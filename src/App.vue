@@ -1,11 +1,306 @@
 <template>
+  <!-- Biometric lock overlay -->
+  <div v-if="locked" class="biometric-lock" :class="isDark ? 'biometric-lock-dark' : 'biometric-lock-light'">
+    <div class="biometric-lock-content">
+      <div class="biometric-lock-icon" :class="isDark ? 'biometric-lock-icon-dark' : 'biometric-lock-icon-light'">
+        <q-icon name="lock" size="32px" />
+      </div>
+      <p class="biometric-lock-title" :class="isDark ? 'biometric-lock-title-dark' : 'biometric-lock-title-light'">BuhoGO</p>
+      <p class="biometric-lock-hint">{{ $t('Tap to unlock') }}</p>
+      <button class="biometric-lock-btn" @click="promptUnlock">
+        <q-icon name="fingerprint" size="28px" />
+      </button>
+    </div>
+  </div>
+
   <router-view />
+
+  <!-- Shared, channel-aware update UI. Soft updates stay nonmodal until the
+       user opens them; required updates wait until biometric UI is gone. -->
+  <UpdateExperience :suspended="locked || addressRequest.state.stage !== 'idle'" />
+  <AddressRequestSheet :suspended="locked" />
+
+  <!-- Global payment-error dialog. Wired to walletStore.paymentError so
+       any page or store can surface a failure via showPaymentError(). -->
+  <PaymentErrorDialog />
+  <ToastHost />
 </template>
 
 <script>
-import { defineComponent } from 'vue';
+import { defineComponent, ref, provide, watch, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { Capacitor } from '@capacitor/core'
+import { useQuasar } from 'quasar'
+import { useWalletStore } from 'src/stores/wallet'
+import { authenticate as biometricAuth, isBiometricAvailable } from 'src/utils/biometric'
+import { triggerWalletStoreHydration, readPersistedWalletState } from 'src/utils/walletHydration'
+import { useAddressBookSync } from 'src/composables/useAddressBookSync'
+import PaymentErrorDialog from 'src/components/PaymentErrorDialog.vue'
+import ToastHost from 'src/components/toasts/ToastHost.vue'
+import UpdateExperience from 'src/components/UpdateExperience.vue'
+import AddressRequestSheet from 'src/components/AddressRequestSheet.vue'
+import { useAddressRequestStore } from 'src/stores/addressRequest.js'
+import { useNotificationsStore } from 'src/stores/notifications'
+import { isInternalRoute, onNotificationTap } from 'src/services/paymentNotifications'
+import { EventBus } from 'src/utils/eventBus'
+import { setAppLocked } from 'src/utils/appLock'
 
 export default defineComponent({
-  name: 'App'
-});
+  name: 'App',
+
+  components: { PaymentErrorDialog, UpdateExperience, AddressRequestSheet, ToastHost },
+
+  setup () {
+    const store = useWalletStore()
+    const $q = useQuasar()
+    const router = useRouter()
+    const addressRequest = useAddressRequestStore()
+    const notifications = useNotificationsStore()
+
+    // Shared-contacts sync driver. App-level so contacts added from
+    // any surface publish, whether or not the Address Book page is
+    // ever opened. No-ops on kiosk devices.
+    useAddressBookSync()
+
+    const locked = ref(false)
+    // Screens that read the clipboard on foreground wait until the lock is gone.
+    provide('appLocked', locked)
+    const isDark = ref($q.dark.isActive)
+    let stateListener = null
+    let notificationsListener = null
+    let stopNotificationTap = null
+    let isPrompting = false
+    let lastPromptEnd = 0
+
+    // The wallet store hydrates lazily (the first page that needs it calls
+    // initialize()), while this component mounts before any route component
+    // exists. On a cold start store.biometricsEnabled therefore still holds
+    // its default `false` here, and the lock would never engage. Kick off
+    // hydration (its synchronous prefix patches persisted state before the
+    // first await) and read the store; the raw snapshot only remains as the
+    // fallback for pre-hydration states the helper skips.
+    function appLockEnabled () {
+      if (store.isInitialized) return store.biometricsEnabled === true
+      triggerWalletStoreHydration(store)
+      if (store.biometricsEnabled) return true
+      return readPersistedWalletState()?.biometricsEnabled === true
+    }
+
+    // A kiosk device boots straight into the cashier screen; painting the
+    // owner's lock over it would block taking payments until the owner
+    // returns. The lock applies again once owner access is unlocked.
+    function kioskActive () {
+      if (store.kioskEnabled) return !store.kioskOwnerAccess
+      if (store.isInitialized) return false
+      return readPersistedWalletState()?.kioskEnabled === true
+    }
+
+    function appLockActive () {
+      return appLockEnabled() && !kioskActive()
+    }
+
+    async function promptUnlock () {
+      if (isPrompting) return
+      isPrompting = true
+      try {
+        const passed = await biometricAuth({
+          reason: 'Unlock BuhoGO',
+          title: 'BuhoGO',
+          subtitle: 'Verify your identity',
+          useFallback: true
+        })
+        if (passed) {
+          locked.value = false
+        } else {
+          // A lock that can never be satisfied must not brick the wallet:
+          // if every device auth method is gone (screen lock removed,
+          // biometric enrollment wiped), there is nothing left to verify
+          // against and the overlay would otherwise be permanent.
+          const { available } = await isBiometricAvailable()
+          if (!available) locked.value = false
+        }
+      } finally {
+        lastPromptEnd = Date.now()
+        isPrompting = false
+      }
+    }
+
+    // Establish the lock before child consent UI can become available.
+    locked.value = Capacitor.isNativePlatform() && appLockActive()
+
+    // The lock as a readable state (src/utils/appLock.js): the launch value
+    // is reported silently, because launching into the lock is a state, not a
+    // change. Boot files that must not start while the app is locked wait for it.
+    setAppLocked(locked.value)
+
+    // Events 'app:locked' and 'app:unlocked' (no payload): emitted on the
+    // EventBus every time the lock engages or releases, i.e. whenever `locked`
+    // changes — the app going to the background with the lock on included.
+    // Anything that keeps a secret only in memory drops it on 'app:locked' (the
+    // contact chat wipes its cached identity key, docs/CONTACT_CHAT.md section 5)
+    // and picks its work up again on 'app:unlocked'. They report a change, not
+    // the state: registered after the initial value above, so launching
+    // straight into the lock is not announced (read it with `isAppLocked`).
+    // Sync flush: the listeners run in the same turn as the change, not on the
+    // next tick, and the state in `appLock` is updated before they run.
+    watch(locked, (isLocked) => {
+      setAppLocked(isLocked)
+      EventBus.emit(isLocked ? 'app:locked' : 'app:unlocked')
+    }, { flush: 'sync' })
+
+    // Tapping a notification opens the screen it was posted for (a contact
+    // chat, say). The route comes out of notification data, which is not a
+    // trusted destination, so only an in-app path is followed.
+    function openNotificationRoute ({ route }) {
+      if (!isInternalRoute(route)) return
+      // A tap that launched the app arrives while the first navigation is
+      // still settling; wait for it, or the start route wins.
+      router.isReady()
+        .then(() => router.push(route))
+        .catch(() => { /* navigation rejection is non-fatal */ })
+    }
+
+    onMounted(async () => {
+      // Payment notifications: load the user's switch before anything can want
+      // to post one. Above the native gate on purpose — the browser posts
+      // through its own Notification API, and a receive on the web would
+      // otherwise stay silent until the user happened to open Settings.
+      notifications.initialize().catch(() => {})
+
+      // Taps on a notification. Registered once, here and early: the plugin
+      // hands a tap that came before any listener to the first one, and the
+      // browser fires its click on web notifications through the same event.
+      stopNotificationTap = onNotificationTap(openNotificationRoute)
+
+      if (!Capacitor.isNativePlatform()) return
+
+      // Dynamic import — @capacitor/app is only available in Capacitor builds.
+      // Must resolve BEFORE cold-start prompt to avoid race with appStateChange listener.
+      const { App: CapApp } = await import('@capacitor/app')
+
+      // Prompt biometric on cold start if enabled
+      if (appLockActive()) {
+        locked.value = true
+        setTimeout(() => promptUnlock(), 300)
+      }
+
+      // Re-read the OS permission on every return to the front: it can be
+      // revoked in system settings while we are away, and a row that still
+      // claims "on" after that would be a lie.
+      notificationsListener = await CapApp.addListener('appStateChange', ({ isActive }) => {
+        if (isActive) notifications.syncPermission().catch(() => {})
+      })
+
+      // Listen for background -> foreground transitions.
+      // The biometric dialog itself causes a brief inactive->active cycle;
+      // suppress it with isPrompting flag + 1.5s cooldown after last prompt.
+      stateListener = await CapApp.addListener('appStateChange', ({ isActive }) => {
+        if (!appLockActive()) return
+
+        // Sync dark mode state for the lock overlay
+        isDark.value = $q.dark.isActive
+
+        if (!isActive) {
+          // Ignore if biometric dialog is showing or just dismissed
+          if (isPrompting || (Date.now() - lastPromptEnd < 1500)) return
+          locked.value = true
+        } else if (locked.value) {
+          // Came back — only prompt if not still within the cooldown window
+          if (isPrompting || (Date.now() - lastPromptEnd < 1500)) return
+          setTimeout(() => promptUnlock(), 300)
+        }
+      })
+    })
+
+    onUnmounted(() => {
+      if (stateListener) {
+        stateListener.remove()
+      }
+      if (notificationsListener) {
+        notificationsListener.remove()
+      }
+      if (stopNotificationTap) {
+        stopNotificationTap()
+        stopNotificationTap = null
+      }
+    })
+
+    return { locked, isDark, promptUnlock, addressRequest }
+  }
+})
 </script>
+
+<style>
+.biometric-lock {
+  position: fixed;
+  inset: 0;
+  z-index: 99999;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.biometric-lock-light {
+  background: rgba(255, 255, 255, 0.97);
+}
+.biometric-lock-dark {
+  background: rgba(18, 18, 18, 0.97);
+}
+.biometric-lock-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+.biometric-lock-icon {
+  width: 72px;
+  height: 72px;
+  border-radius: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
+}
+.biometric-lock-icon-light {
+  background: rgba(21, 222, 114, 0.1);
+  color: #15DE72;
+}
+.biometric-lock-icon-dark {
+  background: rgba(21, 222, 114, 0.15);
+  color: #15DE72;
+}
+.biometric-lock-title {
+  font-size: 22px;
+  font-weight: 800;
+  margin: 0;
+}
+.biometric-lock-title-light {
+  color: #1e293b;
+}
+.biometric-lock-title-dark {
+  color: #f1f5f9;
+}
+.biometric-lock-hint {
+  font-size: 13px;
+  color: #94a3b8;
+  margin: 0;
+}
+.biometric-lock-btn {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: #15DE72;
+  color: white;
+  border: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 16px;
+  box-shadow: 0 8px 24px rgba(21, 222, 114, 0.3);
+  transition: transform 0.1s ease;
+}
+.biometric-lock-btn:active {
+  transform: scale(0.93);
+}
+</style>

@@ -1,4 +1,5 @@
 import { register } from 'register-service-worker'
+import { PWA_UPDATE_EVENT, PWA_UPDATE_FLAG } from 'src/utils/updateEvents'
 
 // The ready(), registered(), cached(), updatefound() and updated()
 // events passes a ServiceWorkerRegistration instance in their arguments.
@@ -28,7 +29,13 @@ register(process.env.SERVICE_WORKER_FILE, {
   },
 
   updated (/* registration */) {
-    // console.log('New content is available; please refresh.')
+    // The worker does not skipWaiting() on install, so at this point the new
+    // version is parked in the waiting state and the page still runs the old
+    // build undisturbed. Hand readiness to the shared in-app update
+    // experience; applying it goes through reloadPwa(), which promotes the
+    // waiting worker and reloads once it has taken control.
+    window[PWA_UPDATE_FLAG] = true
+    window.dispatchEvent(new CustomEvent(PWA_UPDATE_EVENT))
   },
 
   offline () {

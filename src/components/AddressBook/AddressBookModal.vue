@@ -1,17 +1,23 @@
 <template>
   <q-dialog
-    v-model="show"
+    v-model="dialogOpen"
     persistent
     :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'"
+    @hide="onHide"
   >
     <q-card
       class="address-modal"
-      :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'"
+      :class="[$q.dark.isActive ? 'card_dark_style' : 'card_light_style', { 'address-modal--search': !isEditing && activeTab === 'search' }]"
     >
       <!-- Header -->
-      <q-card-section class="modal-header">
+      <q-card-section class="modal-header" :class="{ 'modal-header--back': activeTab === 'search' && searchNavigation.canGoBack }">
+        <button v-if="activeTab === 'search' && searchNavigation.canGoBack" ref="searchBack"
+          type="button" class="search-header-back" :aria-label="$t('Back to results')"
+          :disabled="searchNavigation.saving" @click="$refs.searchRef?.backToResults()">
+          <q-icon name="chevron_left" size="24px" :aria-hidden="true" />
+        </button>
         <div class="modal-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-          {{ isEditing ? $t('Edit Contact') : $t('Add Contact') }}
+          {{ isEditing ? $t('Edit contact') : $t('Add contact') }}
         </div>
         <q-btn
           flat
@@ -25,97 +31,162 @@
         </q-btn>
       </q-card-section>
 
-      <!-- Content -->
-      <q-card-section class="modal-content">
-        <!-- Avatar Preview -->
-        <div class="avatar-preview">
-          <div
-            class="preview-circle"
-            :style="{ backgroundColor: formData.color }"
-            @click="showColorPicker = true"
+      <!-- Segmented control (add-mode only). Keeps the existing edit
+           flow uncluttered — there is nothing to "search" for when
+           you're correcting a name. Order: Scan / Search / Enter, but
+           we default to Search so opening the sheet never prompts for
+           camera permission. -->
+      <q-card-section v-if="!isEditing" class="modal-tabs">
+        <div class="seg-control" role="tablist" :aria-label="$t('Add contact method')">
+          <button
+            v-for="tab in tabs"
+            :key="tab.id"
+            type="button"
+            role="tab"
+            class="seg-tab"
+            :class="{ 'seg-tab--active': activeTab === tab.id }"
+            :aria-selected="activeTab === tab.id"
+            @click="switchTab(tab.id)"
           >
-            <span class="preview-initial">{{ getPreviewInitial() }}</span>
-          </div>
-          <div class="avatar-hint" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
-            {{ $t('Tap to change color') }}
-          </div>
-        </div>
-
-        <!-- Form Fields -->
-        <div class="form-fields">
-          <div class="input-wrapper">
-            <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
-              {{ $t('Name') }}
-            </div>
-            <input
-              v-model="formData.name"
-              type="text"
-              :placeholder="$t('Enter contact name')"
-              class="form-input"
-              :class="$q.dark.isActive ? 'form-input-dark' : 'form-input-light'"
-              ref="nameInput"
-              maxlength="50"
-            />
-          </div>
-
-          <!-- Address Type Toggle -->
-          <div class="input-wrapper">
-            <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
-              {{ $t('Address Type') }}
-            </div>
-            <q-btn-toggle
-              v-model="formData.addressType"
-              toggle-color="primary"
-              :options="[
-                { label: 'Lightning', value: 'lightning', icon: 'bolt' },
-                { label: 'Spark', value: 'spark', icon: 'local_fire_department' },
-                { label: 'Bitcoin', value: 'bitcoin', icon: 'currency_bitcoin' }
-              ]"
-              class="address-type-toggle"
-              :class="$q.dark.isActive ? 'toggle-dark' : 'toggle-light'"
-              no-caps
-              unelevated
-              spread
-            />
-          </div>
-
-          <div class="input-wrapper">
-            <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
-              {{ addressTypeLabel }}
-            </div>
-            <input
-              v-model="formData.address"
-              type="text"
-              :placeholder="addressPlaceholder"
-              class="form-input"
-              :class="$q.dark.isActive ? 'form-input-dark' : 'form-input-light'"
-              ref="addressInput"
-              maxlength="150"
-            />
-            <div v-if="formData.address && !isAddressValid" class="input-error">
-              {{ addressErrorMessage }}
-            </div>
-          </div>
-
-          <!-- Notes Field -->
-          <div class="input-wrapper">
-            <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
-              {{ $t('Notes') }} <span class="optional-hint">({{ $t('optional') }})</span>
-            </div>
-            <textarea
-              v-model="formData.notes"
-              :placeholder="$t('e.g., Monthly rent, Coffee shop...')"
-              class="form-input notes-textarea"
-              :class="$q.dark.isActive ? 'form-input-dark' : 'form-input-light'"
-              maxlength="200"
-              rows="2"
-            />
-          </div>
+            <Icon :icon="tab.icon" width="14" height="14" />
+            <span>{{ $t(tab.label) }}</span>
+          </button>
         </div>
       </q-card-section>
 
-      <!-- Actions -->
-      <q-card-actions align="right" class="modal-actions">
+      <!-- Content router -->
+      <q-card-section class="modal-content">
+        <!-- SCAN -->
+        <AddContactScan
+          v-if="!isEditing && activeTab === 'scan'"
+          :active="show && activeTab === 'scan'"
+          @saved="onChildSaved"
+          @open-existing="onOpenExisting"
+          @switch-to-search="switchTab('search')"
+          @detected-address="onScanDetectedAddress"
+          @address-request="shareAddress"
+        />
+
+        <!-- SEARCH -->
+        <AddContactSearch
+          v-else-if="!isEditing && activeTab === 'search'"
+          ref="searchRef"
+          :initial-query="initialQuery"
+          @navigation-change="searchNavigation = $event"
+          @focus-back="$refs.searchBack?.focus()"
+          :active="show && activeTab === 'search'"
+          @saved="onChildSaved"
+          @open-existing="onOpenExisting"
+        />
+
+        <!-- MANUAL — also used for the edit flow -->
+        <template v-else>
+          <!-- Static preview: the app-wide filled-bust silhouette.
+               Contacts no longer carry a color; a Nostr picture (via
+               the Search / Scan tabs) is the only way an avatar
+               personalizes. -->
+          <div class="avatar-preview">
+            <div class="preview-circle">
+              <svg class="preview-glyph" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                <path d="M12 12.3a4.05 4.05 0 1 0 0-8.1 4.05 4.05 0 0 0 0 8.1Zm0 2.2c-4.3 0-7.6 2.6-8.1 6.3h16.2c-.5-3.7-3.8-6.3-8.1-6.3Z" />
+              </svg>
+            </div>
+          </div>
+
+          <div class="form-fields">
+            <div class="input-wrapper">
+              <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
+                {{ $t('Name') }}
+              </div>
+              <input
+                v-model="formData.name"
+                type="text"
+                :placeholder="$t('Enter contact name')"
+                class="form-input"
+                :class="$q.dark.isActive ? 'form-input-dark' : 'form-input-light'"
+                ref="nameInput"
+                maxlength="50"
+              />
+            </div>
+
+            <div class="input-wrapper">
+              <div class="input-label-row">
+                <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
+                  {{ $t('Payment address') }}
+                </div>
+                <transition name="type-pill">
+                  <div
+                    v-if="detectedType"
+                    class="detected-pill"
+                    :class="`detected-pill--${detectedDisplayType}`"
+                  >
+                    <img
+                      v-if="detectedDisplayType === 'spark'"
+                      width="11" height="11"
+                      :src="$q.dark.isActive ? '/Spark/Spark Asterisk White.svg' : '/Spark/Spark Asterisk Black.svg'"
+                      alt="Spark"
+                    />
+                    <ArkadeLogo v-else-if="detectedDisplayType === 'arkade'" variant="mark" :size="12" />
+                    <Icon v-else :icon="detectedIcon" width="12" height="12" />
+                    <span>{{ detectedLabel }}</span>
+                  </div>
+                </transition>
+              </div>
+              <input
+                v-model="formData.address"
+                type="text"
+                :placeholder="$t('Paste the address from your friend or shop')"
+                class="form-input"
+                :class="[
+                  $q.dark.isActive ? 'form-input-dark' : 'form-input-light',
+                  addressShowsError ? 'form-input--error' : ''
+                ]"
+                ref="addressInput"
+                maxlength="16384"
+                autocapitalize="off"
+                autocorrect="off"
+                spellcheck="false"
+              />
+              <div class="input-helper" :class="$q.dark.isActive ? 'helper-dark' : 'helper-light'">
+                <template v-if="addressIsRequest">
+                  <span>{{ $t('Review this request to share your Lightning address.') }}</span>
+                </template>
+                <template v-else-if="addressShowsError">
+                  <Icon icon="tabler:alert-circle" width="13" height="13" />
+                  <span v-if="addressIsSparkRequest">{{ $t('This is a one-time payment request, not a lasting address. Pay it and save the contact from the payment screen instead.') }}</span>
+                  <span v-else>{{ $t("We don't recognize this as a Lightning, Spark, Bitcoin, or LNURL address") }}</span>
+                </template>
+                <template v-else>
+                  <span>{{ $t('Works with a Lightning, Spark, or Bitcoin address, or an LNURL link') }}</span>
+                </template>
+              </div>
+            </div>
+
+            <div class="input-wrapper">
+              <div class="input-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
+                {{ $t('Notes') }} <span class="optional-hint">({{ $t('optional') }})</span>
+              </div>
+              <textarea
+                v-model="formData.notes"
+                :placeholder="$t('e.g., Monthly rent, Coffee shop...')"
+                class="form-input notes-textarea"
+                :class="$q.dark.isActive ? 'form-input-dark' : 'form-input-light'"
+                maxlength="200"
+                rows="2"
+              />
+            </div>
+          </div>
+        </template>
+      </q-card-section>
+
+      <!-- Footer — only the manual / edit path needs a global Save
+           button. Search and Scan tabs ship their own save UI inside
+           the preview card. -->
+      <q-card-actions
+        v-if="showManualFooter"
+        align="right"
+        class="modal-actions"
+      >
         <q-btn
           flat
           :label="$t('Cancel')"
@@ -126,52 +197,75 @@
         />
         <q-btn
           unelevated
-          :label="isEditing ? $t('Update') : $t('Add')"
+          :label="addressIsRequest ? $t('Review request') : isEditing ? $t('Update') : $t('Add')"
           @click="saveEntry"
           :loading="isSaving"
-          :disable="!isFormValid"
+          :disable="!isFormValid && !addressIsRequest"
           class="save-btn"
           no-caps
         />
       </q-card-actions>
     </q-card>
 
-    <!-- Color Picker Dialog -->
-    <q-dialog v-model="showColorPicker">
-      <q-card class="color-picker-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section>
-          <div class="color-picker-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-            {{ $t('Choose Color') }}
-          </div>
-        </q-card-section>
-
-        <q-card-section class="color-grid">
-          <div
-            v-for="color in colorPalette"
-            :key="color"
-            class="color-option"
-            :class="{ 'selected': formData.color === color }"
-            :style="{ backgroundColor: color }"
-            @click="selectColor(color)"
-          >
-            <Icon
-              v-if="formData.color === color"
-              icon="tabler:check"
-              class="color-check"
-            />
-          </div>
-        </q-card-section>
-      </q-card>
-    </q-dialog>
   </q-dialog>
 </template>
 
 <script>
+import { isAddressRequest } from '../../utils/lud23.js';
+import { offerAddressRequest } from '../../services/addressRequestIntake.js';
+import { useAddressRequestStore } from '../../stores/addressRequest.js';
 import { useAddressBookStore } from '../../stores/addressBook'
-import { mapState, mapActions } from 'pinia'
+import { mapActions } from 'pinia'
+import {
+  isSparkAddress,
+  isBitcoinAddress,
+  isLightningAddress,
+  isLnurl,
+  canonicalLnurl,
+  lnurlToUrl,
+  lnurlDomain,
+  isArkadeAddress,
+} from '../../utils/addressUtils.js'
+import { isSparkPaymentRequest } from '../../utils/sparkPayment.js'
+import { lnurlGetJson } from '../../utils/lnurlHttp.js'
+import { parsePayRequestMetadata, serviceTitle, normalizeServiceImage, serviceIdentity } from '../../utils/lnurlMetadata.js'
+import { useServiceImagesStore } from '../../stores/serviceImages'
+import AddContactSearch from './AddContactSearch.vue'
+import AddContactScan from './AddContactScan.vue'
+import ArkadeLogo from '../ArkadeLogo.vue'
+
+// Order matters: Spark addresses are checked before Bitcoin because some
+// Spark prefixes share a base58-ish look and we want them claimed first.
+function detectType(address) {
+  if (!address || typeof address !== 'string') return null
+  const v = address.trim()
+  if (!v || isAddressRequest(v)) return null
+  // A Spark invoice shares the spark1… prefix but is single-use — it must
+  // never become a contact. The helper text below names it specifically.
+  if (isSparkAddress(v)) return isSparkPaymentRequest(v) ? null : 'spark'
+  if (isArkadeAddress(v)) return 'arkade'
+  if (isBitcoinAddress(v)) return 'bitcoin'
+  // LNURL static pay links — recognized as their own type for routing, but
+  // surfaced as Lightning in the pill below (see detectedType/Label/Icon).
+  if (isLnurl(v)) return 'lnurl'
+  if (isLightningAddress(v)) return 'lightning'
+  return null
+}
+
+const TABS = [
+  // Enter is the default entry: typing a Lightning/Spark/Bitcoin
+  // address works for everyone without assuming Nostr fluency, and it
+  // never prompts for camera permission on open. Scan is one tap away
+  // for in-person sharing; Search covers the Nostr-aware path of
+  // pasting an npub or profile link.
+  { id: 'manual', label: 'Enter',  icon: 'tabler:keyboard' },
+  { id: 'scan',   label: 'Scan',   icon: 'tabler:qrcode' },
+  { id: 'search', label: 'Search', icon: 'tabler:search' },
+]
 
 export default {
   name: 'AddressBookModal',
+  components: { AddContactSearch, AddContactScan, ArkadeLogo },
   props: {
     modelValue: {
       type: Boolean,
@@ -180,24 +274,52 @@ export default {
     entry: {
       type: Object,
       default: null
+    },
+    // A creation draft, never an entry: prefill must not select edit mode.
+    initialAddress: {
+      type: String,
+      default: ''
+    },
+    /**
+     * Which add-mode tab to land on when the sheet opens. Defaults to
+     * 'manual' (see the tab-order comment above) — callers that want a
+     * more specific entry point, e.g. the Identity page's header scan
+     * button jumping straight to the camera, pass 'scan' or 'search'.
+     * Ignored while editing (there is no tab bar in edit mode).
+     */
+    initialTab: {
+      type: String,
+      default: 'manual'
+    },
+    // Text the Search tab starts with (the chat's "Add contact" hands over the
+    // sender's npub, so the preview is one tap away). Ignored by other tabs.
+    initialQuery: {
+      type: String,
+      default: ''
     }
   },
-  emits: ['update:modelValue', 'saved'],
+  emits: ['update:modelValue', 'saved', 'open-existing'],
   data() {
     return {
+      activeTab: 'manual',
+      searchNavigation: { canGoBack: false, saving: false },
+      addressHandoff: false,
+      tabs: TABS,
       formData: {
         name: '',
         address: '',
-        addressType: 'lightning',
-        color: '#3B82F6',
         notes: ''
       },
       isSaving: false,
-      showColorPicker: false
     }
   },
+  setup() { return { addressRequests: useAddressRequestStore() }; },
   computed: {
-    ...mapState(useAddressBookStore, ['colorPalette']),
+    addressIsRequest() { return isAddressRequest(this.formData.address); },
+    dialogOpen: {
+      get() { return this.show && !this.addressHandoff; },
+      set(value) { if (!this.addressHandoff) this.show = value; }
+    },
 
     show: {
       get() {
@@ -212,86 +334,107 @@ export default {
       return !!this.entry
     },
 
-    addressTypeLabel() {
+    /**
+     * The global Save/Cancel footer only makes sense for the
+     * legacy manual form — Search/Scan ship their own save UI
+     * inside the preview card so the user's eye doesn't leave
+     * the profile they're confirming.
+     */
+    showManualFooter() {
+      return this.isEditing || this.activeTab === 'manual'
+    },
+
+    detectedType() {
+      return detectType(this.formData.address)
+    },
+
+    /**
+     * Visual type for the pill. LNURL is stored as its own `addressType`
+     * (so the send flow routes it through LNURL resolution) but folds into
+     * the Lightning badge here, since to the user it is just another way to
+     * pay over Lightning.
+     */
+    detectedDisplayType() {
+      return this.detectedType === 'lnurl' ? 'lightning' : this.detectedType
+    },
+
+    detectedLabel() {
       const labels = {
-        lightning: this.$t('Lightning Address'),
-        spark: this.$t('Spark Address'),
-        bitcoin: this.$t('Bitcoin Address')
+        lightning: this.$t('Lightning'),
+        spark: this.$t('Spark'),
+        arkade: this.$t('Arkade'),
+        bitcoin: this.$t('Bitcoin')
       }
-      return labels[this.formData.addressType] || labels.lightning
+      return labels[this.detectedDisplayType] || ''
     },
 
-    addressPlaceholder() {
-      const placeholders = {
-        lightning: 'user@domain.com',
-        spark: 'spark1... or sp1...',
-        bitcoin: 'bc1... or 1... or 3...'
+    detectedIcon() {
+      const icons = {
+        lightning: 'tabler:bolt',
+        bitcoin: 'tabler:currency-bitcoin'
       }
-      return placeholders[this.formData.addressType] || placeholders.lightning
+      return icons[this.detectedDisplayType] || ''
     },
 
-    addressErrorMessage() {
-      const messages = {
-        lightning: this.$t('Invalid Lightning address format'),
-        spark: this.$t('Invalid Spark address (should start with spark1 or sp1)'),
-        bitcoin: this.$t('Invalid Bitcoin address format')
-      }
-      return messages[this.formData.addressType] || messages.lightning
+    addressShowsError() {
+      return this.formData.address.trim().length > 0 && !this.detectedType && !this.addressIsRequest
     },
-
-    isAddressValid() {
-      if (!this.formData.address.trim()) return true // Don't show error for empty
-      if (this.formData.addressType === 'spark') {
-        return this.isValidSparkAddress(this.formData.address)
-      }
-      if (this.formData.addressType === 'bitcoin') {
-        return this.isValidBitcoinAddress(this.formData.address)
-      }
-      return this.isValidLightningAddress(this.formData.address)
+    addressIsSparkRequest() {
+      const v = this.formData.address.trim()
+      return v.length > 0 && isSparkPaymentRequest(v)
     },
 
     isFormValid() {
-      return this.formData.name.trim() &&
-             this.formData.address.trim() &&
-             this.isAddressValid
+      return this.formData.name.trim() && !!this.detectedType
     }
   },
   watch: {
+    'addressRequests.state.presented'(value) {
+      if (!value && this.addressRequests.state.stage === 'idle') this.addressHandoff = false;
+    },
+    'addressRequests.state.stage'(value) {
+      if (value === 'idle' && !this.addressRequests.state.presented) this.addressHandoff = false;
+    },
     show(newVal) {
       if (newVal) {
         this.initializeForm()
+        // Add mode lands on `initialTab` (defaults to the manual "Enter"
+        // form, which works for everyone without assuming Nostr fluency).
+        // Editing always lands on manual regardless of `initialTab` since
+        // there is no tab bar in that mode. Resetting here keeps the next
+        // open from being biased by where the previous one finished.
+        this.activeTab = this.isEditing ? 'manual' : this.initialTab
         this.$nextTick(() => {
           this.$refs.nameInput?.focus()
         })
       } else {
         this.resetForm()
       }
-    },
-    'formData.addressType'() {
-      // Clear address when switching types to avoid confusion
-      if (!this.isEditing) {
-        this.formData.address = ''
-      }
     }
   },
   methods: {
-    ...mapActions(useAddressBookStore, ['addEntry', 'updateEntry', 'getRandomColor']),
+    ...mapActions(useAddressBookStore, ['addEntry', 'updateEntry']),
+
+    switchTab(id) {
+      if (this.activeTab === id) return
+      this.activeTab = id
+      this.$nextTick(() => {
+        if (id === 'manual') this.$refs.nameInput?.focus()
+        else if (id === 'search') this.$refs.searchRef?.focus?.()
+      })
+    },
 
     initializeForm() {
       if (this.entry) {
         this.formData = {
           name: this.entry.name,
           address: this.entry.address || this.entry.lightningAddress || '',
-          addressType: this.entry.addressType || 'lightning',
-          color: this.entry.color,
           notes: this.entry.notes || ''
         }
       } else {
         this.formData = {
           name: '',
-          address: '',
-          addressType: 'lightning',
-          color: this.getRandomColor(),
+          address: detectType(this.initialAddress) ? this.initialAddress.trim() : '',
           notes: ''
         }
       }
@@ -301,57 +444,54 @@ export default {
       this.formData = {
         name: '',
         address: '',
-        addressType: 'lightning',
-        color: '#3B82F6',
         notes: ''
       }
       this.isSaving = false
-      this.showColorPicker = false
+      this.activeTab = 'manual'
     },
 
-    getPreviewInitial() {
-      return this.formData.name ? this.formData.name.charAt(0).toUpperCase() : '?'
+
+    /**
+     * Child save callback — fires after AddContactSearch or
+     * AddContactScan have persisted a Nostr contact. Bubbles up so
+     * the list refreshes and the sheet dismisses with the same
+     * `saved` semantics the manual flow uses.
+     */
+    onChildSaved(entry) {
+      this.$emit('saved', entry)
+      this.closeModal()
     },
 
-    selectColor(color) {
-      this.formData.color = color
-      this.showColorPicker = false
+    /**
+     * The child preview signals an "already saved" affordance.
+     * Forward upward so the page can open the contact detail or
+     * scroll to its row, then close this sheet to get out of the way.
+     */
+    onOpenExisting(entry) {
+      this.$emit('open-existing', entry)
+      this.closeModal()
     },
 
-    isValidLightningAddress(address) {
-      if (!address) return false
-      const lightningAddressRegex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/
-      return lightningAddressRegex.test(address.trim())
+    /**
+     * The Scan tab found a payment address (Lightning / Spark / Bitcoin /
+     * LNURL) rather than a Nostr profile. Pre-fill the manual form and
+     * switch to it so the detected-type pill lights up and the user just
+     * adds a name + optional note before saving via the normal addEntry path.
+     */
+    onScanDetectedAddress(address) {
+      this.formData.address = address
+      this.switchTab('manual')
     },
 
-    isValidSparkAddress(address) {
-      if (!address) return false
-      const trimmed = address.trim().toLowerCase()
-      // New format: spark1 (mainnet), sparkrt1 (regtest), sparkt1 (testnet), sparks1 (signet), sparkl1 (local)
-      // Legacy format: sp1 (mainnet), tsp1 (testnet), sprt1 (regtest)
-      const newPrefixes = ['spark1', 'sparkrt1', 'sparkt1', 'sparks1', 'sparkl1']
-      const legacyPrefixes = ['sp1', 'tsp1', 'sprt1']
-      return newPrefixes.some(p => trimmed.startsWith(p)) ||
-             legacyPrefixes.some(p => trimmed.startsWith(p))
-    },
-
-    isValidBitcoinAddress(address) {
-      if (!address) return false
-      const trimmed = address.trim()
-      // Mainnet: bc1 (bech32/bech32m native segwit), 1 (P2PKH legacy), 3 (P2SH)
-      // Testnet: tb1 (bech32), m/n (P2PKH), 2 (P2SH)
-      const mainnetBech32Regex = /^bc1[a-zA-HJ-NP-Z0-9]{39,62}$/i
-      const mainnetLegacyRegex = /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/
-      const testnetBech32Regex = /^tb1[a-zA-HJ-NP-Z0-9]{39,62}$/i
-      const testnetLegacyRegex = /^[mn2][a-km-zA-HJ-NP-Z1-9]{25,34}$/
-
-      return mainnetBech32Regex.test(trimmed) ||
-             mainnetLegacyRegex.test(trimmed) ||
-             testnetBech32Regex.test(trimmed) ||
-             testnetLegacyRegex.test(trimmed)
+    shareAddress(value) {
+      if (offerAddressRequest(value, { t: this.$t.bind(this) })) {
+        this.addressHandoff = this.addressRequests.state.stage !== 'idle';
+        this.activeTab = 'manual';
+      }
     },
 
     async saveEntry() {
+      if (this.addressIsRequest) { this.shareAddress(this.formData.address); return; }
       if (!this.isFormValid) return
 
       this.isSaving = true
@@ -360,30 +500,38 @@ export default {
         const entryData = {
           name: this.formData.name.trim(),
           address: this.formData.address.trim(),
-          addressType: this.formData.addressType,
-          color: this.formData.color,
+          addressType: this.detectedType,
           notes: this.formData.notes?.trim() || ''
         }
 
+        // A pasted pay link (LUD-11 service) is stored in its one canonical
+        // form, and the service gets one chance to describe itself (LUD-06
+        // name and logo). Best effort: no answer means the domain is the
+        // name, and nothing here ever creates an invoice.
+        if (this.detectedType === 'lnurl') {
+          const canonical = canonicalLnurl(entryData.address)
+          if (canonical) entryData.address = canonical
+          if (!this.isEditing) {
+            entryData.service = await this.describeService(entryData.address)
+          }
+        }
+
+        let savedEntry
         if (this.isEditing) {
-          await this.updateEntry(this.entry.id, entryData)
+          savedEntry = await this.updateEntry(this.entry.id, entryData)
           this.$q.notify({
             type: 'positive',
             message: this.$t('Contact saved'),
-
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           })
         } else {
-          await this.addEntry(entryData)
+          savedEntry = await this.addEntry(entryData)
           this.$q.notify({
             type: 'positive',
             message: this.$t('Contact added'),
-
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           })
         }
 
-        this.$emit('saved')
+        this.$emit('saved', savedEntry)
         this.closeModal()
       } catch (error) {
         const errorMessage = this.getErrorMessage(error)
@@ -391,17 +539,48 @@ export default {
           type: 'negative',
           message: errorMessage.title,
           caption: errorMessage.caption,
-
           timeout: 4000,
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         })
       } finally {
         this.isSaving = false
       }
     },
 
+    /**
+     * Ask a pay link who it is: one GET of the payRequest, its LUD-06
+     * metadata parsed, the logo kept in the local image registry. Whether
+     * the link is reusable (LUD-11) is only known after a payment, so
+     * `reusable` stays null here. Never throws; null when nothing useful
+     * came back.
+     */
+    async describeService(address) {
+      const url = lnurlToUrl(address)
+      if (!url) return null
+      const domain = lnurlDomain(address)
+      const service = { name: domain, identifier: null, domain, reusable: null, seenAt: Date.now() }
+      try {
+        const response = await lnurlGetJson(url, { timeoutMs: 10000 })
+        const data = response?.data
+        if (!response?.ok || !data || data.tag !== 'payRequest' || data.status === 'ERROR') return service
+        const meta = parsePayRequestMetadata(data.metadata)
+        normalizeServiceImage(meta.image)
+          .then((dataUrl) => { if (dataUrl) useServiceImagesStore().put(serviceIdentity(address, meta).address, dataUrl) })
+          .catch(() => {})
+        return { ...service, name: serviceTitle(meta, domain), identifier: meta.identifier }
+      } catch {
+        return service
+      }
+    },
+
     closeModal() {
       this.show = false
+    },
+
+    onHide() {
+      if (this.addressHandoff) return;
+      // Final cleanup if the dialog was dismissed via escape or
+      // backdrop (the `show` watcher handles regular closes).
+      this.resetForm()
     },
 
     getErrorMessage(error) {
@@ -414,29 +593,15 @@ export default {
         }
       }
 
-      if (msg.includes('Invalid Lightning')) {
+      if (msg.includes('Invalid')) {
         return {
-          title: this.$t('Invalid Lightning address'),
-          caption: this.$t('Please enter a valid address like user@domain.com')
-        }
-      }
-
-      if (msg.includes('Invalid Spark')) {
-        return {
-          title: this.$t('Invalid Spark address'),
-          caption: this.$t('Spark addresses start with spark1 or sp1')
-        }
-      }
-
-      if (msg.includes('Invalid Bitcoin')) {
-        return {
-          title: this.$t('Invalid Bitcoin address'),
-          caption: this.$t('Bitcoin addresses start with bc1, 1, or 3')
+          title: this.$t('Address not recognized'),
+          caption: this.$t('Please check the address and try again')
         }
       }
 
       return {
-        title: this.$t('Couldn\'t save contact'),
+        title: this.$t("Couldn't save contact"),
         caption: msg || this.$t('Please try again')
       }
     }
@@ -447,7 +612,7 @@ export default {
 <style scoped>
 .address-modal {
   width: 100%;
-  max-width: 480px;
+  max-width: 460px;
   border-radius: var(--radius-xl);
 }
 
@@ -455,12 +620,13 @@ export default {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 1.5rem;
-  border-bottom: 1px solid var(--border-card);
+  padding: 1.25rem 1.5rem 0.75rem;
 }
 
 .modal-title {
   font-family: 'Manrope', sans-serif;
+  font-size: 20px;
+  font-weight: 700;
 }
 
 .close-btn {
@@ -468,67 +634,126 @@ export default {
   height: 32px;
 }
 
-.modal-content {
-  padding: 1.5rem;
+/* Segmented control */
+.modal-tabs {
+  padding: 0 1.5rem 0.5rem;
 }
 
+.seg-control {
+  display: flex;
+  gap: 0.25rem;
+  padding: 0.25rem;
+  border-radius: var(--radius-lg);
+  background: rgba(120, 120, 120, 0.08);
+}
+
+.body--dark .seg-control,
+.q-dark .seg-control {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.seg-tab {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.35rem;
+  padding: 0.5rem 0.5rem;
+  border-radius: calc(var(--radius-lg) - 4px);
+  background: transparent;
+  border: none;
+  color: var(--text-secondary);
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.seg-tab:hover {
+  color: var(--text-primary);
+}
+
+.seg-tab--active {
+  background: var(--bg-card, #FAF7EF);
+  color: var(--text-primary);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
+}
+
+.body--dark .seg-tab--active,
+.q-dark .seg-tab--active {
+  background: #1A1A1A;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+.modal-content {
+  padding: 0.75rem 1.5rem 0.5rem;
+}
+
+.address-modal--search { display: flex; flex-direction: column; max-height: calc(100dvh - 48px); }
+.address-modal--search .modal-header, .address-modal--search .modal-tabs { flex-shrink: 0; }
+.address-modal--search .modal-content { display: flex; overflow: hidden; min-height: 0; padding-bottom: 16px; }
+.search-header-back { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 44px; width: 44px; height: 44px; border: 0; border-radius: 50%; background: transparent; color: var(--text-primary); cursor: pointer; }
+.search-header-back:focus-visible { outline: 2px solid currentColor; }
+.modal-header--back .modal-title { flex: 1; text-align: center; }
+.address-modal--search .close-btn { min-width: 44px; min-height: 44px; }
+.address-modal--search .seg-tab { min-height: 44px; min-width: 0; }
+
+/* Avatar */
 .avatar-preview {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  margin-bottom: 2rem;
+  justify-content: center;
+  margin-bottom: 1.25rem;
 }
 
+/* Silhouette preview — same blue-on-pale-blue treatment as
+   ContactAvatar's fallback, purely informational (no picker behind
+   it anymore). */
 .preview-circle {
-  width: 80px;
-  height: 80px;
+  width: 64px;
+  height: 64px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
-  margin-bottom: 0.75rem;
-}
-
-.preview-circle:hover {
-  transform: scale(1.05);
-  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25);
-}
-
-.preview-initial {
-  color: white;
-  font-family: 'Manrope', sans-serif;
-  font-size: 32px;
-  font-weight: 700;
-  text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
-}
-
-.avatar-hint {
-  font-family: 'Manrope', sans-serif;
-  font-size: 12px;
-  text-align: center;
-}
-
-.view_title_dark {
-  color: var(--text-secondary);
-}
-
-.view_title {
+  background: var(--bg-input);
   color: var(--text-muted);
 }
+
+.body--dark .preview-circle {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
+.preview-glyph {
+  /* Filled marks read smaller than strokes — 52% matches the
+     reference wallet's bust-to-disc ratio. */
+  width: 52%;
+  height: 52%;
+  display: block;
+}
+
+/* Form */
+.view_title_dark { color: var(--text-secondary); }
+.view_title { color: var(--text-muted); }
 
 .form-fields {
   display: flex;
   flex-direction: column;
-  gap: 1.5rem;
+  gap: 1.1rem;
 }
 
 .input-wrapper {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 0.5rem;
+}
+
+.input-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  min-height: 20px;
 }
 
 .input-label {
@@ -537,45 +762,87 @@ export default {
   text-align: left;
 }
 
-/* Address Type Toggle */
-.address-type-toggle {
-  border-radius: var(--radius-md);
-  overflow: hidden;
+.detected-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  line-height: 1;
 }
 
-.toggle-dark {
-  background: var(--bg-input);
-  border: 1px solid var(--border-card);
+.detected-pill--lightning {
+  background: rgba(5, 149, 115, 0.12);
+  color: #059573;
+  box-shadow: inset 0 0 0 1px rgba(5, 149, 115, 0.22);
 }
 
-.toggle-light {
-  background: #F8F8F8;
-  border: 1px solid #E5E7EB;
+.body--dark .detected-pill--lightning,
+.q-dark .detected-pill--lightning {
+  background: rgba(21, 222, 114, 0.16);
+  color: #15DE72;
+  box-shadow: inset 0 0 0 1px rgba(21, 222, 114, 0.28);
 }
 
-.toggle-dark :deep(.q-btn) {
-  color: var(--text-secondary);
+.detected-pill--spark {
+  background: rgba(120, 120, 120, 0.12);
+  color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px rgba(120, 120, 120, 0.25);
 }
 
-.toggle-light :deep(.q-btn) {
-  color: #6B7280;
+.detected-pill--arkade {
+  background: var(--arkade-tint);
+  color: var(--arkade-ink-text);
+  box-shadow: inset 0 0 0 1px var(--arkade-tint-border);
 }
 
-.toggle-dark :deep(.q-btn--active),
-.toggle-light :deep(.q-btn--active) {
-  background: linear-gradient(135deg, #059573, #15DE72) !important;
-  color: white !important;
+.detected-pill--bitcoin {
+  background: rgba(247, 147, 26, 0.14);
+  color: #C97A0F;
+  box-shadow: inset 0 0 0 1px rgba(247, 147, 26, 0.28);
 }
 
-.input-error {
+.body--dark .detected-pill--bitcoin,
+.q-dark .detected-pill--bitcoin {
+  color: #F7931A;
+  box-shadow: inset 0 0 0 1px rgba(247, 147, 26, 0.36);
+}
+
+.type-pill-enter-active,
+.type-pill-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.type-pill-enter-from,
+.type-pill-leave-to {
+  opacity: 0;
+  transform: translateY(-2px) scale(0.96);
+}
+
+.input-helper {
+  display: flex;
+  align-items: center;
+  gap: 5px;
   font-family: 'Manrope', sans-serif;
   font-size: 12px;
-  color: #EF4444;
-  margin-top: 0.5rem;
-  padding-left: 0.25rem;
+  line-height: 1.3;
+  padding-left: 2px;
+  min-height: 16px;
 }
 
-/* Form Inputs */
+.helper-dark { color: var(--text-muted); }
+.helper-light { color: #6B7280; }
+
+.input-helper :deep(svg),
+.input-helper svg {
+  flex-shrink: 0;
+  color: #EF4444;
+}
+
+/* Inputs */
 .form-input {
   width: 100%;
   padding: 0.75rem 1rem;
@@ -599,6 +866,15 @@ export default {
 
 .form-input:focus {
   border-color: var(--color-green);
+}
+
+.body--light .form-input:focus {
+  border-color: var(--text-primary);
+}
+
+.form-input--error,
+.form-input--error:focus {
+  border-color: rgba(239, 68, 68, 0.55);
 }
 
 .form-input::placeholder {
@@ -639,92 +915,47 @@ export default {
   color: #FFF;
 }
 
+.body--light .save-btn {
+  background: var(--btn-neutral-bg);
+  color: var(--btn-neutral-fg);
+}
+
 .save-btn:disabled {
   opacity: 0.4;
 }
 
-/* Color Picker */
-.color-picker-card {
-  width: 100%;
-  max-width: 320px;
-  border-radius: var(--radius-md);
-}
-
-.color-picker-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 18px;
-  text-align: center;
-}
-
-.color-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 1rem;
-  padding: 1rem;
-}
-
-.color-option {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-}
-
-.color-option:hover {
-  transform: scale(1.1);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-}
-
-.color-option.selected {
-  transform: scale(1.1);
-  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.3);
-}
-
-.color-check {
-  color: white;
-  font-size: 20px;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-}
 
 /* Responsive Design */
 @media (max-width: 480px) {
+  .address-modal.address-modal--search { margin: 0; }
+  .address-modal--search .modal-header { padding: 16px 16px 8px; }
+  .address-modal--search .modal-tabs { padding: 0 16px 8px; }
+  .address-modal--search .modal-content { padding: 8px 16px 16px; }
   .address-modal {
     max-width: 100%;
     margin: 1rem;
     border-radius: var(--radius-md);
   }
 
-  .modal-header,
+  .modal-header {
+    padding: 1rem 1.25rem 0.5rem;
+  }
+
+  .modal-tabs {
+    padding: 0 1.25rem 0.5rem;
+  }
+
   .modal-content {
-    padding: 1.25rem;
+    padding: 0.5rem 1.25rem 0.25rem;
   }
 
   .modal-actions {
-    padding: 1rem 1.25rem 1.25rem;
+    padding: 0.75rem 1.25rem 1.25rem;
   }
 
-  .preview-circle {
-    width: 64px;
-    height: 64px;
-  }
-
-  .preview-initial {
-    font-size: 24px;
-  }
-
-  .color-grid {
-    grid-template-columns: repeat(3, 1fr);
-    gap: 0.75rem;
-  }
-
-  .color-option {
-    width: 40px;
-    height: 40px;
-  }
+}
+@media (max-width: 360px) {
+  .address-modal--search .seg-tab { gap: 0; padding: 8px 2px; }
+  .address-modal--search .seg-tab :deep(svg) { display: none; }
 }
 </style>

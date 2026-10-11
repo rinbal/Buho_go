@@ -149,35 +149,48 @@
               <span>{{ state.toWallet?.name }}</span>
             </div>
           </div>
-          <p class="note">{{ $t('This transfer happens instantly via Lightning') }}</p>
+          <p class="note">{{ transferNote }}</p>
         </section>
 
-        <!-- Success -->
-        <section v-if="state.transferComplete" class="step-panel step-panel--center">
-          <div class="success-ring"><Icon icon="tabler:check" width="32" height="32" /></div>
-          <h3 class="success-title">{{ $t('Transfer Complete') }}</h3>
-          <p class="success-amount">{{ fmt(parseInt(state.amount)) }}</p>
-          <p class="success-route">{{ state.fromWallet?.name }} → {{ state.toWallet?.name }}</p>
+        <!--
+          Success panel.
+
+          Uses the shared SuccessCheckmark + the same uppercase
+          label / bold numeric anchor pattern as PaymentConfirmation
+          and BatchSendModal step 5. The "From → To" route stays —
+          it's the one piece of context unique to this flow and it
+          tells the user which side of the move they're looking at.
+        -->
+        <section v-if="state.transferComplete" class="step-panel step-panel--center transfer-success">
+          <SuccessCheckmark :animate="state.transferComplete" accent="green" />
+          <div class="success-label">{{ $t('Transfer Complete') }}</div>
+          <div class="success-amount">{{ fmt(parseInt(state.amount)) }}</div>
+          <div class="success-route">{{ state.fromWallet?.name }} → {{ state.toWallet?.name }}</div>
         </section>
 
-        <div v-if="state.transferError" class="banner banner--error banner--lg">
-          <Icon icon="tabler:alert-triangle" width="18" height="18" />
-          <span>{{ state.transferError }}</span>
-        </div>
       </main>
 
       <!-- Footer -->
-      <footer class="modal-footer">
-        <q-btn v-if="state.currentStep > 1 && !state.transferComplete && !state.isTransferring" flat no-caps class="btn-back" @click="goBack">
+      <footer v-if="state.transferComplete" class="modal-footer completion-actions">
+        <q-btn v-if="detailsRoute" :to="detailsRoute" unelevated no-caps
+          class="completion-button completion-button--details" :loading="openingDetails"
+          :aria-label="$t('Transaction Details')" @click="openDetails">
+          {{ $t('TX Details') }}
+        </q-btn>
+        <q-btn unelevated no-caps class="completion-button completion-button--done" :disable="openingDetails" @click="close">
+          {{ $t('Done') }}
+        </q-btn>
+      </footer>
+      <footer v-else class="modal-footer">
+        <q-btn v-if="state.currentStep > 1 && !state.isTransferring" flat no-caps class="btn-back" @click="goBack">
           <Icon icon="tabler:arrow-left" width="16" height="16" />
           <span>{{ $t('Back') }}</span>
         </q-btn>
         <q-space />
-        <q-btn v-if="!state.transferComplete" unelevated no-caps class="btn-main" :disable="!canProceed" :loading="state.isTransferring" @click="goNext">
+        <q-btn unelevated no-caps class="btn-main" :disable="!canProceed" :loading="state.isTransferring" @click="goNext">
           <span>{{ state.currentStep < 3 ? $t('Continue') : $t('Transfer Now') }}</span>
           <Icon v-if="state.currentStep < 3" icon="tabler:arrow-right" width="16" height="16" />
         </q-btn>
-        <q-btn v-else unelevated no-caps class="btn-main" @click="close">{{ $t('Done') }}</q-btn>
       </footer>
     </q-card>
 
@@ -246,10 +259,19 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, watch, nextTick, h } from 'vue';
+import { ref, reactive, computed, watch, nextTick, h, getCurrentInstance } from 'vue';
 import { useQuasar } from 'quasar';
 import { useWalletStore } from '../stores/wallet';
 import { haptics } from '../utils/haptics';
+import SuccessCheckmark from './SuccessCheckmark.vue';
+import ArkadeLogo from './ArkadeLogo.vue';
+import { internalTransferDetailsRoute } from '../utils/internalTransferDetails.js';
+
+// vue-i18n is configured in legacy mode (see src/boot/i18n.js), so
+// useI18n() throws "Not available in legacy mode". Reach $t through the
+// component proxy — same pattern as BatchSendModal.
+const { proxy } = getCurrentInstance();
+const t = (key, params) => proxy.$t(key, params);
 
 // ─────────────────────────────────────────────────────────────
 // Sub-components (functional)
@@ -285,15 +307,17 @@ const WalletAvatar = {
           fill: '#897FFF'
         })
       ]),
-      // LNBits - pink fill
+      // LNbits - pink fill
       props.type === 'lnbits' && h('svg', { width: '18', height: '18', viewBox: '0 0 502 902', fill: 'none', xmlns: 'http://www.w3.org/2000/svg' }, [
         h('path', {
           d: 'M158.566 493.857L1 901L450.49 355.202H264.831L501.791 1H187.881L36.4218 493.857H158.566Z',
           fill: '#FF1FE1'
         })
       ]),
+      // Arkade brand mark: follows the theme (purple light, red dark)
+      props.type === 'arkade' && h(ArkadeLogo, { variant: 'mark', size: 20 }),
       // Default wallet icon
-      !['spark', 'nwc', 'lnbits'].includes(props.type) && h('svg', { width: '18', height: '18', viewBox: '0 0 24 24', fill: 'none', xmlns: 'http://www.w3.org/2000/svg' }, [
+      !['spark', 'nwc', 'lnbits', 'arkade'].includes(props.type) && h('svg', { width: '18', height: '18', viewBox: '0 0 24 24', fill: 'none', xmlns: 'http://www.w3.org/2000/svg' }, [
         h('path', {
           d: 'M19 7h-1V6a3 3 0 0 0-3-3H5a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3h14a3 3 0 0 0 3-3v-8a3 3 0 0 0-3-3zm-4 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2z',
           fill: 'white'
@@ -318,7 +342,12 @@ const StatusDot = {
 // ─────────────────────────────────────────────────────────────
 // Props / Emits
 // ─────────────────────────────────────────────────────────────
-const props = defineProps({ modelValue: { type: Boolean, default: false } });
+const props = defineProps({
+  modelValue: { type: Boolean, default: false },
+  // Preselects the source (Settings' "Move funds" before removing a wallet);
+  // the active wallet otherwise.
+  fromWalletId: { type: String, default: null },
+});
 const emit = defineEmits(['update:modelValue', 'transfer-complete']);
 
 // ─────────────────────────────────────────────────────────────
@@ -340,6 +369,7 @@ const STEPS = [
 // State
 // ─────────────────────────────────────────────────────────────
 const amountInputRef = ref(null);
+const openingDetails = ref(false);
 const connStatus = reactive({});
 
 const state = reactive({
@@ -352,7 +382,7 @@ const state = reactive({
   showToPicker: false,
   isTransferring: false,
   transferComplete: false,
-  transferError: '',
+  transactionId: null,
   isReconnecting: false,
   isMaxAmount: false
 });
@@ -366,8 +396,18 @@ const isVisible = computed({
 });
 
 const themeClass = computed(() => $q.dark.isActive ? 'theme-dark' : 'theme-light');
+const detailsRoute = computed(() => internalTransferDetailsRoute(state.transactionId, state.fromWallet?.id));
 const wallets = computed(() => store.getTransferableWallets());
 const sameWalletSelected = computed(() => state.fromWallet && state.toWallet && state.fromWallet.id === state.toWallet.id);
+
+// An Arkade leg rides a Lightning swap, so a small swap fee applies — say so
+// instead of promising a plain instant Lightning hop.
+const transferNote = computed(() => {
+  const arkadeLeg = state.fromWallet?.type === 'arkade' || state.toWallet?.type === 'arkade';
+  return arkadeLeg
+    ? t('This transfer happens via Lightning and includes a small swap fee')
+    : t('This transfer happens instantly via Lightning');
+});
 
 const canProceed = computed(() => {
   if (state.isTransferring) return false;
@@ -385,8 +425,9 @@ const fmt = (sats) => sats ? `${sats.toLocaleString()} sats` : '0 sats';
 // Methods
 // ─────────────────────────────────────────────────────────────
 async function init() {
-  const active = wallets.value.find(w => w.id === store.activeWalletId);
-  if (active?.canSend) state.fromWallet = active;
+  const preferred = wallets.value.find(w => w.id === (props.fromWalletId || store.activeWalletId));
+  if (preferred?.canSend) state.fromWallet = preferred;
+  if (state.toWallet?.id === state.fromWallet?.id) state.toWallet = null;
   await reconnectAll();
 }
 
@@ -394,7 +435,7 @@ async function reconnectAll() {
   state.isReconnecting = true;
   for (const w of store.wallets) {
     const connected = store.connectionStates[w.id]?.connected;
-    connStatus[w.id] = connected ? 'connected' : (w.type === 'spark' && !store.sessionPin) ? 'pin_required' : 'connecting';
+    connStatus[w.id] = connected ? 'connected' : 'connecting';
   }
   await Promise.allSettled(store.wallets.map(async (w) => {
     if (connStatus[w.id] !== 'connecting') return;
@@ -489,15 +530,25 @@ function goBack() {
 async function doTransfer() {
   if (state.isTransferring) return;
   state.isTransferring = true;
-  state.transferError = '';
   try {
     haptics.medium();
-    await store.transferBetweenWallets(state.fromWallet.id, state.toWallet.id, parseInt(state.amount));
+    const result = await store.transferBetweenWallets(state.fromWallet.id, state.toWallet.id, parseInt(state.amount));
+    state.transactionId = result.transactionId;
     state.transferComplete = true;
     haptics.success();
     emit('transfer-complete', { fromWallet: state.fromWallet, toWallet: state.toWallet, amount: parseInt(state.amount) });
   } catch (e) {
-    state.transferError = e.message || 'Transfer failed';
+    // Surface the failure in the global payment-error dialog so the
+    // transfer-fail screen looks the same as every other payment
+    // surface. The inline banner that used to live on step 3 has
+    // been retired in favour of the dialog.
+    store.showPaymentError(e, {
+      context: 'transfer',
+      walletType: state.fromWallet?.type || null,
+      route: `Transfer (${state.fromWallet?.name || '?'} → ${state.toWallet?.name || '?'})`,
+      amountSats: parseInt(state.amount) || undefined,
+      t: t,
+    });
     haptics.error();
   } finally {
     state.isTransferring = false;
@@ -513,7 +564,7 @@ function resetState() {
     amountError: '',
     isTransferring: false,
     transferComplete: false,
-    transferError: '',
+    transactionId: null,
     isMaxAmount: false,
     isReconnecting: false
   });
@@ -522,6 +573,24 @@ function resetState() {
 
 function close() {
   isVisible.value = false;
+}
+
+async function openDetails(event, navigate) {
+  // Preserve the link's normal new-tab behavior. For in-app navigation, keep
+  // the sheet visible until the one destination route is ready: no History
+  // detour and no close-animation flash of the wallet underneath.
+  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  event.preventDefault();
+  if (openingDetails.value) return;
+  openingDetails.value = true;
+  try {
+    const failure = await navigate({ returnRouterError: true });
+    if (!failure) close();
+  } catch {
+    $q.notify({ type: 'negative', message: t("Couldn't load details") });
+  } finally {
+    openingDetails.value = false;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -812,21 +881,158 @@ watch(() => props.modelValue, (open) => { if (open) init(); });
 
 /* ════════════════════════════════════════════════════════════
    Success
+
+   Same visual chrome as PaymentConfirmation + BatchSendModal step 5:
+   shared SuccessCheckmark primitive, uppercase tracked label, bold
+   numeric anchor for the amount, supporting route line. The
+   `.transfer-success` wrapper just adds column gap + bottom padding
+   so the panel breathes inside the modal.
    ════════════════════════════════════════════════════════════ */
-.success-ring { width: 72px; height: 72px; margin: 0 auto 20px; border-radius: 50%; background: rgba(21,222,114,.15); color: #15DE72; display: flex; align-items: center; justify-content: center; animation: pop .4s cubic-bezier(.175,.885,.32,1.275); }
-@keyframes pop { 0% { transform: scale(0); opacity: 0; } 60% { transform: scale(1.1); } 100% { transform: scale(1); opacity: 1; } }
-.success-title { margin: 0 0 8px; font-size: 20px; font-weight: 600; color: var(--c-text); }
-.success-amount { margin: 0 0 8px; font-size: 32px; font-weight: 700; color: #15DE72; }
-.success-route { margin: 0; font-size: 14px; color: var(--c-text2); }
+.transfer-success {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 8px 0 24px;
+}
+
+.success-label {
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--c-text2);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  margin-top: 6px;
+}
+
+.success-amount {
+  font-family: 'Manrope', sans-serif;
+  font-size: 2.5rem;
+  font-weight: 800;
+  color: var(--c-text);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.success-route {
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--c-text2);
+  margin: 0;
+}
 
 /* ════════════════════════════════════════════════════════════
    Footer
    ════════════════════════════════════════════════════════════ */
-.modal-footer { display: flex; align-items: center; padding: 16px 20px; padding-bottom: max(16px, env(safe-area-inset-bottom)); border-top: 1px solid var(--c-border); gap: 12px; }
+.modal-footer { display: flex; align-items: center; padding: 16px 20px; padding-bottom: max(16px, var(--safe-bottom, 16px)); border-top: 1px solid var(--c-border); gap: 12px; }
+.completion-actions { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); }
+.completion-button { min-height: 48px; min-width: 0; padding: 12px 8px; border-radius: 14px; font: 600 15px/1.3 'Manrope', sans-serif; letter-spacing: 0; }
+.completion-button :deep(.q-btn__content) { white-space: nowrap; }
+.completion-button--done { background: #15de72; color: #092515; }
+.completion-button--details { background: rgba(255,255,255,.07); color: var(--c-text); box-shadow: inset 0 0 0 1px var(--c-border); }
+.theme-light .completion-button--done { background: var(--btn-neutral-bg); color: var(--btn-neutral-fg); }
+.theme-light .completion-button--details { background: rgba(26,26,28,.05); }
+.completion-button:focus-visible { outline: 2px solid var(--c-text); outline-offset: 3px; }
+.completion-button:active { filter: brightness(.92); }
 .btn-back { display: flex; align-items: center; gap: 4px; padding: 10px 16px; font-size: 15px; font-weight: 500; color: var(--c-text2); }
-.btn-main { display: flex; align-items: center; gap: 6px; padding: 12px 24px; font-size: 15px; font-weight: 600; background: var(--gradient-green) !important; color: #fff !important; border-radius: var(--radius-md); }
-.btn-main:hover { opacity: 0.9; }
-.btn-main:disabled { opacity: .5; }
+/* Primary CTA — tinted green, matches the Create Invoice / Continue
+   pattern used across the app. */
+.btn-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 24px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  background: rgba(21, 222, 114, 0.14) !important;
+  color: #15DE72 !important;
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 1px rgba(21, 222, 114, 0.22);
+  transition: filter 0.18s ease, transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.btn-main:hover:not(:disabled) { filter: brightness(1.06); }
+.btn-main:active:not(:disabled) { transform: scale(0.98); filter: brightness(0.94); }
+.btn-main:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ════════════════════════════════════════════════════════════
+   Light mode — remap brand-green accents to the cream palette.
+   Dark mode keeps the bright #15DE72 everywhere above; on cream
+   the same hex reads as a loud neon, so we use the darker shade
+   #059573 for decoration and flip the primary CTA to the neutral
+   dark-pill language shared across the app (Create Invoice,
+   Restore Spark Wallet, Add Contact, …).
+
+   Only decorative greens are remapped — "success" greens on the
+   transfer-complete ring and amount stay coloured because that
+   state *is* the semantic confirmation; muting them to grey would
+   erase the "done" feedback.
+   ════════════════════════════════════════════════════════════ */
+.body--light .header-icon { color: #059573; }
+
+.body--light .step.active .step-dot { background: #059573; }
+.body--light .step-line.active { background: #059573; }
+
+.body--light .wallet-btn.selected { border-color: #059573; }
+.body--light .wallet-bal { color: #059573; }
+
+.body--light .direction-line { background: linear-gradient(to bottom, var(--c-bg3), #059573); }
+.body--light .direction-icon {
+  background: rgba(5, 149, 115, 0.08);
+  border-color: rgba(5, 149, 115, 0.35);
+  color: #059573;
+}
+.body--light .direction-line-bottom { background: linear-gradient(to bottom, #059573, var(--c-bg3)); }
+
+.body--light .banner--info { background: rgba(5, 149, 115, 0.08); color: #059573; }
+
+.body--light .route-arrow {
+  background: rgba(5, 149, 115, 0.08);
+  color: #059573;
+}
+
+.body--light .quick-chip--max {
+  background: rgba(5, 149, 115, 0.08);
+  color: #059573;
+}
+.body--light .quick-chip--max:hover { background: rgba(5, 149, 115, 0.16); }
+
+.body--light .confirm-amount { color: var(--text-primary); }
+
+.body--light .connector-line { background: linear-gradient(to right, var(--c-bg3), #059573); }
+.body--light .connector-line:last-child { background: linear-gradient(to right, #059573, var(--c-bg3)); }
+.body--light .connector-arrow {
+  background: rgba(5, 149, 115, 0.08);
+  border-color: rgba(5, 149, 115, 0.35);
+  color: #059573;
+}
+
+/* Transfer-complete ring and amount stay coloured — this is the
+   semantic "success" state, not decoration. Softened to the muted
+   dark-green so it sits naturally on cream. */
+/*
+  Success amount now reads in the neutral primary-text colour like
+  PaymentConfirmation's amount-value. Removed the previous green
+  tint here — the SuccessCheckmark already carries the colour
+  signal, so doubling up on the amount overwhelmed the layout.
+*/
+.body--light .check { color: #059573; }
+.body--light .dot--ok { background: #059573; }
+.body--light .picker-row.selected { background: rgba(5, 149, 115, 0.08); }
+
+/* Primary CTA — neutral dark pill on cream, same as every other
+   "Continue / Confirm / Done" button across the app. Overrides the
+   base tinted-green via selector specificity (body--light + class)
+   plus !important to beat the upstream !important. */
+.body--light .btn-main {
+  background: var(--btn-neutral-bg) !important;
+  color: var(--btn-neutral-fg) !important;
+  box-shadow: none !important;
+}
 
 /* ════════════════════════════════════════════════════════════
    Picker

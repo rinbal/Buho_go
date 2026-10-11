@@ -1,366 +1,423 @@
+<!--
+  SendModal
+  Input-first Send sheet opened from the wallet's Send button. One tall
+  bottom sheet holds every entry path — no nested sub-sheets:
+
+    - Field:     one auto-detecting input (type or paste anything we can
+                 pay: invoice, Lightning address, LNURL, Spark, Arkade,
+                 Bitcoin, BIP21, npub/nprofile, KE/ZM phone number). A
+                 type chip confirms what we recognized; unrecognized text
+                 live-filters the contact list instead of erroring.
+    - Paste:     reads the clipboard into the field, lets the user verify,
+                 then auto-advances. No silent fire-and-forget.
+    - Scan:      opens the scanner as a child surface (native MLKit
+                 overlay on iOS/Android, qr-scanner video on web). The
+                 decoded string lands back in the field so the user
+                 always sees what is being resolved.
+    - Mobile Money: phone-first entry for the KE/ZM fiat-payout rails,
+                 surfacing what the field would otherwise only reveal
+                 by accident.
+    - Batch send / Manage: forwarded to the parent (BatchSendModal) and
+                 the Address Book page.
+    - Contacts:  inlined list (favorites → recents → all) with the same
+                 payability guards the quick-contacts modal applies.
+
+  All payment-routing logic (BIP21 unwrap, SA-retailer QR conversion,
+  Lightning/LNURL/Spark/Bitcoin detection, parent emit, the
+  resolving/resolve-error contract with Wallet.onPaymentDetected) is
+  unchanged from the previous version — only the presentation layer was
+  rebuilt around the field instead of the camera.
+-->
 <template>
   <q-dialog
     v-model="show"
-    maximized
+    position="bottom"
+    :persistent="ctaBusy"
     transition-show="slide-up"
     transition-hide="slide-down"
-    class="send-modal"
+    class="send-sheet-dialog"
+    @show="onSheetShow"
     @before-hide="resetState"
   >
-    <q-card class="send-card" :class="$q.dark.isActive ? 'send-card-dark' : 'send-card-light'">
-      <!-- Header -->
-      <q-card-section class="send-header">
-        <div class="header-content">
-          <q-btn
-            flat
-            round
-            dense
-            @click="closeModal"
-            class="back-btn"
-            :class="$q.dark.isActive ? 'back_btn_dark' : 'back_btn_light'"
-          >
-            <svg v-if="$q.dark.isActive" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"
-                 fill="none">
-              <path
-                d="M8.83191 10.5936C8.75381 10.5162 8.69181 10.424 8.6495 10.3224C8.6072 10.2209 8.58542 10.112 8.58542 10.002C8.58542 9.89195 8.6072 9.78303 8.6495 9.68148C8.69181 9.57993 8.75381 9.48777 8.83191 9.4103L12.6569 5.59363C12.735 5.51616 12.797 5.42399 12.8393 5.32244C12.8816 5.22089 12.9034 5.11197 12.9034 5.00196C12.9034 4.89195 12.8816 4.78303 12.8393 4.68148C12.797 4.57993 12.735 4.48776 12.6569 4.4103C12.5008 4.25509 12.2896 4.16797 12.0694 4.16797C11.8493 4.16797 11.638 4.25509 11.4819 4.4103L7.65691 8.2353C7.18875 8.70405 6.92578 9.33946 6.92578 10.002C6.92578 10.6645 7.18875 11.2999 7.65691 11.7686L11.4819 15.5936C11.6371 15.7476 11.8466 15.8344 12.0652 15.8353C12.1749 15.8359 12.2836 15.8149 12.3852 15.7734C12.4867 15.732 12.579 15.6709 12.6569 15.5936C12.735 15.5162 12.797 15.424 12.8393 15.3224C12.8816 15.2209 12.9034 15.112 12.9034 15.002C12.9034 14.892 12.8816 14.783 12.8393 14.6815C12.797 14.5799 12.735 14.4878 12.6569 14.4103L8.83191 10.5936Z"
-                fill="white"/>
-            </svg>
-            <svg v-else xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20" fill="none">
-              <path
-                d="M8.83191 10.5936C8.75381 10.5162 8.69181 10.424 8.6495 10.3224C8.6072 10.2209 8.58542 10.112 8.58542 10.002C8.58542 9.89195 8.6072 9.78303 8.6495 9.68148C8.69181 9.57993 8.75381 9.48777 8.83191 9.4103L12.6569 5.59363C12.735 5.51616 12.797 5.42399 12.8393 5.32244C12.8816 5.22089 12.9034 5.11197 12.9034 5.00196C12.9034 4.89195 12.8816 4.78303 12.8393 4.68148C12.797 4.57993 12.735 4.48776 12.6569 4.4103C12.5008 4.25509 12.2896 4.16797 12.0694 4.16797C11.8493 4.16797 11.638 4.25509 11.4819 4.4103L7.65691 8.2353C7.18875 8.70405 6.92578 9.33946 6.92578 10.002C6.92578 10.6645 7.18875 11.2999 7.65691 11.7686L11.4819 15.5936C11.6371 15.7476 11.8466 15.8344 12.0652 15.8353C12.1749 15.8359 12.2836 15.8149 12.3852 15.7734C12.4867 15.732 12.579 15.6709 12.6569 15.5936C12.735 15.5162 12.797 15.424 12.8393 15.3224C12.8816 15.2209 12.9034 15.112 12.9034 15.002C12.9034 14.892 12.8816 14.783 12.8393 14.6815C12.797 14.5799 12.735 14.4878 12.6569 14.4103L8.83191 10.5936Z"
-                fill="#6D6D6D"/>
-            </svg>
-          </q-btn>
-          <div class="header-title" :class="$q.dark.isActive ? 'main_page_title_dark' : 'main_page_title_light'">
-            {{ $t('Send') }}
-          </div>
-          <div class="header-spacer"></div>
-        </div>
-      </q-card-section>
+    <q-card class="send-sheet" :class="$q.dark.isActive ? 'send-sheet-dark' : 'send-sheet-light'">
+      <div class="grab-bar"></div>
 
-      <!-- Camera View -->
-      <div class="camera-container">
-        <video
-          v-if="showCamera && !isProcessing"
-          ref="videoElement"
-          class="camera-view"
-          style="width: 100%; height: 100%; object-fit: cover;"
-          playsinline
+      <!-- Always-reachable way out. While busy it cancels the whole Send
+           flow (the backdrop is persistent then, so this is the one exit).
+           Hidden in Mobile Money mode, whose header owns the back slot. -->
+      <q-btn v-if="!mobileMoneyMode" flat round dense class="sheet-close glass-back-btn" :aria-label="$t('Back')" @click="closeModal">
+        <Icon icon="tabler:chevron-left" width="20" height="20" />
+      </q-btn>
+
+      <!-- Mobile Money mode header: back arrow + label. The field below
+           switches to phone entry; everything else yields to it. -->
+      <header v-if="mobileMoneyMode" class="mm-head">
+        <q-btn flat round dense class="mm-back" :aria-label="$t('Back')" @click="exitMobileMoney">
+          <Icon icon="tabler:chevron-left" width="20" height="20" />
+        </q-btn>
+        <span class="mm-title">{{ $t('Mobile Money') }}</span>
+      </header>
+
+      <!-- ─────────────  ENTRY FIELD  ───────────── -->
+      <section class="entry-block">
+        <!-- Clipboard suggestion — web only (native platforms surface a
+             system "pasted from clipboard" notice on programmatic reads,
+             so there the explicit Paste button stays the path). One tap
+             applies it; it resolves to the confirm sheet, never sends. -->
+        <transition name="type-pill">
+          <button
+            v-if="showClipboardSuggestion"
+            type="button"
+            class="clip-suggest"
+            data-audit="send-clip-suggest"
+            @click="applyClipboardSuggestion"
+          >
+            <Icon icon="tabler:clipboard-check" width="15" height="15" class="clip-suggest-icon" />
+            <span class="clip-suggest-text">{{ clipboardPreview }}</span>
+            <span class="clip-suggest-cta">{{ $t('Paste') }}</span>
+          </button>
+        </transition>
+        <textarea
+          v-model="manualInput"
+          class="manual-textarea"
+          :class="{ 'manual-textarea--error': !!resolveError }"
+          :placeholder="mobileMoneyMode ? $t('Enter a mobile number') : $t('Enter a name, invoice, or address')"
+          rows="3"
+          autocapitalize="off"
+          autocorrect="off"
+          spellcheck="false"
+          :inputmode="mobileMoneyMode ? 'tel' : 'text'"
+          :disabled="ctaBusy"
+          ref="manualTextarea"
+          data-audit="send-input"
+          @paste="onTextareaPaste"
         />
 
-        <!-- Processing Overlay -->
-        <div v-if="isProcessing" class="processing-overlay">
-          <q-spinner-dots color="#15DE72" size="3rem"/>
-          <div class="processing-text">{{ $t('Processing payment...') }}</div>
+        <div class="field-meta">
+          <div
+            class="input-helper"
+            :class="{
+              'input-helper--error': !!resolveError,
+              'input-helper--warn': !resolveError && !!capabilityBlocked
+            }"
+          >
+            <template v-if="resolveError">
+              <Icon icon="tabler:alert-circle" width="13" height="13" class="helper-icon-error" />
+              <span>{{ resolveError }}</span>
+            </template>
+            <template v-else-if="capabilityBlocked">
+              <Icon icon="tabler:arrows-exchange" width="13" height="13" class="helper-icon-warn" />
+              <span>{{ capabilityBlocked }}</span>
+            </template>
+            <template v-else-if="mobileMoneyMode">
+              <span v-if="mmCountryOption">
+                {{ countryName(mmCountryOption.code) }} · +{{ mmCountryOption.callingCode }}<template
+                  v-if="mmCountryOption.networkNote"
+                > · {{ $t(mmCountryOption.networkNote) }}</template>
+              </span>
+              <span v-else>{{ $t('Type the number, or pick the country first') }}</span>
+            </template>
+          </div>
+          <transition name="type-pill">
+            <div
+              v-if="detectedInputType"
+              class="detected-pill"
+              :class="`detected-pill--${detectedInputType}`"
+            >
+              <img
+                v-if="detectedInputType === 'spark'"
+                width="11" height="11"
+                :src="$q.dark.isActive ? '/Spark/Spark Asterisk White.svg' : '/Spark/Spark Asterisk Black.svg'"
+                alt="Spark"
+              />
+              <Icon v-else :icon="detectedInputIcon" width="12" height="12" />
+              <span>{{ detectedInputLabel }}</span>
+            </div>
+          </transition>
         </div>
+      </section>
 
-        <!-- Camera Error -->
-        <div v-if="cameraError" class="camera-error">
-          <Icon icon="tabler:camera" style="font-size: 4rem; color: #bdbdbd;" />
-          <div class="error-title">{{ $t('Camera Access Required') }}</div>
-          <div class="error-subtitle">{{ cameraError }}</div>
-          <q-btn
-            class="retry-btn"
-            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
-            :label="$t('Retry')"
-            @click="initializeCamera"
-            no-caps
-          />
-        </div>
-
-        <!-- Scanning Frame -->
-        <div v-if="showCamera && !isProcessing" class="scanning-frame">
-          <div class="frame-corner top-left"></div>
-          <div class="frame-corner top-right"></div>
-          <div class="frame-corner bottom-left"></div>
-          <div class="frame-corner bottom-right"></div>
-        </div>
+      <!-- ─────────────  MOBILE MONEY COUNTRY SELECTOR  ─────────────
+           Optional, not a gate: typing a full number still resolves on its
+           own. Picking a country locks recognition to it — which also lets
+           us accept the bare local number and removes the KE/ZM 07x
+           ambiguity before it can appear. -->
+      <div
+        v-if="mobileMoneyMode"
+        class="mm-countries"
+        :style="{ gridTemplateColumns: `repeat(${mmCountryColumns}, 1fr)` }"
+      >
+        <button
+          v-for="c in payoutCountries"
+          :key="c.code"
+          type="button"
+          class="mm-country"
+          :class="{ 'mm-country--active': mmCountry === c.code }"
+          :data-audit="`send-mm-country-${c.code.toLowerCase()}`"
+          @click="selectMmCountry(c.code)"
+        >
+          <img :src="c.logo || c.flag" class="mm-country-logo" alt="" aria-hidden="true" />
+          <span class="mm-country-name">{{ countryName(c.code) }}</span>
+          <span class="mm-country-cc">+{{ c.callingCode }}</span>
+        </button>
       </div>
 
-      <!-- Bottom Actions -->
-      <q-card-section class="send-actions">
-        <div class="action-buttons">
-          <q-btn
-            flat
-            class="action-btn"
-            :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
-            @click="showManualInput"
-          >
-            <div class="btn-content">
-              <Icon icon="tabler:keyboard" width="22" height="22" class="btn-icon" />
-              <span class="btn-label">{{ $t('Manual') }}</span>
-            </div>
-          </q-btn>
+      <!-- ─────────────  PASTE / SCAN  ───────────── -->
+      <div v-if="!mobileMoneyMode && !isValidManualInput" class="quick-actions">
+        <button type="button" class="quick-btn" data-audit="send-paste" @click="pasteFromClipboard">
+          <Icon icon="tabler:clipboard" width="19" height="19" class="quick-icon" />
+          <span>{{ $t('Paste') }}</span>
+        </button>
+        <button type="button" class="quick-btn" data-audit="send-scan" @click="openScanner">
+          <Icon icon="tabler:scan" width="19" height="19" class="quick-icon" />
+          <span>{{ $t('Scan') }}</span>
+        </button>
+      </div>
 
-          <q-btn
-            flat
-            class="action-btn"
-            :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
-            @click="pasteFromClipboard"
-          >
-            <div class="btn-content">
-              <Icon icon="tabler:clipboard" width="22" height="22" class="btn-icon" />
-              <span class="btn-label">{{ $t('Paste') }}</span>
-            </div>
-          </q-btn>
-
-          <q-btn
-            flat
-            class="action-btn"
-            :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
-            @click="showContactPicker"
-          >
-            <div class="btn-content">
-              <Icon icon="tabler:address-book" width="22" height="22" class="btn-icon" />
-              <span class="btn-label">{{ $t('Contacts') }}</span>
-            </div>
-          </q-btn>
+      <!-- ─────────────  RESOLVING SKELETON  ─────────────
+           While the destination is fetched/validated, show the shape of
+           what's coming (the confirm sheet's recipient hero) instead of
+           any intermediate "we recognized this" card — the next screen
+           forming, never a review-this step. Failures land as the inline
+           field error; success replaces this with the real sheet. -->
+      <section v-if="ctaBusy" class="resolve-skeleton">
+        <q-skeleton type="circle" size="44px" animation="wave" />
+        <div class="resolve-skeleton-lines">
+          <q-skeleton type="text" width="42%" height="16px" animation="wave" />
+          <q-skeleton type="text" width="68%" height="12px" animation="wave" />
         </div>
-      </q-card-section>
+      </section>
+
+      <!-- ─────────────  METHOD ROWS  ───────────── -->
+      <div v-if="showMethods" class="method-block">
+        <button type="button" class="method-row" data-audit="send-mobile-money" @click="enterMobileMoney">
+          <span class="method-icon">
+            <Icon icon="tabler:device-mobile" width="20" height="20" />
+          </span>
+          <span class="method-text">
+            <span class="method-title">{{ $t('Mobile Money') }}</span>
+            <span class="method-sub">{{ $t('Pay to borderless mobile money') }}</span>
+          </span>
+          <Icon icon="tabler:chevron-right" width="16" height="16" class="method-chev" />
+        </button>
+        <div class="method-divider"></div>
+        <button type="button" class="method-row" data-audit="send-batch" @click="openBatchSend">
+          <span class="method-icon">
+            <Icon icon="tabler:stack-2" width="20" height="20" />
+          </span>
+          <span class="method-text">
+            <span class="method-title">{{ $t('Batch Send') }}</span>
+            <span class="method-sub">{{ $t('Pay several people at once') }}</span>
+          </span>
+          <Icon icon="tabler:chevron-right" width="16" height="16" class="method-chev" />
+        </button>
+      </div>
+
+      <!-- ─────────────  CONTACTS  ───────────── -->
+      <section v-if="showContactsSection" class="contacts-section">
+        <div class="section-head">
+          <span class="section-label">{{ $t('Send to a contact') }}</span>
+          <button type="button" class="manage-btn" data-audit="send-manage-contacts" @click="goToAddressBook">
+            {{ $t('Manage') }}
+          </button>
+        </div>
+
+        <div class="contacts-scroll">
+          <!-- Loading skeleton on first open -->
+          <div v-if="contactsLoading" class="contacts-skeleton">
+            <div v-for="n in 4" :key="'sk-' + n" class="skeleton-row">
+              <q-skeleton type="circle" size="44px" />
+              <q-skeleton type="text" width="45%" />
+            </div>
+          </div>
+
+          <template v-else-if="displayContacts.length > 0">
+            <button
+              v-for="contact in displayContacts"
+              :key="contact.id"
+              type="button"
+              class="contact-row"
+              :class="{ 'contact-row--unpayable': !isContactPayable(contact) }"
+              data-audit="send-contact-row"
+              @click="onContactPicked(contact)"
+            >
+              <!-- Rail dot: icon-only nuance on the avatar, and ONLY for
+                   the constrained rails (spark / arkade / on-chain) — a
+                   Lightning contact is the payable-everywhere norm and
+                   stays clean. Unpayable rows dim; tapping still explains
+                   why via the shared capability toast. -->
+              <span class="row-avatar-wrap">
+                <ContactAvatar class="row-avatar" :entry="contact" />
+                <span
+                  v-if="contactRailDot(contact)"
+                  class="row-rail-dot"
+                  :style="{ background: contactRailDot(contact).color }"
+                >
+                  <svg v-if="contactRailDot(contact).kind === 'spark'" width="9" height="9" viewBox="0 0 135 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path fill-rule="evenodd" clip-rule="evenodd" d="M79.4319 49.3554L81.7454 0H52.8438L55.1573 49.356L8.9311 31.9035L0 59.3906L47.6565 72.4425L16.7743 111.012L40.1562 128L67.2966 86.7083L94.4358 127.998L117.818 111.01L86.9359 72.4412L134.587 59.3907L125.656 31.9036L79.4319 49.3554Z" fill="white"/>
+                  </svg>
+                  <ArkadeLogo v-else-if="contactRailDot(contact).kind === 'arkade'" variant="mark" color="white" :size="9" />
+                  <Icon v-else icon="tabler:currency-bitcoin" width="10" height="10" />
+                </span>
+              </span>
+              <span class="row-name">
+                {{ contact.name }}
+                <Icon v-if="contact.isFavorite" icon="tabler:star-filled" width="11" height="11" class="row-star" />
+              </span>
+              <Icon icon="tabler:chevron-right" width="16" height="16" class="row-chev" />
+            </button>
+          </template>
+
+          <!-- Typed text matches nothing: neither a payment format nor a
+               saved contact. Guidance, not an error — the user may still
+               be mid-paste or mid-typo. -->
+          <div v-else-if="contactQuery" class="contacts-empty">
+            <Icon icon="tabler:search-off" width="26" height="26" class="empty-icon" />
+            <p class="empty-title">{{ $t('No matches') }}</p>
+            <p class="empty-sub">{{ $t('Keep typing, or paste an invoice or address') }}</p>
+          </div>
+
+          <!-- First-run: no contacts saved yet. Paste and Scan above stay
+               the obvious next actions; this is a soft pointer, not a wall. -->
+          <div v-else class="contacts-empty">
+            <Icon icon="tabler:address-book" width="26" height="26" class="empty-icon" />
+            <p class="empty-title">{{ $t('No contacts yet') }}</p>
+            <p class="empty-sub">{{ $t('People you save appear here for one-tap sending') }}</p>
+            <button type="button" class="empty-add-btn" @click="goToAddressBook">
+              <Icon icon="tabler:plus" width="15" height="15" />
+              <span>{{ $t('Add contact') }}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- ─────────────  FOOTER  ───────────── -->
+      <footer v-if="ctaBusy || phoneNeedsCountryChoice || isValidManualInput" class="sheet-footer">
+        <!-- While we fetch + validate the destination, the CTA becomes the
+             shared filling loading-button (same one the send/commit flow
+             uses), so the wait reads as "we're resolving this", not a frozen
+             button. The parent closes the sheet on success or pushes an
+             inline error above on failure. -->
+        <ProgressCta v-if="ctaBusy" :label="$t('Fetching…')" />
+        <!-- 075-078 are valid mobile prefixes in BOTH Kenya and Zambia.
+             Rather than silently guess (and risk paying the wrong country),
+             let the user pick. Unambiguous numbers and +CC input skip
+             straight to Continue / auto-advance. -->
+        <div v-else-if="phoneNeedsCountryChoice" class="country-choice">
+          <div class="country-choice-label">{{ $t('Which country?') }}</div>
+          <div class="country-choice-list">
+            <button
+              v-for="c in orderedPhoneCandidates"
+              :key="c.country.code"
+              type="button"
+              class="country-choice-btn"
+              @click="selectPhoneCountry(c)"
+            >
+              <img
+                v-if="c.brandLogo"
+                :src="c.brandLogo"
+                class="country-choice-logo"
+                alt=""
+                aria-hidden="true"
+              />
+              <span class="country-choice-text">
+                <span class="country-choice-name">{{ countryName(c.country.code) }}</span>
+                <span v-if="c.operator" class="country-choice-op">{{ c.operator }}</span>
+              </span>
+              <span class="country-choice-number">{{ c.display }}</span>
+            </button>
+          </div>
+        </div>
+        <button
+          v-else
+          type="button"
+          class="primary-cta"
+          data-audit="send-continue"
+          :disabled="!!capabilityBlocked"
+          @click="processManualInput"
+        >
+          {{ $t('Continue') }}
+        </button>
+      </footer>
     </q-card>
 
-    <!-- Manual Input Dialog -->
-    <q-dialog v-model="showManualDialog" class="manual-dialog-backdrop">
-      <q-card class="manual-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section class="manual-header">
-          <div class="manual-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-            {{ $t('Who do you want to pay?') }}
-          </div>
-          <q-btn flat round dense v-close-popup
-                 :class="$q.dark.isActive ? 'close_btn_dark' : 'close_btn_light'">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 20 20" fill="none">
-              <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </q-btn>
-        </q-card-section>
-
-        <q-card-section class="manual-content">
-          <q-input
-            v-model="manualInput"
-            outlined
-            :label="$t('Paste invoice or enter address')"
-            :placeholder="manualInputPlaceholder"
-            class="manual-input"
-            :class="$q.dark.isActive ? 'manual-input-dark' : 'manual-input-light'"
-            color="green"
-            autofocus
-            :rules="[validatePaymentInput]"
-          />
-        </q-card-section>
-
-        <q-card-actions align="right" class="manual-actions" :class="$q.dark.isActive ? 'actions-dark' : 'actions-light'">
-          <q-btn flat :label="$t('Cancel')" v-close-popup :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'"/>
-          <q-btn
-            flat
-            :label="$t('Continue')"
-            class="continue-btn"
-            @click="processManualInput"
-            :disable="!isValidManualInput"
-          />
-        </q-card-actions>
-      </q-card>
-    </q-dialog>
-
-    <!-- Contact Picker Dialog -->
-    <q-dialog v-model="showContactDialog" class="contact-dialog-backdrop">
-      <q-card class="contact-picker-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section class="contact-picker-header">
-          <div class="contact-picker-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-            {{ $t('Choose a contact') }}
-          </div>
-          <q-btn flat round dense v-close-popup
-                 :class="$q.dark.isActive ? 'close_btn_dark' : 'close_btn_light'">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 20 20" fill="none">
-              <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </q-btn>
-        </q-card-section>
-
-        <!-- Search (only show if 5+ contacts) -->
-        <q-card-section v-if="contacts.length >= 5" class="contact-search-section">
-          <q-input
-            v-model="contactSearch"
-            outlined
-            dense
-            :placeholder="$t('Search contacts...')"
-            class="contact-search"
-            :class="$q.dark.isActive ? 'manual-input-dark' : 'manual-input-light'"
-          >
-            <template v-slot:prepend>
-              <Icon icon="tabler:search" :style="{ color: $q.dark.isActive ? '#9e9e9e' : '#757575' }" />
-            </template>
-            <template v-slot:append v-if="contactSearch">
-              <Icon icon="tabler:x" class="cursor-pointer" @click="contactSearch = ''" />
-            </template>
-          </q-input>
-        </q-card-section>
-
-        <!-- Contact List -->
-        <q-card-section class="contact-list-section">
-          <!-- Empty State -->
-          <div v-if="contacts.length === 0" class="contact-empty-state">
-            <Icon icon="tabler:users" width="48" height="48" :style="{ color: $q.dark.isActive ? '#757575' : '#9e9e9e' }" />
-            <div class="empty-title" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
-              {{ $t('No contacts yet') }}
-            </div>
-            <div class="empty-subtitle" :class="$q.dark.isActive ? 'text-grey-6' : 'text-grey-5'">
-              {{ $t('Save contacts in the Address Book to quickly pay them') }}
-            </div>
-            <q-btn
-              unelevated
-              no-caps
-              class="add-contact-cta"
-              :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
-              @click="goToAddressBook"
-            >
-              <Icon icon="tabler:plus" class="q-mr-sm" />
-              {{ $t('Add Contact') }}
-            </q-btn>
-          </div>
-
-          <!-- No Results -->
-          <div v-else-if="!hasContactsToShow" class="contact-empty-state">
-            <Icon icon="tabler:search" width="48" height="48" :style="{ color: $q.dark.isActive ? '#757575' : '#9e9e9e' }" />
-            <div class="empty-title" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
-              {{ $t('No matches found') }}
-            </div>
-          </div>
-
-          <!-- Sectioned Contact List -->
-          <div v-else class="contact-list">
-            <!-- Favorites Section -->
-            <template v-if="favoriteContacts.length > 0">
-              <div class="contact-section-header" :class="$q.dark.isActive ? 'section-header-dark' : 'section-header-light'">
-                <Icon icon="tabler:star" width="14" height="14" style="color: #ffc107;" />
-                <span>{{ $t('Favorites') }}</span>
-              </div>
-              <div
-                v-for="contact in favoriteContacts"
-                :key="'fav-' + contact.id"
-                class="contact-item"
-                :class="[
-                  $q.dark.isActive ? 'contact-item-dark' : 'contact-item-light',
-                  { 'contact-disabled': !canPayContact(contact) }
-                ]"
-                @click="selectContact(contact)"
-              >
-                <div class="contact-avatar" :style="{ backgroundColor: contact.color }">
-                  {{ contact.name.charAt(0).toUpperCase() }}
-                </div>
-                <div class="contact-info">
-                  <div class="contact-name-row">
-                    <div class="contact-name" :class="$q.dark.isActive ? 'text-white' : 'text-grey-9'">
-                      {{ contact.name }}
-                    </div>
-                    <Icon icon="tabler:star" width="12" height="12" style="color: #ffc107;" class="q-ml-xs" />
-                    <div class="contact-type-badge" :class="getContactTypeBadgeClass(contact)">
-                      <Icon :icon="getContactTypeIcon(contact)" width="10" height="10" />
-                      <span>{{ getContactTypeLabel(contact) }}</span>
-                    </div>
-                  </div>
-                  <div class="contact-address" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-                    {{ getContactAddress(contact) }}
-                  </div>
-                </div>
-                <Icon icon="tabler:chevron-right" width="20" height="20" :style="{ color: $q.dark.isActive ? '#757575' : '#9e9e9e' }" />
-              </div>
-            </template>
-
-            <!-- Recent Section -->
-            <template v-if="recentContacts.length > 0">
-              <div class="contact-section-header" :class="$q.dark.isActive ? 'section-header-dark' : 'section-header-light'">
-                <Icon icon="tabler:clock" width="14" height="14" />
-                <span>{{ $t('Recent') }}</span>
-              </div>
-              <div
-                v-for="contact in recentContacts"
-                :key="'recent-' + contact.id"
-                class="contact-item"
-                :class="[
-                  $q.dark.isActive ? 'contact-item-dark' : 'contact-item-light',
-                  { 'contact-disabled': !canPayContact(contact) }
-                ]"
-                @click="selectContact(contact)"
-              >
-                <div class="contact-avatar" :style="{ backgroundColor: contact.color }">
-                  {{ contact.name.charAt(0).toUpperCase() }}
-                </div>
-                <div class="contact-info">
-                  <div class="contact-name-row">
-                    <div class="contact-name" :class="$q.dark.isActive ? 'text-white' : 'text-grey-9'">
-                      {{ contact.name }}
-                    </div>
-                    <div class="contact-type-badge" :class="getContactTypeBadgeClass(contact)">
-                      <Icon :icon="getContactTypeIcon(contact)" width="10" height="10" />
-                      <span>{{ getContactTypeLabel(contact) }}</span>
-                    </div>
-                  </div>
-                  <div class="contact-address" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-                    {{ getContactAddress(contact) }}
-                  </div>
-                </div>
-                <Icon icon="tabler:chevron-right" width="20" height="20" :style="{ color: $q.dark.isActive ? '#757575' : '#9e9e9e' }" />
-              </div>
-            </template>
-
-            <!-- All Contacts Section -->
-            <template v-if="otherContacts.length > 0">
-              <div class="contact-section-header" :class="$q.dark.isActive ? 'section-header-dark' : 'section-header-light'">
-                <Icon icon="tabler:users" width="14" height="14" />
-                <span>{{ $t('All Contacts') }}</span>
-              </div>
-              <div
-                v-for="contact in otherContacts"
-                :key="'other-' + contact.id"
-                class="contact-item"
-                :class="[
-                  $q.dark.isActive ? 'contact-item-dark' : 'contact-item-light',
-                  { 'contact-disabled': !canPayContact(contact) }
-                ]"
-                @click="selectContact(contact)"
-              >
-                <div class="contact-avatar" :style="{ backgroundColor: contact.color }">
-                  {{ contact.name.charAt(0).toUpperCase() }}
-                </div>
-                <div class="contact-info">
-                  <div class="contact-name-row">
-                    <div class="contact-name" :class="$q.dark.isActive ? 'text-white' : 'text-grey-9'">
-                      {{ contact.name }}
-                    </div>
-                    <div class="contact-type-badge" :class="getContactTypeBadgeClass(contact)">
-                      <Icon :icon="getContactTypeIcon(contact)" width="10" height="10" />
-                      <span>{{ getContactTypeLabel(contact) }}</span>
-                    </div>
-                  </div>
-                  <div class="contact-address" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-                    {{ getContactAddress(contact) }}
-                  </div>
-                </div>
-                <Icon icon="tabler:chevron-right" width="20" height="20" :style="{ color: $q.dark.isActive ? '#757575' : '#9e9e9e' }" />
-              </div>
-            </template>
-          </div>
-        </q-card-section>
-      </q-card>
-    </q-dialog>
+    <!-- ─────────────  SCANNER (child surface)  ─────────────
+         Shared single-shot scan sheet (native MLKit overlay / web
+         qr-scanner). It closes itself on the first decode — the result
+         lands in the field, so resolving and errors always happen on
+         this sheet. -->
+    <QrScanSheet
+      v-model="scannerOpen"
+      @scanned="onQRDetect"
+    />
   </q-dialog>
 </template>
 
 <script>
-import QrScanner from 'qr-scanner';
+import { isAddressRequest, parseAddressRequest } from '../utils/lud23.js';
+import { offerAddressRequest } from '../services/addressRequestIntake.js';
+import { Capacitor } from '@capacitor/core';
+import QrScanSheet from './QrScanSheet.vue';
 import { useAddressBookStore } from '../stores/addressBook';
 import { useWalletStore } from '../stores/wallet';
+import { readClipboardCrossPlatform } from '../utils/shopClipboard.js';
 import { isSARetailerQR, convertToLightningAddress, getMerchantInfo, SA_RETAIL_SOURCE } from '../utils/merchantQR';
+import { parseBip21, extractLnFallbackParam } from '../utils/bip21';
+import {
+  isSparkAddress,
+  isArkadeAddress,
+  isBolt12Offer,
+  isLightningInvoice,
+  isLnurl,
+  isBitcoinAddress,
+  isLightningAddress,
+  stripWrapperScheme,
+} from '../utils/addressUtils';
+import {
+  recognizePhoneNumber,
+  recognizePhoneNumberForCountry,
+  matchLnAddressService,
+  payoutCountryOptions,
+} from '../services/lnAddressServices';
+import { getPreferredPayoutCountry, rememberPayoutCountry } from '../utils/payoutCountryPreference';
+import { classifyIdentifier, LOOKUP_ERROR } from '../utils/nostrLookup';
+import { canWalletPay, walletSwitchHint } from '../utils/walletCapabilities';
+import {
+  MAX_CLIPBOARD_LENGTH,
+  classifyDestination,
+  isSuggestibleDestination,
+  normalizeDestination,
+} from '../utils/clipboardSuggestion.js';
+import { resolveNostrLightningTarget, NOSTR_TARGET_ERROR } from '../services/nostrPaymentTarget';
+import { usernameAddressFromInput } from '../services/nip05';
+import ContactAvatar from './AddressBook/ContactAvatar.vue';
+import ArkadeLogo from './ArkadeLogo.vue';
+import ProgressCta from './ProgressCta.vue';
 
 export default {
   name: 'SendModal',
+  components: { ArkadeLogo, ContactAvatar, ProgressCta, QrScanSheet },
   props: {
     modelValue: {
       type: Boolean,
       default: false
+    },
+    // True while the parent (Wallet.onPaymentDetected) is fetching/validating
+    // the destination after we emitted it. Drives the loading CTA so the user
+    // sees that we are resolving the address, not guessing it.
+    resolving: {
+      type: Boolean,
+      default: false
+    },
+    // Set by the parent when resolution fails (e.g. the Lightning address
+    // doesn't exist). Shown inline in the field so the user can fix it without
+    // ever leaving the sheet. Cleared on edit (update:resolveError).
+    resolveError: {
+      type: String,
+      default: ''
     }
   },
-  emits: ['update:modelValue', 'payment-detected'],
+  emits: ['update:modelValue', 'payment-detected', 'update:resolveError', 'open-batch-send'],
   setup() {
     const addressBookStore = useAddressBookStore();
     const walletStore = useWalletStore();
@@ -368,18 +425,36 @@ export default {
   },
   data() {
     return {
-      showCamera: false,
       isProcessing: false,
-      cameraError: null,
-      showManualDialog: false,
-      showContactDialog: false,
-      contactSearch: '',
+      // Child scan surface (QrScanSheet owns the platform split).
+      scannerOpen: false,
+      // Phone-first entry mode for the fiat-payout rails.
+      mobileMoneyMode: false,
+      // Explicitly chosen payout country (Mobile Money selector). null =
+      // auto-detect from the typed number. Registry-driven options.
+      mmCountry: null,
+      payoutCountries: payoutCountryOptions(),
       manualInput: '',
-      qrScanner: null,
-      videoElement: null
+      // First-open contact hydration (store.initialize reads localStorage).
+      contactsLoading: false,
+      // Payable string found on the clipboard at open (web peek only).
+      clipboardSuggestion: null,
+      // Sticky default for the ambiguous-country chooser: the payout country the
+      // user last picked, so a bare (no calling code) number that is valid in
+      // more than one country leads with their country. Ordering only — an
+      // ambiguous number always still requires an explicit tap.
+      preferredPayoutCountry: getPreferredPayoutCountry(),
     }
   },
   computed: {
+    // Loading from the moment we submit (local isProcessing, covers our own
+    // npub resolve + the QR decode) through the parent's fetch (resolving prop),
+    // until the parent either closes us (success) or reports an error. One
+    // flag drives the footer CTA everywhere.
+    ctaBusy() {
+      return this.isProcessing || this.resolving;
+    },
+
     show: {
       get() {
         return this.modelValue;
@@ -388,158 +463,412 @@ export default {
         this.$emit('update:modelValue', value);
       }
     },
+
+    // Live detection mirrors AddressBookModal's pattern. We strip URI
+    // wrappers (lightning:, bitcoin:) so a paste like
+    // "lightning:lnbc1..." resolves to lightning_invoice rather than
+    // the raw scheme.
+    detectedInputType() {
+      const raw = (this.manualInput || '').trim();
+      if (!raw) return null;
+      if (isAddressRequest(raw)) return 'address_request';
+      const lower = raw.toLowerCase();
+
+      // BIP21 first — bitcoin:<addr>?... is structurally distinct and
+      // we want the "Bitcoin (BIP21)" label even when the inner is an
+      // on-chain address that would also pass isBitcoinAddress.
+      if (lower.startsWith('bitcoin:')) {
+        const parsed = parseBip21(raw);
+        if (parsed) return 'bip21';
+      }
+
+      // http(s) "fallback URL" with the LNURL in a `lightning=` query param
+      // (LNbits / Fossa ATMs) — surface it as LNURL while typing. Otherwise
+      // strip a wrapper URI scheme (`lightning:` / `lnurl:`) off the raw paste.
+      const lnFallback = extractLnFallbackParam(raw);
+      const cleaned = lnFallback ? lnFallback : stripWrapperScheme(raw);
+
+      if (isAddressRequest(cleaned)) return 'address_request';
+      if (isSparkAddress(cleaned)) return 'spark';
+      if (isArkadeAddress(cleaned)) return 'arkade';
+      if (isBolt12Offer(cleaned)) return 'bolt12_offer';
+      if (isLightningInvoice(cleaned)) return 'lightning_invoice';
+      // Bare Nostr key: `npub1…` / `nprofile1…` (optionally `nostr:`-prefixed).
+      // Unambiguous — nothing else looks like this — so we resolve it to the
+      // person's Lightning address. NIP-05 (`name@domain`) is intentionally
+      // NOT matched here: it's indistinguishable from a Lightning Address, so
+      // it stays on the Lightning-address rails (and is only Nostr-resolved as
+      // a fallback if that lookup misses — see Wallet.onPaymentDetected).
+      // A BuhoGO username (`@maria`, `maria@mybuho.de`) is a person to look
+      // up, not a Lightning address: it resolves through their profile to
+      // where they get paid.
+      if (usernameAddressFromInput(cleaned)) return 'username';
+      const nostrKind = classifyIdentifier(cleaned);
+      if (nostrKind === 'npub' || nostrKind === 'nprofile') return 'nostr_identifier';
+      if (isLightningAddress(cleaned)) return 'lightning_address';
+      if (isLnurl(cleaned)) return 'lnurl';
+      if (isBitcoinAddress(cleaned)) return 'bitcoin_address';
+      // A bare phone number we can route to a fiat-payout provider
+      // (Zambia → Bitzed, Kenya → Tando). Strict: only a complete, valid
+      // KE/ZM mobile number matches, so partial digits never false-positive.
+      if (this.recognizedPhone) return 'phone_number';
+      return null;
+    },
+
+    detectedInputLabel() {
+      // A resolved, unambiguous phone number names its destination country
+      // (and operator when known) — stronger confirmation than a generic
+      // "Phone number" before an irreversible fiat payout.
+      if (this.detectedInputType === 'phone_number') {
+        const phone = this.recognizedPhone;
+        if (phone && !phone.ambiguous) {
+          const c = phone.candidates?.[0] || phone;
+          const cn = this.countryName(c.country.code);
+          return c.operator ? `${cn} · ${c.operator}` : cn;
+        }
+        return this.$t('Phone number');
+      }
+      // Payment-language unification: every payable rail reads "Bitcoin" —
+      // the chip's icon and color carry the nuance for expert eyes. Only
+      // non-rail identities (a Nostr person) and the one unsupported
+      // format we must name (BOLT12, so its error makes sense) differ.
+      const labels = {
+        address_request: this.$t('Address request'),
+        spark: this.$t('Bitcoin'),
+        bolt12_offer: this.$t('BOLT12 offer'),
+        silent_payment: this.$t('Silent payment'),
+        lightning_invoice: this.$t('Bitcoin'),
+        lightning_address: this.$t('Bitcoin'),
+        lnurl: this.$t('Bitcoin'),
+        bitcoin_address: this.$t('Bitcoin'),
+        bip21: this.$t('Bitcoin'),
+        nostr_identifier: this.$t('Nostr profile'),
+        username: this.$t('Username')
+      };
+      return labels[this.detectedInputType] || '';
+    },
+
+    detectedInputIcon() {
+      // The bolt is reserved for the one place it means something (the
+      // unsupported-BOLT12 signal) — every payable rail carries the ₿
+      // mark, matching the unified "Bitcoin" label. LNURL keeps the link
+      // glyph (it is a link), phone and Nostr keep their identities.
+      const icons = {
+        address_request: 'tabler:address-book',
+        bolt12_offer: 'tabler:bolt',
+        silent_payment: 'tabler:eye-off',
+        lightning_invoice: 'tabler:currency-bitcoin',
+        lightning_address: 'tabler:currency-bitcoin',
+        lnurl: 'tabler:link',
+        bitcoin_address: 'tabler:currency-bitcoin',
+        bip21: 'tabler:currency-bitcoin',
+        phone_number: 'tabler:device-mobile',
+        nostr_identifier: 'tabler:user',
+        username: 'tabler:rosette-discount-check'
+      };
+      return icons[this.detectedInputType] || '';
+    },
+
     isValidManualInput() {
-      return this.manualInput.trim().length > 0 && this.validatePaymentInput(this.manualInput) === true;
+      return !!this.detectedInputType;
     },
-    contacts() {
-      return this.addressBookStore.entries || [];
+
+    // Live capability gate, computed off the same normalization the emit
+    // uses. Non-empty = the active wallet can't ride this rail; the hint
+    // shows in the field the moment the destination is recognized, the
+    // CTA disables, and nothing is ever emitted — so a confirm sheet
+    // that could only dead-end never opens.
+    capabilityBlocked() {
+      if (!this.isValidManualInput || this.detectedInputType === 'address_request') return '';
+      const paymentType = this.determinePaymentType(this.manualInput.trim());
+      if (canWalletPay(this.walletStore.activeWalletType, paymentType)) return '';
+      return walletSwitchHint(paymentType, this.$t.bind(this));
     },
-    // Favorite contacts (filtered by search)
-    favoriteContacts() {
-      return (this.addressBookStore.favoriteEntries || [])
-        .filter(c => this.matchesSearch(c));
+
+    // Full phone-number recognition for the current input (or null). Drives
+    // the 'phone_number' chip and the ambiguous-country chooser. With a
+    // Mobile Money country picked, recognition locks to that country (which
+    // also accepts the bare local number); an explicit foreign calling code
+    // still wins over the lock — the typed +CC is the stronger signal.
+    recognizedPhone() {
+      const raw = (this.manualInput || '').trim();
+      if (!raw) return null;
+      const cleaned = raw.toLowerCase().startsWith('lightning:')
+        ? raw.substring(10).trim()
+        : raw;
+      if (this.mobileMoneyMode && this.mmCountry) {
+        return recognizePhoneNumberForCountry(this.mmCountry, cleaned)
+          || recognizePhoneNumber(cleaned);
+      }
+      return recognizePhoneNumber(cleaned);
     },
-    // Recent contacts (filtered by search)
-    recentContacts() {
-      return (this.addressBookStore.recentEntries || [])
-        .filter(c => this.matchesSearch(c));
+
+    mmCountryOption() {
+      return this.payoutCountries.find((c) => c.code === this.mmCountry) || null;
     },
-    // Other contacts (not in favorites or recent, filtered by search)
-    otherContacts() {
-      const favoriteIds = new Set((this.addressBookStore.favoriteEntries || []).map(c => c.id));
-      const recentIds = new Set((this.addressBookStore.recentEntries || []).map(c => c.id));
-      return this.contacts
-        .filter(c => !favoriteIds.has(c.id) && !recentIds.has(c.id))
-        .filter(c => this.matchesSearch(c))
-        .sort((a, b) => a.name.localeCompare(b.name));
+
+    /**
+     * How many country tiles sit on a row.
+     *
+     * Fixed at three, a fourth country made a second row holding one orphan
+     * tile. CSS cannot count its own children, so the column count is chosen
+     * here: up to three fit on one row, four go two by two, and five or more
+     * fall back to three across with the row itself scrolling.
+     */
+    mmCountryColumns() {
+      const n = this.payoutCountries.length;
+      if (n <= 3) return Math.max(1, n);
+      if (n === 4) return 2;
+      return 3;
     },
-    // All filtered contacts (for backward compatibility and empty state check)
-    filteredContacts() {
-      if (!this.contactSearch) return this.contacts;
-      const search = this.contactSearch.toLowerCase();
-      return this.contacts.filter(c => {
-        const address = c.address || c.lightningAddress || '';
-        const notes = c.notes || '';
-        return c.name.toLowerCase().includes(search) ||
-          address.toLowerCase().includes(search) ||
-          notes.toLowerCase().includes(search);
+
+    // True when the number is valid in more than one country (075-078 KE/ZM
+    // overlap) and no calling code was given — the user must pick.
+    phoneNeedsCountryChoice() {
+      return this.detectedInputType === 'phone_number'
+        && !!this.recognizedPhone
+        && this.recognizedPhone.ambiguous === true;
+    },
+
+    // The ambiguous-country candidates, each enriched with its provider brand
+    // logo and ordered so the user's last-chosen country leads (see
+    // payoutCountryPreference). This is presentation only — selecting still
+    // requires an explicit tap; we never auto-pick a country for an ambiguous
+    // number because a wrong-country payout is irreversible.
+    orderedPhoneCandidates() {
+      const phone = this.recognizedPhone;
+      if (!phone || !Array.isArray(phone.candidates)) return [];
+      const preferred = this.preferredPayoutCountry;
+      const ordered = [
+        ...phone.candidates.filter((c) => c.country.code === preferred),
+        ...phone.candidates.filter((c) => c.country.code !== preferred),
+      ];
+      return ordered.map((c) => {
+        const brand = matchLnAddressService(c.lightningAddress);
+        return { ...c, brandLogo: (brand && (brand.logo || brand.flag)) || '' };
       });
     },
-    // Check if we have any contacts to show in sections
-    hasContactsToShow() {
-      return this.favoriteContacts.length > 0 ||
-             this.recentContacts.length > 0 ||
-             this.otherContacts.length > 0;
+
+    // Method rows (Mobile Money / Batch Send) show only on the resting sheet:
+    // any typing hands their space to the contact filter or the preview card.
+    showMethods() {
+      return !this.mobileMoneyMode && !(this.manualInput || '').trim();
     },
-    isActiveWalletSpark() {
-      return this.walletStore.isActiveWalletSpark;
+
+    showContactsSection() {
+      return !this.mobileMoneyMode && !this.isValidManualInput;
     },
-    manualInputPlaceholder() {
-      return this.isActiveWalletSpark
-        ? this.$t('e.g. name@wallet.com, lnbc..., or spark1...')
-        : this.$t('e.g. name@wallet.com or lnbc...');
+
+    // The clipboard chip shows only on the resting sheet: any typing (or
+    // Mobile Money mode) means the user has chosen their own path.
+    showClipboardSuggestion() {
+      return !!this.clipboardSuggestion
+        && !this.mobileMoneyMode
+        && !(this.manualInput || '').trim();
+    },
+
+    clipboardPreview() {
+      const v = this.clipboardSuggestion?.value || '';
+      if (v.length <= 30) return v;
+      return `${v.slice(0, 18)}…${v.slice(-8)}`;
+    },
+
+    // Unrecognized text doubles as a contact search. Empty while the input
+    // is a recognized payment format (the list is hidden then anyway).
+    contactQuery() {
+      if (this.mobileMoneyMode || this.isValidManualInput) return '';
+      return (this.manualInput || '').trim().toLowerCase();
+    },
+
+    // Resting order: favorites, then recents, then everyone (alphabetical),
+    // deduped. A query filters across ALL contacts by name or address.
+    displayContacts() {
+      const all = [...this.addressBookStore.entries]
+        .sort((a, b) => a.name.localeCompare(b.name));
+      const q = this.contactQuery;
+      if (q) {
+        return all.filter((c) =>
+          c.name.toLowerCase().includes(q) ||
+          (c.address || c.lightningAddress || '').toLowerCase().includes(q)
+        );
+      }
+      const seen = new Set();
+      const ordered = [];
+      for (const c of [
+        ...this.addressBookStore.favoriteEntries,
+        ...this.addressBookStore.recentEntries,
+        ...all,
+      ]) {
+        if (!seen.has(c.id)) {
+          seen.add(c.id);
+          ordered.push(c);
+        }
+      }
+      return ordered;
     }
   },
   watch: {
     show(newVal) {
       if (newVal) {
-        this.initializeCamera();
+        this.initContacts();
+        this.peekClipboard();
       } else {
-        this.stopQrScanner();
-        this.showCamera = false;
         this.resetState();
       }
+    },
+    // Smart fetching: ANY recognized destination auto-advances into the
+    // resolve once the input settles — no Continue tap needed. Detection
+    // is prefix-based, so the debounce is what makes this safe for typed
+    // input: every keystroke re-arms it, and it only fires after the user
+    // has stopped. Phone numbers get the shorter beat (the matcher only
+    // accepts complete numbers, so a partial can never fire); addresses
+    // and other formats wait slightly longer because a pause can land on
+    // a valid intermediate string. Pasted content advances faster still
+    // (see pasteFromClipboard) since it arrives complete. The confirm
+    // sheet stays the review/commit gate either way — this fetches and
+    // validates, it never sends.
+    manualInput() {
+      // Editing clears a stale "couldn't resolve" error from the previous try.
+      if (this.resolveError) this.$emit('update:resolveError', '');
+      clearTimeout(this.phoneAdvanceTimer);
+      if (!this.isValidManualInput || this.phoneNeedsCountryChoice || this.capabilityBlocked) return;
+      const settleMs = this.detectedInputType === 'phone_number' ? 700 : 900;
+      this.phoneAdvanceTimer = setTimeout(() => this.autoAdvance(), settleMs);
+    },
+    // The parent flips `resolving` back to false the moment its fetch settles
+    // (success OR failure, including notify-only paths) — clear the local
+    // spinner so the CTA leaves "Fetching…". The field is always present on
+    // this sheet, so failures stay inline; we never auto-close here (success
+    // closes us from the parent).
+    resolving(now, was) {
+      if (was && !now) this.isProcessing = false;
+    },
+    // A failure message arriving. Clear the spinner here too: on a synchronous
+    // throw the parent sets sendResolving true->false within one tick, so the
+    // `resolving` watcher above never fires and the CTA would freeze.
+    resolveError(message) {
+      if (message) this.isProcessing = false;
     }
   },
   beforeUnmount() {
-    this.stopQrScanner();
+    clearTimeout(this.phoneAdvanceTimer);
+    clearTimeout(this.pasteAdvanceTimer);
   },
   methods: {
-    // Search filter helper
-    matchesSearch(contact) {
-      if (!this.contactSearch) return true;
-      const search = this.contactSearch.toLowerCase();
-      const address = contact.address || contact.lightningAddress || '';
-      const notes = contact.notes || '';
-      return contact.name.toLowerCase().includes(search) ||
-        address.toLowerCase().includes(search) ||
-        notes.toLowerCase().includes(search);
-    },
-
-    async initializeCamera() {
-      this.cameraError = null;
+    // Hydrate the address book on first open (idempotent — the store guards
+    // itself). The skeleton only shows while entries are still empty, so a
+    // warm store re-opens instantly.
+    async initContacts() {
+      if (this.addressBookStore.entries.length > 0) return;
+      this.contactsLoading = true;
       try {
-        // Check if QrScanner has camera support
-        const hasCamera = await QrScanner.hasCamera();
-        if (!hasCamera) {
-          throw new Error('No camera found on this device.');
-        }
-
-        this.showCamera = true;
-        // Wait for the next tick to ensure the video element is rendered
-        await this.$nextTick();
-        await this.startQrScanner();
-      } catch (error) {
-        console.error('Camera initialization error:', error);
-        this.handleCameraError(error);
+        await this.addressBookStore.initialize();
+      } catch (e) {
+        console.error('Failed to load contacts:', e);
+      } finally {
+        this.contactsLoading = false;
       }
     },
 
-    async startQrScanner() {
+    // QDialog auto-focuses the first focusable element — here, the field —
+    // which would pop the keyboard over the contact list on every open. The
+    // resting sheet must open calm: focus only when the user taps the field
+    // (or Paste / Mobile Money, which focus deliberately).
+    onSheetShow() {
+      this.$refs.manualTextarea?.blur();
+    },
+
+    /**
+     * Clipboard peek on open — web only. Native platforms surface a
+     * system "app pasted from your clipboard" notice on every
+     * programmatic read (Android 12+ toast, iOS paste banner/prompt);
+     * Android's home screen offers new clipboard contents on app return
+     * (ClipboardSuggestion). iOS waits for explicit Paste, avoiding an
+     * unsolicited permission prompt. Paste is this sheet's only native read.
+     *
+     * The chip appears only for a string this wallet could actually
+     * take further (recognized format, payable rail) — anything else
+     * stays invisible. Tapping it is the explicit consent that starts
+     * the resolve; nothing ever advances on its own.
+     */
+    async peekClipboard() {
+      this.clipboardSuggestion = null;
+      if (Capacitor.isNativePlatform()) return;
+      if (!navigator.clipboard?.readText) return;
       try {
-        if (!this.$refs.videoElement) {
-          throw new Error('Video element not found');
-        }
-
-        this.videoElement = this.$refs.videoElement;
-
-        // Create QR scanner instance
-        this.qrScanner = new QrScanner(
-          this.videoElement,
-          (result) => {
-            // Handle both string and object result formats from qr-scanner
-            const data = typeof result === 'string' ? result : (result?.data || result?.text || '');
-            this.onQRDetect(data);
-          },
-          {
-            returnDetailedScanResult: true,
-            highlightScanRegion: true,
-            highlightCodeOutline: true,
-            preferredCamera: 'environment'
-          }
-        );
-
-        // Start scanning
-        await this.qrScanner.start();
-
-      } catch (error) {
-        console.error('Error starting QR scanner:', error);
-        this.handleCameraError(error);
+        const text = (await navigator.clipboard.readText() || '').trim();
+        // The field may have been filled while the read was in flight.
+        if (this.manualInput) return;
+        if (!text || text.length > MAX_CLIPBOARD_LENGTH) return;
+        if (!this.isSuggestibleDestination(text)) return;
+        this.clipboardSuggestion = { value: text };
+      } catch {
+        // Permission denied / unavailable — no chip, no noise.
       }
     },
 
-    stopQrScanner() {
-      if (this.qrScanner) {
-        this.qrScanner.stop();
-        this.qrScanner.destroy();
-        this.qrScanner = null;
-      }
+    /** Would this string get somewhere if the user pasted it? One rule, shared with the home strip. */
+    isSuggestibleDestination(text) {
+      return isSuggestibleDestination(text, this.walletStore.activeWalletType);
     },
 
-    handleCameraError(error) {
-      if (error.name === 'NotAllowedError') {
-        this.cameraError = this.$t('Camera permission denied. Please allow camera access and try again.');
-      } else if (error.name === 'NotFoundError') {
-        this.cameraError = this.$t('No camera found on this device.');
-      } else if (error.name === 'NotSupportedError') {
-        this.cameraError = this.$t('Camera not supported in this browser.');
-      } else {
-        this.cameraError = this.$t('Failed to access camera. Please try again.');
-      }
+    applyClipboardSuggestion() {
+      const value = this.clipboardSuggestion?.value;
+      if (!value) return;
+      this.useDestination(value);
+    },
+
+    /**
+     * Take a destination the user has already chosen (the chip here, the
+     * clipboard strip on the home screen) exactly as a paste: it lands in
+     * the visible field, then resolves after the same short beat the
+     * Paste button gives — to the confirm sheet, never a send.
+     */
+    useDestination(value) {
+      this.clipboardSuggestion = null;
+      if (this.resolveError) this.$emit('update:resolveError', '');
+      this.manualInput = value;
+      this.$nextTick(() => {
+        this.$refs.manualTextarea?.focus();
+      });
+      clearTimeout(this.pasteAdvanceTimer);
+      this.pasteAdvanceTimer = setTimeout(() => this.autoAdvance(), 300);
+    },
+
+    /**
+     * Open on a destination that already failed to resolve elsewhere.
+     *
+     * The home clipboard strip resolves without raising this sheet, so the
+     * sheet is not part of a successful send anymore — it appears only when
+     * that resolve failed, and then it must land exactly where the user
+     * would have typed: the string in the field, the reason under it,
+     * nothing auto-advancing (it has had its try). The error is applied on
+     * the next tick because the `manualInput` watcher clears a stale error
+     * on every edit, and this assignment counts as one.
+     */
+    revealFailed(value, message) {
+      this.manualInput = value;
+      this.$nextTick(() => {
+        clearTimeout(this.phoneAdvanceTimer);
+        clearTimeout(this.pasteAdvanceTimer);
+        this.isProcessing = false;
+        if (message) this.$emit('update:resolveError', message);
+      });
+    },
+
+    openScanner() {
+      if (this.ctaBusy) return;
+      if (this.resolveError) this.$emit('update:resolveError', '');
+      this.scannerOpen = true;
     },
 
     async onQRDetect(qrContent) {
       if (this.isProcessing || !qrContent) return;
+
+      // The scan sheet has already closed itself — land the decoded string
+      // in the field, so the user always sees exactly what is being
+      // resolved, and can edit it in place if resolution fails.
+      this.manualInput = qrContent;
 
       this.isProcessing = true;
 
@@ -551,8 +880,6 @@ export default {
           type: 'negative',
           message: this.$t('Invalid QR code'),
           caption: this.$t('Please try a different code'),
-          
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
         this.isProcessing = false;
       }
@@ -560,33 +887,47 @@ export default {
 
     async processPaymentData(paymentData) {
       try {
-        // Ensure paymentData is a string
         const inputData = typeof paymentData === 'string'
           ? paymentData
           : (paymentData?.data || paymentData?.text || String(paymentData || ''));
 
-        // Basic validation
         if (!inputData || inputData.trim().length === 0) {
           throw new Error(this.$t('Invalid payment data'));
         }
 
+        if (offerAddressRequest(inputData, { t: this.$t.bind(this) })) {
+          this.show = false; this.isProcessing = false; return;
+        }
         let trimmedData = inputData.trim();
+
+        // A recognized Kenyan/Zambian phone number is a fiat-payout destination
+        // — resolve it to its provider Lightning Address (Zambia → @bitzed.xyz,
+        // Kenya → @bitcoin.co.ke) up front, BEFORE the SA-retail QR check, whose
+        // numeric codes would otherwise swallow a 10-digit phone number. The
+        // built address then flows through the normal Lightning-address rails
+        // (which brand it).
+        const phone = recognizePhoneNumber(trimmedData);
+        if (phone) {
+          this.$emit('payment-detected', {
+            data: phone.lightningAddress,
+            type: 'lightning_address',
+            rawInput: trimmedData,
+          });
+          return;
+        }
 
         // Check for SA retailer QR codes (PnP, Checkers, Woolworths, etc.)
         if (isSARetailerQR(trimmedData)) {
           const result = convertToLightningAddress(trimmedData);
           if (result) {
-            // EMVCo QR converted to lightning address via cryptoqr.net
             this.$emit('payment-detected', {
               data: result.lightningAddress,
               type: 'lightning_address',
               source: SA_RETAIL_SOURCE,
               merchant: result.merchant,
             });
-            this.closeModal();
             return;
           }
-          // URL-based SA retailer QR - needs Scanner API (Phase 2)
           const merchant = getMerchantInfo(trimmedData);
           this.$q.notify({
             type: 'warning',
@@ -595,247 +936,276 @@ export default {
               ? `${merchant.displayName} - ${this.$t('not yet supported')}`
               : this.$t('This retailer is not yet supported'),
             timeout: 4000,
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }],
           });
           this.isProcessing = false;
           return;
         }
 
-        // Handle lightning: prefix and extract the actual invoice
-        let cleanData = trimmedData.toLowerCase().startsWith('lightning:')
-          ? trimmedData.substring(10)
-          : trimmedData;
+        // Resolve URI wrappers: strip `lightning:`, and for BIP21
+        // (`bitcoin:<addr>?amount=...&lightning=lnbc...`) prefer the embedded
+        // BOLT11 invoice over the on-chain address.
+        const { cleaned: resolved, bip21 } = this.normalizePaymentInput(trimmedData);
+        if (offerAddressRequest(resolved, { t: this.$t.bind(this) })) {
+          this.show = false; this.isProcessing = false; return;
+        }
+        let cleanData = resolved;
 
-        // Handle bitcoin: URI scheme (BIP21) - strip prefix and query params
-        if (cleanData.toLowerCase().startsWith('bitcoin:')) {
-          cleanData = cleanData.substring(8).split('?')[0];
+        if (isLightningAddress(cleanData)) {
+          cleanData = cleanData.toLowerCase();
         }
 
-        // Normalize lightning addresses to lowercase (LN address standard)
-        if (cleanData.includes('@') && cleanData.includes('.')) {
-          cleanData = cleanData.toLowerCase();
+        // Bare Nostr key (npub / nprofile, optionally nostr:-prefixed): resolve
+        // the person's profile to their Lightning address (lud16) or LNURL
+        // (lud06) and pay that, carrying their name + avatar so the confirm
+        // sheet shows who they are. The loading CTA is already up
+        // (processManualInput / onQRDetect set isProcessing).
+        const nostrKind = classifyIdentifier(cleanData);
+        const usernameAddress = usernameAddressFromInput(cleanData);
+        if (usernameAddress || nostrKind === 'npub' || nostrKind === 'nprofile') {
+          try {
+            const target = await resolveNostrLightningTarget(usernameAddress || cleanData, { timeoutMs: 8000 });
+            this.$emit('payment-detected', {
+              data: target.address,
+              type: target.kind, // 'lightning_address' | 'lnurl'
+              rawInput: trimmedData,
+              paymentOnly: true,
+              nostrPubkey: target.pubkey,
+              nostrNpub: target.npub,
+              nostrProfile: target.profile,
+              nostrProfileEvent: target.profileEvent,
+              nostrRelayHints: target.relayHints,
+            });
+          } catch (err) {
+            this.isProcessing = false;
+            this.notifyNostrResolveError(err);
+          }
+          return;
         }
 
         const paymentType = this.determinePaymentType(cleanData);
 
-        // Early warning: NWC wallet cannot pay Spark addresses
-        if (paymentType === 'spark_address' && !this.isActiveWalletSpark) {
+        // Nothing we can route. Stop here instead of handing the parent a
+        // payload it can only fail on. The string stays visible in the field
+        // for inspection; the toast explains why nothing happened (this path
+        // is practically scan-only — typing is gated by isValidManualInput).
+        if (paymentType === 'unknown') {
+          this.isProcessing = false;
           this.$q.notify({
-            type: 'warning',
-            message: this.$t('Spark address detected'),
-            caption: this.$t('Switch to Spark wallet to pay this address'),
-            
+            type: 'negative',
+            message: this.$t("We don't recognize this code"),
+            caption: this.$t("It doesn't look like a payment request"),
             timeout: 4000,
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           });
+          return;
         }
 
-        // Early warning: NWC wallet cannot send to Bitcoin addresses
-        if (paymentType === 'bitcoin_address' && !this.isActiveWalletSpark) {
-          this.$q.notify({
-            type: 'warning',
-            message: this.$t('Bitcoin address detected'),
-            caption: this.$t('Switch to Spark wallet to send to Bitcoin addresses'),
-            
-            timeout: 4000,
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-          });
+        // Capability backstop for payloads that bypass the field guards
+        // (scans land here directly): never emit a destination the active
+        // wallet can't pay — the parent could only dead-end on it. The
+        // scanned string is in the field, so the reactive capability hint
+        // (capabilityBlocked) is already explaining the switch.
+        if (!canWalletPay(this.walletStore.activeWalletType, paymentType)) {
+          this.isProcessing = false;
+          return;
         }
 
-        // Emit the detected payment data to parent component
         this.$emit('payment-detected', {
           data: cleanData,
-          type: paymentType
+          type: paymentType,
+          // Original, un-normalized input. Branta needs this for on-chain
+          // verification because the ZK params (branta_id / branta_secret)
+          // live in the bitcoin: URI query string, which normalization
+          // strips out of `data`.
+          rawInput: trimmedData,
+          ...(bip21 ? { bip21 } : {})
         });
-
-        this.closeModal();
-
+        // No closeModal here: we stay open showing the loading CTA while the
+        // parent fetches/validates the destination. It closes us on success,
+        // or pushes an inline error back via :resolve-error on failure.
       } catch (error) {
         throw error;
       }
     },
 
-    determinePaymentType(data) {
-      const trimmed = data.trim().toLowerCase();
-      // Handle lightning: prefix
-      let cleanData = trimmed.startsWith('lightning:') ? trimmed.substring(10) : trimmed;
-      // Handle bitcoin: URI scheme
-      if (cleanData.startsWith('bitcoin:')) {
-        cleanData = cleanData.substring(8).split('?')[0]; // Remove URI params
+    /**
+     * Map a Nostr-resolution failure to a friendly notification. The error's
+     * `.code` distinguishes "profile has no Lightning address" from "couldn't
+     * find / reach the profile" so the user knows whether to fix the npub or
+     * just retry.
+     */
+    notifyNostrResolveError(err) {
+      const code = err?.code;
+      let message = this.$t("We couldn't resolve this Nostr profile");
+      let caption = this.$t('Check the npub and your connection, then try again');
+      if (code === NOSTR_TARGET_ERROR.NO_ADDRESS) {
+        message = this.$t('This Nostr profile has no Lightning address yet');
+        caption = this.$t('Ask them to set a Lightning address on their profile');
+      } else if (code === NOSTR_TARGET_ERROR.NO_PROFILE) {
+        message = this.$t("We couldn't find this Nostr profile");
+        caption = this.$t('No profile was published to the relays we checked');
+      } else if (code === LOOKUP_ERROR.INVALID_NPUB || code === LOOKUP_ERROR.INVALID_NPROFILE) {
+        message = this.$t('That Nostr key looks malformed');
+        caption = this.$t('Double-check the npub and try again');
       }
-
-      // Spark addresses - Zero fee transfers
-      // New format: spark1 (mainnet), sparkrt1 (regtest), sparkt1 (testnet), sparks1 (signet), sparkl1 (local)
-      // Legacy format: sp1 (mainnet), tsp1 (testnet), sprt1 (regtest)
-      if (this.isSparkAddress(cleanData)) return 'spark_address';
-      // Lightning invoices: lnbc (mainnet), lntb (testnet), lntbs (signet), lnbcrt (regtest)
-      if (cleanData.startsWith('lnbc') || cleanData.startsWith('lntb') ||
-          cleanData.startsWith('lntbs') || cleanData.startsWith('lnbcrt')) return 'lightning_invoice';
-      if (cleanData.includes('@') && cleanData.includes('.')) return 'lightning_address';
-      if (cleanData.startsWith('lnurl') || cleanData.startsWith('keyauth://')) return 'lnurl';
-      // Bitcoin on-chain addresses (L1)
-      if (this.isBitcoinAddress(cleanData)) return 'bitcoin_address';
-      return 'unknown';
+      this.$q.notify({ type: 'negative', message, caption });
     },
 
     /**
-     * Check if address is a valid Bitcoin on-chain address
+     * Unwrap URI schemes to the inner payment destination.
+     *
+     * - `lightning:<...>`      → strip prefix
+     * - `bitcoin:<addr>?...`   → parse BIP21, prefer embedded `lightning=`
+     *                            invoice over on-chain address
      */
-    isBitcoinAddress(address) {
-      if (!address) return false;
-      const normalized = address.trim();
-      // Mainnet: bc1 (bech32/bech32m), 1 (P2PKH), 3 (P2SH)
-      // Testnet: tb1 (bech32), m/n (P2PKH), 2 (P2SH)
-      const mainnetRegex = /^(bc1[a-zA-HJ-NP-Z0-9]{39,62}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$/i;
-      const testnetRegex = /^(tb1[a-zA-HJ-NP-Z0-9]{39,62}|[mn2][a-km-zA-HJ-NP-Z1-9]{25,34})$/i;
-      return mainnetRegex.test(normalized) || testnetRegex.test(normalized);
+    /** Bare destination plus any BIP21 it came from; see normalizeDestination. */
+    normalizePaymentInput(input) {
+      return normalizeDestination(input, this.walletStore.activeWalletType);
     },
 
-    isSparkAddress(address) {
-      if (!address) return false;
-      const normalized = address.toLowerCase().trim();
-      // New format prefixes
-      const newPrefixes = ['spark1', 'sparkrt1', 'sparkt1', 'sparks1', 'sparkl1'];
-      // Legacy format prefixes
-      const legacyPrefixes = ['sp1', 'tsp1', 'sprt1'];
-      return newPrefixes.some(p => normalized.startsWith(p)) ||
-             legacyPrefixes.some(p => normalized.startsWith(p));
-    },
-
-    validatePaymentInput(input) {
-      if (!input || input.trim().length === 0) {
-        return this.$t('Please enter a payment request');
-      }
-
-      let trimmed = input.trim().toLowerCase();
-      // Strip lightning: prefix if present
-      if (trimmed.startsWith('lightning:')) {
-        trimmed = trimmed.substring(10);
-      }
-      // Strip bitcoin: URI prefix if present
-      if (trimmed.startsWith('bitcoin:')) {
-        trimmed = trimmed.substring(8).split('?')[0];
-      }
-      // Lightning invoices: lnbc (mainnet), lntb (testnet), lntbs (signet), lnbcrt (regtest)
-      const isLightningInvoice = trimmed.startsWith('lnbc') || trimmed.startsWith('lntb') ||
-        trimmed.startsWith('lntbs') || trimmed.startsWith('lnbcrt');
-      const isLightningAddress = trimmed.includes('@') && trimmed.includes('.');
-      const isLnurl = trimmed.startsWith('lnurl');
-      const isSparkAddr = this.isSparkAddress(trimmed);
-      const isBitcoinAddr = this.isBitcoinAddress(trimmed);
-
-      const isValid = isLightningInvoice || isLightningAddress || isLnurl || isSparkAddr || isBitcoinAddr;
-
-      return isValid ? true : this.$t('Invalid payment format');
-    },
-
-    showManualInput() {
-      this.showManualDialog = true;
-      this.manualInput = '';
+    determinePaymentType(data) {
+      return classifyDestination(data, this.walletStore.activeWalletType);
     },
 
     async pasteFromClipboard() {
-      let clipboardText = '';
+      // Native plugin first, WebView APIs as fallback: on Android the
+      // WebView rejects programmatic reads, which used to leave the Paste
+      // button focusing an empty field and coaching a long-press instead
+      // of pasting.
+      const clipboardText = await readClipboardCrossPlatform();
 
-      // 1) Try navigator.clipboard.readText (modern API)
-      if (navigator.clipboard && navigator.clipboard.readText) {
-        try {
-          clipboardText = await navigator.clipboard.readText();
-        } catch (e) {
-          console.warn('clipboard.readText() failed:', e);
-        }
-      }
-
-      // 2) Fallback: navigator.clipboard.read() — works on some Android
-      //    devices where readText() is denied but read() is allowed
-      if (!clipboardText && navigator.clipboard && navigator.clipboard.read) {
-        try {
-          const items = await navigator.clipboard.read();
-          for (const item of items) {
-            if (item.types.includes('text/plain')) {
-              const blob = await item.getType('text/plain');
-              clipboardText = await blob.text();
-              break;
-            }
-          }
-        } catch (e) {
-          console.warn('clipboard.read() failed:', e);
-        }
-      }
-
-      // 3) Success — process the pasted data
-      if (clipboardText && clipboardText.trim()) {
-        await this.processPaymentData(clipboardText.trim());
-        return;
-      }
-
-      // 4) Clipboard API unavailable or empty — fall back to manual input
-      this.showManualDialog = true;
-      this.manualInput = '';
+      // Always land the clipboard in the visible field for the user to
+      // verify before committing. No silent fire-and-forget — too easy
+      // to send to a stale or wrong address otherwise.
+      this.manualInput = (clipboardText || '').trim();
       this.$nextTick(() => {
-        const input = this.$el?.querySelector('.manual-input input, .manual-input textarea');
-        if (input) input.focus();
+        this.$refs.manualTextarea?.focus();
       });
-      this.$q.notify({
-        type: 'info',
-        message: this.$t('Paste into the input field'),
-        caption: this.$t('Long-press the text field and tap Paste'),
-        timeout: 4000,
-        actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+
+      // Pasted content is complete, so fetch directly once it's recognized
+      // (any type) — a short beat lets the user glimpse what was pasted.
+      clearTimeout(this.pasteAdvanceTimer);
+      if (this.manualInput) {
+        this.pasteAdvanceTimer = setTimeout(() => this.autoAdvance(), 300);
+      }
+
+      if (!clipboardText) {
+        this.$q.notify({
+          type: 'info',
+          message: this.$t('Paste into the input field'),
+          caption: this.$t('Long-press the text field and tap Paste'),
+          timeout: 4000,
+        });
+      }
+    },
+
+    onTextareaPaste() {
+      clearTimeout(this.pasteAdvanceTimer);
+      this.pasteAdvanceTimer = setTimeout(() => this.autoAdvance(), 200);
+    },
+
+    enterMobileMoney() {
+      this.mobileMoneyMode = true;
+      this.manualInput = '';
+      // Never pre-select a country — a remembered choice would silently
+      // resolve the KE/ZM 07x collision, and a wrong-country payout is
+      // irreversible. Locking a country is always an explicit tap.
+      this.mmCountry = null;
+      if (this.resolveError) this.$emit('update:resolveError', '');
+      this.$nextTick(() => {
+        this.$refs.manualTextarea?.focus();
       });
     },
 
-    async showContactPicker() {
-      // Initialize the address book store to load contacts from localStorage
-      await this.addressBookStore.initialize();
-      this.showContactDialog = true;
-      this.contactSearch = '';
+    exitMobileMoney() {
+      this.mobileMoneyMode = false;
+      this.manualInput = '';
+      this.mmCountry = null;
+      if (this.resolveError) this.$emit('update:resolveError', '');
+    },
+
+    // Tap toggles: selecting locks recognition to the country, tapping the
+    // active chip returns to auto-detect. A complete number plus an explicit
+    // country is a full destination — advance without further ceremony.
+    selectMmCountry(code) {
+      this.mmCountry = this.mmCountry === code ? null : code;
+      this.$nextTick(() => {
+        this.$refs.manualTextarea?.focus();
+        this.autoAdvance();
+      });
+    },
+
+    // Batch send lives on the wallet page (BatchSendModal) — hand off and
+    // get out of the way.
+    openBatchSend() {
+      this.show = false;
+      this.$emit('open-batch-send');
     },
 
     goToAddressBook() {
-      this.showContactDialog = false;
-      this.closeModal();
+      this.show = false;
       this.$router.push('/address-book');
     },
 
-    async selectContact(contact) {
-      // Check if user can pay this contact
-      if (!this.canPayContact(contact)) {
+    onContactPicked(contact) {
+      // Identity-only Nostr contact — saved, but no Lightning address
+      // published yet. Explain instead of emitting a payment the send
+      // flow can't complete.
+      if (contact.source === 'nostr' && !this.addressBookStore.isEntryPayable(contact)) {
         this.$q.notify({
-          type: 'warning',
-          message: this.$t('Cannot pay this contact'),
-          caption: this.getContactDisabledReason(contact),
-          
-          timeout: 3500,
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+          type: 'info',
+          message: this.$t('No Lightning address yet'),
+          caption: this.$t(
+            "{name} hasn't published a Lightning address. Open Address Book to check again later.",
+            { name: contact.name },
+          ),
+          timeout: 4500,
         });
         return;
       }
 
-      // Use store methods for consistent address/type detection
       const address = this.getContactAddress(contact);
+      if (offerAddressRequest(address, { t: this.$t.bind(this), paymentOnly: true })) return;
       const addressType = this.getContactAddressType(contact);
 
-      // Update last used timestamp for recent contacts tracking
-      await this.addressBookStore.updateLastUsed(contact.id);
+      // Defensive — block payment paths the active wallet can't satisfy,
+      // with the same switch hint every other surface shows.
+      if (!canWalletPay(this.walletStore.activeWalletType, addressType)) {
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('Cannot pay this contact'),
+          caption: walletSwitchHint(addressType, this.$t.bind(this)),
+          timeout: 3500,
+        });
+        return;
+      }
 
-      // Map contact address type to payment type
       const paymentTypeMap = {
-        'spark': 'spark_address',
-        'bitcoin': 'bitcoin_address',
-        'lightning': 'lightning_address'
+        spark: 'spark_address',
+        arkade: 'arkade_address',
+        bitcoin: 'bitcoin_address',
+        lightning: 'lightning_address',
+        // LNURL contacts emit the same payment type the manual/scan LNURL path
+        // uses, so Wallet.onPaymentDetected resolves them via fetchLNURLInfo.
+        lnurl: 'lnurl'
       };
       const paymentType = paymentTypeMap[addressType] || 'lightning_address';
 
+      // Feed the recents ordering the resting list leads with.
+      this.addressBookStore.updateLastUsed(contact.id);
+
+      // Land the address in the field: the user sees exactly what is being
+      // resolved, and a failure leaves it editable in place.
+      this.manualInput = address;
+      this.isProcessing = true;
       this.$emit('payment-detected', {
         data: address,
-        type: paymentType
+        type: paymentType,
+        paymentOnly: true
       });
-      this.showContactDialog = false;
-      this.closeModal();
+      // Parent closes us on success / surfaces an inline error on failure.
     },
 
-    // Contact type helper methods - use store methods for consistency and auto-detection
+    // Contact helpers (used by the contact-row handler above).
     getContactAddress(contact) {
       return this.addressBookStore.getEntryAddress(contact);
     },
@@ -844,61 +1214,95 @@ export default {
       return this.addressBookStore.getEntryAddressType(contact);
     },
 
-    getContactTypeIcon(contact) {
+    /**
+     * Rail dot for a contact row — only the constrained rails get one
+     * (a Lightning/LNURL contact is the norm and stays undecorated).
+     * Colors mirror the quick-contacts modal so the vocabulary matches.
+     */
+    contactRailDot(contact) {
       const type = this.getContactAddressType(contact);
-      const icons = {
-        lightning: 'tabler:bolt',
-        spark: 'tabler:flame',
-        bitcoin: 'tabler:currency-bitcoin'
-      };
-      return icons[type] || icons.lightning;
+      if (type === 'spark') return { kind: 'spark', color: '#000' };
+      // Arkade: purple in light mode, orange in dark (app.css tokens).
+      if (type === 'arkade') return { kind: 'arkade', color: 'var(--arkade-ink)' };
+      if (type === 'bitcoin') return { kind: 'bitcoin', color: '#F7931A' };
+      return null;
     },
 
-    getContactTypeLabel(contact) {
-      const type = this.getContactAddressType(contact);
-      const labels = {
-        lightning: 'Lightning',
-        spark: 'Spark',
-        bitcoin: 'Bitcoin'
-      };
-      return labels[type] || labels.lightning;
+    // Payable = has a resolvable address (identity-only Nostr contacts
+    // don't yet) AND rides a rail the active wallet can pay. Drives the
+    // dimmed row state; the tap guards in onContactPicked explain why.
+    isContactPayable(contact) {
+      if (contact.source === 'nostr' && !this.addressBookStore.isEntryPayable(contact)) return false;
+      return canWalletPay(this.walletStore.activeWalletType, this.getContactAddressType(contact));
     },
 
-    getContactTypeBadgeClass(contact) {
-      const type = this.getContactAddressType(contact);
-      const classes = {
-        lightning: 'badge-lightning',
-        spark: 'badge-spark',
-        bitcoin: 'badge-bitcoin'
-      };
-      return classes[type] || classes.lightning;
+    countryName(code) {
+      return {
+        KE: this.$t('Kenya'),
+        ZM: this.$t('Zambia'),
+        TZ: this.$t('Tanzania'),
+        GH: this.$t('Ghana'),
+      }[code] || code;
     },
 
-    canPayContact(contact) {
-      const type = this.getContactAddressType(contact);
-      if (type === 'spark' || type === 'bitcoin') {
-        // Spark and Bitcoin contacts can only be paid from Spark wallet
-        return this.isActiveWalletSpark;
+    // Ambiguous-number chooser: emit the picked country's constructed address
+    // directly, bypassing the default-country resolution in processPaymentData.
+    selectPhoneCountry(candidate) {
+      if (!candidate) return;
+      // Remember the choice so the chooser leads with this country next time.
+      this.preferredPayoutCountry = candidate.country.code;
+      rememberPayoutCountry(candidate.country.code);
+      // Keep the sheet open with the loading CTA while the parent resolves the
+      // constructed provider address; it closes us on success.
+      this.isProcessing = true;
+      this.$emit('payment-detected', {
+        data: candidate.lightningAddress,
+        type: 'lightning_address',
+        rawInput: this.manualInput.trim(),
+      });
+    },
+
+    // Auto-advance (smart fetching) entry point used by the input watcher
+    // and the paste hooks. Guarded so a pending timer never fires after the
+    // sheet was closed, edited to something invalid, a send is in flight,
+    // an ambiguous number still needs a KE/ZM choice, or a resolve already
+    // failed for exactly this input (editing clears the error and re-arms).
+    autoAdvance() {
+      // A person can pause while typing a URL. Only advance a complete
+      // request automatically; explicit Continue can explain malformed input.
+      if (this.detectedInputType === 'address_request') {
+        try { parseAddressRequest(this.manualInput); } catch { return; }
       }
-      // Lightning contacts can be paid from any wallet
-      return true;
-    },
-
-    getContactDisabledReason(contact) {
-      if (!this.canPayContact(contact)) {
-        const type = this.getContactAddressType(contact);
-        if (type === 'bitcoin') {
-          return this.$t('Switch to Spark wallet to send Bitcoin');
-        }
-        return this.$t('Switch to Spark wallet to pay this contact');
+      if (this.show && !this.isProcessing && !this.resolveError && this.isValidManualInput
+          && !this.phoneNeedsCountryChoice && !this.capabilityBlocked) {
+        this.processManualInput();
       }
-      return '';
     },
 
     async processManualInput() {
-      if (!this.isValidManualInput) return;
+      if (!this.isValidManualInput || this.ctaBusy || this.capabilityBlocked) return;
 
-      this.showManualDialog = false;
+      // Resolved Mobile Money number: it is already bound to one provider
+      // address, so emit that directly. Re-deriving in processPaymentData
+      // would re-apply the ambiguous-country default and could flip a
+      // country-locked number to the wrong corridor.
+      const phone = this.mobileMoneyMode ? this.recognizedPhone : null;
+      if (phone && !phone.ambiguous) {
+        this.preferredPayoutCountry = phone.country.code;
+        rememberPayoutCountry(phone.country.code);
+        this.isProcessing = true;
+        this.$emit('payment-detected', {
+          data: phone.lightningAddress,
+          type: 'lightning_address',
+          rawInput: this.manualInput.trim(),
+        });
+        return;
+      }
+
+      // Keep the sheet OPEN and swap the CTA for the loading button — the
+      // fetch/validation happens here (and in the parent) before we ever
+      // leave this field, so a bad address surfaces inline instead of failing
+      // later. The parent closes the sheet once the destination is resolved.
       this.isProcessing = true;
 
       try {
@@ -908,8 +1312,6 @@ export default {
           type: 'negative',
           message: this.$t('Invalid payment request'),
           caption: this.$t('Please check the format and try again'),
-          
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
         this.isProcessing = false;
       }
@@ -920,608 +1322,907 @@ export default {
     },
 
     resetState() {
+      clearTimeout(this.phoneAdvanceTimer);
+      clearTimeout(this.pasteAdvanceTimer);
       this.isProcessing = false;
-      this.cameraError = null;
       this.manualInput = '';
-      this.showManualDialog = false;
+      this.mobileMoneyMode = false;
+      this.mmCountry = null;
+      this.scannerOpen = false;
+      this.clipboardSuggestion = null;
+      // Clear any inline resolve error so a fresh open starts clean.
+      if (this.resolveError) this.$emit('update:resolveError', '');
     }
   }
 }
 </script>
 
 <style scoped>
-.send-modal :deep(.q-dialog__inner) {
+.send-sheet-dialog :deep(.q-dialog__inner) {
   padding: 0;
 }
 
-.send-card {
+.send-sheet-dialog :deep(.q-dialog__backdrop) {
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Sheet shell
+   Content-sized bottom sheet: it hugs whatever state is showing
+   (compact for Mobile Money / a recognized destination, tall only
+   when the contact list earns the height) and never opens a void
+   of dead space. Cap in dvh where supported so the keyboard resize
+   keeps the footer visible; the contact list is the one scroll
+   region once the cap is hit.
+   ───────────────────────────────────────────────────────────── */
+.send-sheet {
   width: 100%;
-  height: 100%;
+  max-width: 520px;
+  max-height: min(86vh, calc(100vh - var(--safe-top, 0px) - 12px));
   display: flex;
   flex-direction: column;
-}
-
-.send-card-dark {
-  background: #0C0C0C;
-  color: #FFF;
-}
-
-.send-card-light {
-  background: #FFF;
-  color: #212121;
-}
-
-/* Header */
-.send-header {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-  padding: 1rem;
-  padding-top: calc(var(--safe-top, 0px) + 1rem);
-  flex-shrink: 0;
+  border-radius: var(--radius-xl) var(--radius-xl) 0 0;
+  background: var(--bg-card);
+  font-family: 'Manrope', sans-serif;
   position: relative;
-  z-index: 10;
 }
 
-.header-content {
+@supports (height: 1dvh) {
+  .send-sheet {
+    max-height: min(86dvh, calc(100dvh - var(--safe-top, 0px) - 12px));
+  }
+}
+
+.send-sheet-dark {
+  box-shadow: 0 -20px 60px rgba(0, 0, 0, 0.55);
+}
+
+.send-sheet-light {
+  border-top: 1px solid var(--border-card);
+  box-shadow: 0 -20px 50px rgba(40, 34, 20, 0.12);
+}
+
+.grab-bar {
+  width: 36px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  opacity: 0.45;
+  margin: 8px auto 0;
+  flex-shrink: 0;
+}
+
+.sheet-close {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  z-index: 2;
+}
+
+.mm-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  min-height: 34px;
+  padding: 2px 52px 0 8px;
+  gap: 2px;
+  flex-shrink: 0;
 }
 
-.back-btn {
-  color: inherit;
+.mm-back {
+  width: 34px;
+  height: 34px;
+  color: var(--text-secondary);
 }
 
-.header-title {
+.mm-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Entry field
+   ───────────────────────────────────────────────────────────── */
+.entry-block {
+  /* Top padding clears the floating glass back button — the sheet is
+     deliberately headerless (grab bar + back + field, no title noise). */
+  padding: 58px 20px 0;
+  flex-shrink: 0;
+}
+
+.mm-head + .entry-block {
+  padding-top: 10px;
+}
+
+/* Clipboard suggestion chip — quiet card above the field. The value
+   reads as data (mono, middle-truncated); the accent "Paste" tag names
+   the action. */
+.clip-suggest {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 10px 12px;
+  border: 1px dashed var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--bg-input);
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  text-align: left;
+  transition: background-color 0.15s ease, transform 0.08s ease;
+}
+
+.body--dark .clip-suggest {
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.clip-suggest:hover { background: rgba(17, 24, 39, 0.05); }
+.body--dark .clip-suggest:hover { background: rgba(255, 255, 255, 0.08); }
+.clip-suggest:active { transform: scale(0.99); }
+
+.clip-suggest-icon {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.clip-suggest-text {
   flex: 1;
-  text-align: center;
-}
-
-.header-spacer {
-  width: 40px;
-}
-
-/* Camera Container */
-.camera-container {
-  flex: 1;
-  position: relative;
+  min-width: 0;
+  font-family: var(--font-mono), 'Manrope', sans-serif;
+  font-size: 12.5px;
+  color: var(--text-secondary);
   overflow: hidden;
-  background: #000;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.camera-view {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-}
-
-.processing-overlay {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.8);
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  z-index: 5;
-}
-
-.processing-text {
-  color: white;
-  font-family: 'Manrope', sans-serif;
-  font-size: 18px;
-  font-weight: 500;
-  margin-top: 1rem;
-}
-
-.camera-error {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: #1f2937;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 2rem;
-  text-align: center;
-}
-
-.error-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 20px;
-  font-weight: 600;
-  color: white;
-  margin: 1rem 0 0.5rem;
-}
-
-.error-subtitle {
-  color: #9ca3af;
-  font-family: 'Manrope', sans-serif;
-  font-size: 14px;
-  margin-bottom: 1.5rem;
-  line-height: 1.5;
-}
-
-.retry-btn {
-  border-radius: 24px;
-}
-
-/* Scanning Frame */
-.scanning-frame {
-  display: none !Important;
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 250px;
-  height: 250px;
-  pointer-events: none;
-}
-
-.frame-corner {
-  position: absolute;
-  width: 30px;
-  height: 30px;
-  border: 3px solid #15DE72;
-}
-
-.frame-corner.top-left {
-  top: 0;
-  left: 0;
-  border-right: none;
-  border-bottom: none;
-}
-
-.frame-corner.top-right {
-  top: 0;
-  right: 0;
-  border-left: none;
-  border-bottom: none;
-}
-
-.frame-corner.bottom-left {
-  bottom: 0;
-  left: 0;
-  border-right: none;
-  border-top: none;
-}
-
-.frame-corner.bottom-right {
-  bottom: 0;
-  right: 0;
-  border-left: none;
-  border-top: none;
-}
-
-/* Bottom Actions */
-.send-actions {
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
-  padding: 1rem;
+.clip-suggest-cta {
   flex-shrink: 0;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--btn-neutral-bg);
+  color: var(--btn-neutral-fg);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
-.action-buttons {
-  display: flex;
-  justify-content: space-around;
-  gap: 1rem;
-}
-
-.action-btn {
-  flex: 1;
-  height: 80px;
-  border-radius: 16px;
-  transition: all 0.2s ease;
-}
-
-.action-btn-dark {
-  background: rgba(42, 52, 42, 0.5);
-  color: white;
-}
-
-.action-btn-light {
-  background: rgba(0, 0, 0, 0.05);
-  color: #212121;
-}
-
-.action-btn-dark:hover {
-  background: rgba(42, 52, 42, 0.8);
-  transform: translateY(-2px);
-}
-
-.action-btn-light:hover {
-  background: rgba(0, 0, 0, 0.1);
-  transform: translateY(-2px);
-}
-
-.btn-content {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.btn-icon {
+.body--dark .clip-suggest-cta {
+  background: rgba(21, 222, 114, 0.16);
   color: #15DE72;
 }
 
-.btn-label {
-  font-family: 'Manrope', sans-serif;
-  font-size: 14px;
-  font-weight: 500;
-}
-
-/* Manual Input Dialog */
-.manual-dialog :deep(.q-dialog__inner) {
-  padding: 1rem;
-}
-
-.manual-card {
+.manual-textarea {
   width: 100%;
-  max-width: min(500px, 95vw);
-  border-radius: 24px;
+  padding: 14px 16px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-lg);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-family: var(--font-mono), 'Manrope', sans-serif;
+  font-size: 16px; /* ≥16px so iOS never zooms the sheet on focus */
+  line-height: 1.45;
+  outline: none;
+  resize: none;
+  transition: border-color 0.18s ease;
+  word-break: break-all;
 }
 
-.manual-header {
-  border-bottom: 1px solid;
+.manual-textarea:focus {
+  border-color: var(--color-green);
+}
+
+.body--light .manual-textarea:focus {
+  border-color: var(--text-primary);
+}
+
+.manual-textarea--error,
+.manual-textarea--error:focus {
+  border-color: rgba(239, 68, 68, 0.55);
+}
+
+.manual-textarea::placeholder {
+  color: var(--text-muted);
+  font-family: 'Manrope', sans-serif;
+}
+
+.field-meta {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  align-items: center;
+  gap: 10px;
+  min-height: 24px;
+  padding: 4px 2px 0;
 }
 
-.manual-title {
-  font-family: 'Manrope', sans-serif;
-}
-
-.close-btn {
-  color: #6b7280;
-}
-
-/* Blur backdrop for manual dialog */
-.manual-dialog-backdrop :deep(.q-dialog__backdrop) {
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-}
-
-.manual-content {
-  padding: 1.5rem;
-}
-
-.manual-input {
-  margin-bottom: 0.5rem;
-}
-
-.manual-input :deep(.q-field__control) {
-  border-radius: 12px;
-}
-
-/* Dark mode input styling - green instead of blue */
-.manual-input-dark :deep(.q-field__control) {
-  background: var(--bg-input) !important;
-  border-color: rgba(255, 255, 255, 0.2) !important;
-}
-
-.manual-input-dark :deep(.q-field--focused .q-field__control) {
-  border-color: #15DE72 !important;
-}
-
-.manual-input-dark :deep(.q-field__label) {
-  color: #B0B0B0;
-}
-
-.manual-input-dark :deep(.q-field--focused .q-field__label),
-.manual-input-dark :deep(.q-field--float .q-field__label) {
-  color: #15DE72 !important;
-}
-
-.manual-input-dark :deep(.q-field__native) {
-  color: #FFF !important;
-}
-
-/* Light mode input styling - green instead of blue */
-.manual-input-light :deep(.q-field__control) {
-  background: var(--bg-input) !important;
-  border-color: rgba(0, 0, 0, 0.15) !important;
-}
-
-.manual-input-light :deep(.q-field--focused .q-field__control) {
-  border-color: #15DE72 !important;
-}
-
-.manual-input-light :deep(.q-field__label) {
-  color: #6B7280;
-}
-
-.manual-input-light :deep(.q-field--focused .q-field__label),
-.manual-input-light :deep(.q-field--float .q-field__label) {
-  color: #15DE72 !important;
-}
-
-.manual-input-light :deep(.q-field__native) {
-  color: #212121 !important;
-}
-
-/* Continue button - green text */
-.continue-btn {
-  color: #15DE72 !important;
-  font-weight: 600;
-}
-
-.continue-btn:disabled {
-  color: #6b7280 !important;
-  opacity: 0.5;
-}
-
-/* Action buttons border colors */
-.actions-dark {
-  border-top-color: rgba(255, 255, 255, 0.1);
-}
-
-.actions-light {
-  border-top-color: rgba(0, 0, 0, 0.1);
-}
-
-.manual-actions {
-  border-top: 1px solid;
-}
-
-/* Responsive Design */
-@media (max-width: 480px) {
-  .scanning-frame {
-    width: 200px;
-    height: 200px;
-  }
-
-  .action-buttons {
-    gap: 0.5rem;
-  }
-
-  .action-btn {
-    height: 70px;
-  }
-
-  .btn-label {
-    font-size: 12px;
-  }
-
-  .manual-content {
-    padding: 1rem;
-  }
-}
-
-/* Contact Picker Dialog */
-.contact-dialog-backdrop :deep(.q-dialog__backdrop) {
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(8px);
-  -webkit-backdrop-filter: blur(8px);
-}
-
-.contact-picker-card {
-  width: 100%;
-  max-width: 400px;
-  border-radius: 24px;
-  overflow: hidden;
-}
-
-.contact-picker-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 1rem 1.25rem;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-}
-
-.contact-picker-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 18px;
-  font-weight: 600;
-}
-
-.contact-search-section {
-  padding: 0.75rem 1rem 0;
-}
-
-.contact-search :deep(.q-field__control) {
-  border-radius: 12px;
-}
-
-.contact-list-section {
-  padding: 0.5rem 0;
-  max-height: 350px;
-  overflow-y: auto;
-}
-
-/* Empty State */
-.contact-empty-state {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  padding: 2.5rem 1.5rem;
-  text-align: center;
-}
-
-.empty-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 16px;
-  font-weight: 600;
-  margin-top: 1rem;
-}
-
-.empty-subtitle {
-  font-family: 'Manrope', sans-serif;
-  font-size: 13px;
-  margin-top: 0.5rem;
-  line-height: 1.4;
-  max-width: 250px;
-}
-
-.add-contact-cta {
-  margin-top: 1.25rem;
-  height: 44px;
-  border-radius: 22px;
-  font-family: 'Manrope', sans-serif;
-  font-size: 14px;
-  font-weight: 500;
-  padding: 0 1.5rem;
-}
-
-/* Contact List */
-.contact-list {
-  display: flex;
-  flex-direction: column;
-}
-
-/* Contact Section Headers */
-.contact-section-header {
+.input-helper {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.625rem 1.25rem 0.5rem;
-  font-family: 'Manrope', sans-serif;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+.helper-icon-error {
+  color: #EF4444;
+  flex-shrink: 0;
+}
+
+/* Whole helper row turns red when showing a resolution error so the
+   message (e.g. "We couldn't find this Lightning address") reads clearly. */
+.input-helper--error {
+  color: #EF4444;
+}
+
+/* Capability hint (amber, not red): the destination is valid, the wallet
+   just rides a different rail — a constraint, not a failure. */
+.helper-icon-warn {
+  color: #B45309;
+  flex-shrink: 0;
+}
+
+.input-helper--warn {
+  color: #B45309;
+}
+
+.body--dark .helper-icon-warn,
+.body--dark .input-helper--warn {
+  color: #F59E0B;
+}
+
+/* Auto-detection chip — same vocabulary as AddressBookModal so users
+   recognize the affordance across surfaces. */
+.detected-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 999px;
   font-size: 11px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.2px;
+  line-height: 1;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.section-header-dark {
-  color: #777;
+/* Light mode runs neutral (near-black on soft grey) — Buho green is a
+   deliberate accent, not the default chrome. Dark mode keeps the green
+   family below, where it reads calm instead of loud. */
+.detected-pill--lightning_address,
+.detected-pill--lightning_invoice,
+.detected-pill--lnurl,
+.detected-pill--phone_number,
+.detected-pill--nostr_identifier {
+  background: rgba(17, 24, 39, 0.06);
+  color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px rgba(17, 24, 39, 0.14);
 }
 
-.section-header-light {
-  color: #9CA3AF;
+.body--dark .detected-pill--lightning_address,
+.body--dark .detected-pill--lightning_invoice,
+.body--dark .detected-pill--lnurl,
+.body--dark .detected-pill--phone_number,
+.body--dark .detected-pill--nostr_identifier {
+  background: rgba(21, 222, 114, 0.16);
+  color: #15DE72;
+  box-shadow: inset 0 0 0 1px rgba(21, 222, 114, 0.28);
 }
 
-.contact-item {
+.detected-pill--spark,
+.detected-pill--arkade,
+.detected-pill--silent_payment,
+.detected-pill--bolt12_offer {
+  background: rgba(120, 120, 120, 0.12);
+  color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px rgba(120, 120, 120, 0.25);
+}
+
+.detected-pill--bitcoin_address,
+.detected-pill--bip21 {
+  background: rgba(247, 147, 26, 0.14);
+  color: #C97A0F;
+  box-shadow: inset 0 0 0 1px rgba(247, 147, 26, 0.28);
+}
+
+.body--dark .detected-pill--bitcoin_address,
+.body--dark .detected-pill--bip21 {
+  color: #F7931A;
+  box-shadow: inset 0 0 0 1px rgba(247, 147, 26, 0.36);
+}
+
+.type-pill-enter-active,
+.type-pill-leave-active {
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+.type-pill-enter-from,
+.type-pill-leave-to {
+  opacity: 0;
+  transform: translateY(-2px) scale(0.96);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Mobile Money country selector
+   ───────────────────────────────────────────────────────────── */
+.mm-countries {
+  display: grid;
+  /* Column count is set inline from mmCountryColumns: CSS cannot count its
+     own children, and a fixed three left a fourth country alone on a row. */
+  gap: 10px;
+  /* With enough countries the tiles would push the field and the keyboard
+     apart, so the row carries its own scroll rather than growing the sheet. */
+  max-height: 42vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Bottom inset carries the safe area for the (footer-less) resting
+     Mobile Money state, so the sheet ends cleanly at the chips. */
+  padding: 14px 20px max(16px, var(--safe-bottom, 16px));
+  flex-shrink: 0;
+}
+
+.mm-country {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px 8px 10px;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+  background: var(--bg-input);
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  transition: box-shadow 0.15s ease, background-color 0.15s ease,
+    border-color 0.15s ease, transform 0.08s ease;
+}
+
+.body--dark .mm-country {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.mm-country:active {
+  transform: scale(0.97);
+}
+
+/* Light mode: selection reads as near-black, not green. */
+.mm-country--active {
+  border-color: var(--text-primary);
+  box-shadow: 0 0 0 1px var(--text-primary);
+  background: rgba(17, 24, 39, 0.04);
+}
+
+.body--dark .mm-country--active {
+  border-color: #15DE72;
+  box-shadow: 0 0 0 1px #15DE72;
+  background: rgba(21, 222, 114, 0.10);
+}
+
+.mm-country-logo {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  object-fit: cover;
+  background: #fff;
+}
+
+.mm-country-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.mm-country-cc {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Paste / Scan
+   ───────────────────────────────────────────────────────────── */
+.quick-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  padding: 12px 20px 2px;
+  flex-shrink: 0;
+}
+
+.quick-btn {
+  height: 52px;
   display: flex;
   align-items: center;
-  padding: 0.875rem 1.25rem;
+  justify-content: center;
+  gap: 8px;
+  border: none;
+  border-radius: var(--radius-lg);
+  background: var(--bg-input);
+  box-shadow: inset 0 0 0 1px var(--border-card);
+  color: var(--text-primary);
+  font-family: 'Manrope', sans-serif;
+  font-size: 14.5px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  cursor: pointer;
+  transition: background-color 0.18s ease, transform 0.08s ease;
+}
+
+.body--dark .quick-btn {
+  background: rgba(255, 255, 255, 0.06);
+  box-shadow: none;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.quick-btn:hover {
+  background: rgba(17, 24, 39, 0.05);
+}
+
+.body--dark .quick-btn:hover {
+  background: rgba(255, 255, 255, 0.10);
+}
+
+.quick-btn:active {
+  transform: scale(0.97);
+}
+
+.quick-icon {
+  opacity: 0.8;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Resolving skeleton — the confirm sheet's recipient hero, forming
+   ───────────────────────────────────────────────────────────── */
+.resolve-skeleton {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 16px 20px 2px;
+  flex-shrink: 0;
+}
+
+.resolve-skeleton-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Method rows (Mobile Money / Batch Send)
+   ───────────────────────────────────────────────────────────── */
+.method-block {
+  margin: 14px 20px 0;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-card);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.body--dark .method-block {
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.method-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 12px 14px;
+  border: none;
+  background: transparent;
+  font-family: 'Manrope', sans-serif;
+  text-align: left;
   cursor: pointer;
   transition: background-color 0.15s ease;
-  gap: 0.875rem;
 }
 
-.contact-item-dark:hover {
-  background: rgba(21, 222, 114, 0.08);
+.method-row:hover {
+  background: rgba(17, 24, 39, 0.04);
 }
 
-.contact-item-dark:active {
-  background: rgba(21, 222, 114, 0.15);
+.body--dark .method-row:hover {
+  background: rgba(255, 255, 255, 0.05);
 }
 
-.contact-item-light:hover {
-  background: rgba(21, 222, 114, 0.08);
+.method-row:active {
+  background: rgba(17, 24, 39, 0.07);
 }
 
-.contact-item-light:active {
-  background: rgba(21, 222, 114, 0.12);
+.body--dark .method-row:active {
+  background: rgba(255, 255, 255, 0.08);
 }
 
-.contact-disabled {
-  opacity: 0.5;
+.method-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  flex-shrink: 0;
 }
 
-.contact-disabled:hover {
-  background: transparent !important;
-  cursor: not-allowed;
+.body--dark .method-icon {
+  background: rgba(255, 255, 255, 0.07);
+  color: rgba(255, 255, 255, 0.75);
 }
 
-.contact-avatar {
+.method-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.method-title {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
+}
+
+.method-sub {
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.method-chev {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.method-divider {
+  height: 1px;
+  margin-left: 66px;
+  background: var(--border-card);
+}
+
+.body--dark .method-divider {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Contacts
+   ───────────────────────────────────────────────────────────── */
+.contacts-section {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  padding-top: 6px;
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px 4px;
+  flex-shrink: 0;
+}
+
+.section-label {
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.manage-btn {
+  border: none;
+  background: transparent;
+  padding: 4px 2px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  color: #15DE72;
+  cursor: pointer;
+}
+
+/* Light mode: neutral near-black action, per the light-palette rule
+   (green stays a dark-mode accent). */
+.body--light .manage-btn {
+  color: var(--text-primary);
+}
+
+.contacts-scroll {
+  flex: 1;
+  /* Floor keeps the sheet height steady while typing filters the list —
+     rows disappearing must not make the whole sheet pump up and down. */
+  min-height: 240px;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 2px 8px max(14px, var(--safe-bottom, 14px));
+}
+
+.contact-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 14px;
+  background: transparent;
+  font-family: 'Manrope', sans-serif;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.contact-row:hover {
+  background: rgba(17, 24, 39, 0.04);
+}
+
+.body--dark .contact-row:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.contact-row:active {
+  background: rgba(17, 24, 39, 0.07);
+}
+
+.body--dark .contact-row:active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.row-avatar-wrap {
+  position: relative;
+  flex-shrink: 0;
+  display: inline-flex;
+}
+
+.row-avatar {
   width: 44px;
   height: 44px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* Rail dot — bottom-right of the avatar, ringed so it reads over any
+   avatar color. Icon-only: the nuance without the jargon. */
+.row-rail-dot {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 17px;
+  height: 17px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-family: 'Manrope', sans-serif;
-  font-size: 18px;
-  font-weight: 600;
-  color: white;
-  flex-shrink: 0;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+  color: #fff;
+  box-shadow: 0 0 0 2px var(--bg-card);
 }
 
-.contact-info {
+/* Unpayable on the active wallet (or identity-only Nostr contact):
+   visibly dimmed; the tap still explains why via the shared toast. */
+.contact-row--unpayable {
+  opacity: 0.45;
+}
+
+.row-name {
   flex: 1;
   min-width: 0;
   display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-}
-
-.contact-name-row {
-  display: flex;
   align-items: center;
-  gap: 0.5rem;
-}
-
-.contact-name {
-  font-family: 'Manrope', sans-serif;
+  gap: 6px;
   font-size: 15px;
   font-weight: 600;
-  white-space: nowrap;
+  color: var(--text-primary);
+  letter-spacing: -0.005em;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-.contact-type-badge {
-  display: flex;
-  align-items: center;
-  gap: 0.2rem;
-  padding: 0.1rem 0.4rem;
-  border-radius: 6px;
-  font-family: 'Manrope', sans-serif;
-  font-size: 9px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
+.row-star {
+  color: #F59E0B;
   flex-shrink: 0;
 }
 
-.badge-lightning {
-  background: linear-gradient(135deg, #F59E0B, #D97706);
-  color: white;
+.row-chev {
+  color: var(--text-muted);
+  flex-shrink: 0;
 }
 
-.badge-spark {
-  background: linear-gradient(135deg, #15DE72, #059573);
-  color: white;
+/* Skeleton + empty states */
+.contacts-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 4px 12px;
 }
 
-.badge-bitcoin {
-  background: linear-gradient(135deg, #F7931A, #E67E00);
-  color: white;
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 0;
 }
 
-.contact-address {
+.contacts-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 36px 24px;
+  gap: 4px;
+}
+
+.empty-icon {
+  color: var(--text-muted);
+  opacity: 0.7;
+  margin-bottom: 4px;
+}
+
+.empty-title {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.empty-sub {
+  margin: 0;
+  font-size: 12.5px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.empty-add-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 14px;
+  padding: 9px 16px;
+  border: none;
+  border-radius: 999px;
+  background: var(--bg-input);
+  box-shadow: inset 0 0 0 1px var(--border-card);
+  color: var(--text-primary);
   font-family: 'Manrope', sans-serif;
   font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.body--dark .empty-add-btn {
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: none;
+  color: rgba(255, 255, 255, 0.88);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   Footer (loading CTA / country chooser / Continue)
+   ───────────────────────────────────────────────────────────── */
+.sheet-footer {
+  padding: 12px 20px max(14px, var(--safe-bottom, 14px));
+  flex-shrink: 0;
+}
+
+/* Ambiguous-country chooser: a bare (no calling code) 07x number can be a
+   valid mobile in more than one country. We never guess (wrong country is
+   irreversible) — instead we show rich, one-tap rows (provider logo, country,
+   operator, international number) with the user's last-picked country first. */
+.country-choice { display: flex; flex-direction: column; gap: 8px; }
+.country-choice-label {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-align: center;
+}
+.country-choice-list { display: flex; flex-direction: column; gap: 8px; }
+.country-choice-btn {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-card);
+  background: var(--bg-input);
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  text-align: left;
+  transition: filter 0.15s ease, transform 0.08s ease;
+}
+.country-choice-btn:hover { filter: brightness(1.03); }
+.country-choice-btn:active { transform: scale(0.99); }
+.country-choice-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: #fff;
+}
+.country-choice-text { display: flex; flex-direction: column; gap: 1px; min-width: 0; flex: 1; }
+.country-choice-name { font-size: 14px; font-weight: 700; color: var(--text-primary); }
+.country-choice-op { font-size: 11.5px; color: var(--text-secondary); }
+.country-choice-number {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex-shrink: 0;
 }
 
-/* Scrollbar styling for contact list */
-.contact-list-section::-webkit-scrollbar {
-  width: 4px;
+/* Primary CTA — gradient-green on dark, neutral-dark pill on cream.
+   Same language as PaymentConfirmSheet, AddressBookModal, etc. */
+.primary-cta {
+  width: 100%;
+  /* Match ProgressCta's height so the idle CTA -> loading-button morph doesn't
+     jump (ProgressCta is 56px, 50px under 480px — mirrored below). */
+  height: 56px;
+  border-radius: var(--radius-pill);
+  border: none;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  cursor: pointer;
+  background: var(--gradient-green);
+  color: #fff;
+  transition: filter 0.15s ease, transform 0.08s ease, opacity 0.15s ease;
 }
 
-.contact-list-section::-webkit-scrollbar-track {
-  background: transparent;
+.body--light .primary-cta {
+  background: var(--btn-neutral-bg);
+  color: var(--btn-neutral-fg);
 }
 
-.contact-list-section::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.3);
-  border-radius: 2px;
+.primary-cta:hover:not(:disabled) {
+  filter: brightness(1.05);
 }
 
-.contact-list-section::-webkit-scrollbar-thumb:hover {
-  background: rgba(128, 128, 128, 0.5);
+.primary-cta:active:not(:disabled) {
+  transform: scale(0.985);
+  filter: brightness(0.95);
+}
+
+.primary-cta:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Responsive */
+@media (max-width: 480px) {
+  /* Mirror ProgressCta's mobile height so the CTA morph stays seamless. */
+  .primary-cta {
+    height: 50px;
+  }
+
+  .entry-block,
+  .quick-actions,
+  .sheet-footer {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  .method-block,
+  .resolve-skeleton {
+    margin-left: 16px;
+    margin-right: 16px;
+  }
+
+  .section-head {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
 }
 </style>

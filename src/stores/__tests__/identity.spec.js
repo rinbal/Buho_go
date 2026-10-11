@@ -1,0 +1,1196 @@
+/**
+ * Identity store lifecycle tests.
+ *
+ * Drives the Pinia store through create / persist / hydrate / restore /
+ * rotate / reset paths against an in-memory localStorage shim. Uses
+ * real AES-GCM via Node's Web Crypto so the encryption envelope is
+ * exercised end-to-end — only the storage backing is faked.
+ *
+ * Run with the Node runtime directly:
+ *   node src/stores/__tests__/identity.spec.js
+ *
+ * No jest/vitest dependency; matches the harness style used by
+ * identityCrypto.spec.js and lud4.spec.js.
+ */
+
+import { strict as assert } from 'node:assert';
+
+// ---------------------------------------------------------------------------
+// Browser globals shim — must be set up BEFORE the store imports load,
+// since they reference `localStorage` at module level.
+// ---------------------------------------------------------------------------
+
+/**
+ * Minimal in-memory localStorage. Pure storage — no test hooks bolted on.
+ * Specific failure modes (e.g. quota exceeded) are simulated locally in
+ * the tests that need them via `withFailingStorageWrite` below.
+ */
+class MemoryStorage {
+  constructor() {
+    this._data = new Map();
+  }
+  getItem(key) {
+    return this._data.has(key) ? this._data.get(key) : null;
+  }
+  setItem(key, value) {
+    this._data.set(key, String(value));
+  }
+  removeItem(key) {
+    this._data.delete(key);
+  }
+  clear() {
+    this._data.clear();
+  }
+}
+
+globalThis.localStorage = new MemoryStorage();
+
+/**
+ * Run `fn` with `localStorage.setItem(failingKey, …)` configured to throw,
+ * then restore the original method. Keeps the failure mode local to one
+ * test so it can't leak into others — strictly more honest than a global
+ * `__throwOnWrite` flag on the shim.
+ */
+async function withFailingStorageWrite(failingKey, fn) {
+  const orig = globalThis.localStorage.setItem.bind(globalThis.localStorage);
+  globalThis.localStorage.setItem = (key, value) => {
+    if (key === failingKey) {
+      throw new Error('quota exceeded (simulated by test)');
+    }
+    return orig(key, value);
+  };
+  try {
+    await fn();
+  } finally {
+    globalThis.localStorage.setItem = orig;
+  }
+}
+
+const { createPinia, setActivePinia } = await import('pinia');
+const { useIdentityStore } = await import('../identity.js');
+
+let passed = 0;
+let failed = 0;
+
+async function test(name, fn) {
+  try {
+    await fn();
+    console.log(`  ✓ ${name}`);
+    passed += 1;
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    console.error(`    ${err.message}`);
+    if (err.stack) console.error(err.stack.split('\n').slice(1, 4).join('\n'));
+    failed += 1;
+  }
+}
+
+/**
+ * Reset every test to a known-good baseline: empty localStorage,
+ * fresh Pinia instance.
+ */
+function freshEnv() {
+  globalThis.localStorage = new MemoryStorage();
+  setActivePinia(createPinia());
+  return useIdentityStore();
+}
+
+console.log('identity store');
+
+await test('confirmBackup restores its previous state when storage fails', async () => {
+  const store = freshEnv();
+  store.backupBannerDismissedUntil = 123;
+  await withFailingStorageWrite('buhoGO_identity_v1', async () => {
+    await assert.rejects(() => store.confirmBackup(), /quota/);
+  });
+  assert.equal(store.backupConfirmed, false);
+  assert.equal(store.backupBannerDismissedUntil, 123);
+  await store.confirmBackup();
+  assert.equal(store.backupConfirmed, true);
+});
+
+
+// ---------------------------------------------------------------------------
+// ensureIdentity — fresh state, idempotent
+// ---------------------------------------------------------------------------
+
+await test('ensureIdentity creates a new identity from scratch', async () => {
+  const s = freshEnv();
+  assert.equal(s.bootstrapped, false);
+  await s.ensureIdentity();
+  assert.equal(s.bootstrapped, true);
+  assert.equal(s.backupConfirmed, false);
+  assert.match(s.fingerprint, /^[0-9a-f]{16}$/);
+  assert.equal(s.nostrAccountIndex, 0);
+  assert.match(s.nostrPubkeyHex, /^[0-9a-f]{64}$/);
+  assert.match(s.nostrNpub, /^npub1[02-9ac-hj-np-z]+$/);
+});
+
+await test('ensureIdentity is a no-op when already bootstrapped', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const npubBefore = s.nostrNpub;
+  const fpBefore = s.fingerprint;
+  await s.ensureIdentity();
+  // The second call must not generate a new mnemonic.
+  assert.equal(s.nostrNpub, npubBefore);
+  assert.equal(s.fingerprint, fpBefore);
+});
+
+// ---------------------------------------------------------------------------
+// getMnemonic — round-trips through real AES-GCM
+// ---------------------------------------------------------------------------
+
+await test('getMnemonic round-trips through the encryption envelope', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const m1 = await s.getMnemonic();
+  const m2 = await s.getMnemonic();
+  assert.equal(m1, m2);
+  assert.equal(m1.split(' ').length, 12);
+});
+
+await test('getMnemonic throws IDENTITY_NOT_BOOTSTRAPPED when no seed', async () => {
+  const s = freshEnv();
+  try {
+    await s.getMnemonic();
+    assert.fail('expected getMnemonic to throw');
+  } catch (err) {
+    assert.equal(err.code, 'IDENTITY_NOT_BOOTSTRAPPED');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// importMnemonic — valid / invalid / state reset
+// ---------------------------------------------------------------------------
+
+const FIXED_SEED =
+  'legal winner thank year wave sausage worth useful legal winner thank yellow';
+
+await test('importMnemonic accepts a valid 12-word phrase', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  assert.equal(s.bootstrapped, true);
+  assert.equal(s.backupConfirmed, true); // default
+  assert.equal(s.nostrAccountIndex, 0);
+  assert.match(s.nostrNpub, /^npub1/);
+  assert.equal(await s.getMnemonic(), FIXED_SEED);
+});
+
+await test('importMnemonic respects markBackedUp=false', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED, false);
+  assert.equal(s.backupConfirmed, false);
+});
+
+await test('importMnemonic rejects an invalid phrase with code', async () => {
+  const s = freshEnv();
+  try {
+    await s.importMnemonic('not a real seed phrase at all');
+    assert.fail('expected importMnemonic to throw');
+  } catch (err) {
+    assert.equal(err.code, 'IDENTITY_INVALID_MNEMONIC');
+  }
+});
+
+await test('importMnemonic resets connectedSites and rotation index', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  s.recordConnectedSite({ domain: 'example.com', action: 'login', linkingPubHex: 'aa' });
+  // Drive the rotation through the public API instead of mutating state
+  // directly: three real rotations get us to account 3, which is plenty
+  // to verify the import path zeroes the index back to 0.
+  await s.rotateNostrIdentity();
+  await s.rotateNostrIdentity();
+  await s.rotateNostrIdentity();
+  assert.equal(s.nostrAccountIndex, 3);
+  assert.equal(s.connectedSites.length, 1);
+
+  await s.importMnemonic(FIXED_SEED);
+  assert.deepEqual(s.connectedSites, []);
+  assert.equal(s.nostrAccountIndex, 0);
+});
+
+await test('importMnemonic + ensureIdentity from the same seed produce the same npub', async () => {
+  const a = freshEnv();
+  await a.importMnemonic(FIXED_SEED);
+  const b = freshEnv();
+  await b.importMnemonic(FIXED_SEED);
+  assert.equal(a.nostrNpub, b.nostrNpub);
+  assert.equal(a.fingerprint, b.fingerprint);
+});
+
+// ---------------------------------------------------------------------------
+// hydrate — round-trip + clamping of out-of-range persisted values
+// ---------------------------------------------------------------------------
+
+await test('hydrate round-trips the metadata blob', async () => {
+  const s1 = freshEnv();
+  await s1.importMnemonic(FIXED_SEED);
+  const fp = s1.fingerprint;
+  const npub = s1.nostrNpub;
+
+  // Re-attach a fresh Pinia against the *same* localStorage instance.
+  setActivePinia(createPinia());
+  const s2 = useIdentityStore();
+  await s2.hydrate();
+  assert.equal(s2.bootstrapped, true);
+  assert.equal(s2.fingerprint, fp);
+  assert.equal(s2.nostrNpub, npub);
+  assert.equal(s2.nostrAccountIndex, 0);
+});
+
+await test('hydrate is idempotent', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  setActivePinia(createPinia());
+  const s2 = useIdentityStore();
+  await s2.hydrate();
+  await s2.hydrate(); // second call is a no-op
+  assert.equal(s2.hydrated, true);
+});
+
+await test('hydrate clamps a negative nostrAccountIndex to 0', async () => {
+  // Hand-corrupt the persisted metadata as if a malicious devtools
+  // edit had set the index out of range. Hydrate must defend itself.
+  const seed = freshEnv();
+  await seed.ensureIdentity();
+  const raw = JSON.parse(globalThis.localStorage.getItem('buhoGO_identity_v1'));
+  raw.nostrAccountIndex = -1;
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify(raw));
+
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nostrAccountIndex, 0);
+});
+
+await test('hydrate clamps a >= 2^31 nostrAccountIndex to 0', async () => {
+  const seed = freshEnv();
+  await seed.ensureIdentity();
+  const raw = JSON.parse(globalThis.localStorage.getItem('buhoGO_identity_v1'));
+  raw.nostrAccountIndex = 2 ** 31; // hardened-derivation collision territory
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify(raw));
+
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nostrAccountIndex, 0);
+});
+
+await test('hydrate clamps a non-integer nostrAccountIndex to 0', async () => {
+  const seed = freshEnv();
+  await seed.ensureIdentity();
+  const raw = JSON.parse(globalThis.localStorage.getItem('buhoGO_identity_v1'));
+  raw.nostrAccountIndex = 'not-a-number';
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify(raw));
+
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nostrAccountIndex, 0);
+});
+
+await test('hydrate tolerates a missing metadata blob gracefully', async () => {
+  // No setup at all — just an empty store.
+  const s = freshEnv();
+  await s.hydrate();
+  assert.equal(s.bootstrapped, false);
+  assert.equal(s.fingerprint, null);
+  assert.equal(s.nostrNpub, null);
+});
+
+// ---------------------------------------------------------------------------
+// rotateNostrIdentity — bump, cache, persist-then-commit rollback, overflow
+// ---------------------------------------------------------------------------
+
+await test('rotateNostrIdentity bumps the account index and refreshes the cache', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const npub0 = s.nostrNpub;
+  const pub0 = s.nostrPubkeyHex;
+
+  const result = await s.rotateNostrIdentity();
+  assert.equal(s.nostrAccountIndex, 1);
+  assert.equal(result.account, 1);
+  assert.notEqual(s.nostrNpub, npub0);
+  assert.notEqual(s.nostrPubkeyHex, pub0);
+  assert.equal(result.npub, s.nostrNpub);
+  assert.equal(result.pubkeyHex, s.nostrPubkeyHex);
+});
+
+await test('rotateNostrIdentity rolls back in-memory state when persist throws', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const npubBefore = s.nostrNpub;
+  const acctBefore = s.nostrAccountIndex;
+
+  await withFailingStorageWrite('buhoGO_identity_v1', async () => {
+    try {
+      await s.rotateNostrIdentity();
+      assert.fail('expected rotation to throw on persist failure');
+    } catch (err) {
+      assert.match(err.message, /quota exceeded/);
+    }
+  });
+
+  // Pre-rotation state must be restored: the user sees the same npub on
+  // reload as they had before the failed rotation.
+  assert.equal(s.nostrAccountIndex, acctBefore);
+  assert.equal(s.nostrNpub, npubBefore);
+});
+
+await test('rotateNostrIdentity refuses to overflow past 2^31', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  // Direct mutation is unavoidable here: simulating 2^31 real rotations
+  // is not feasible in test time. We mutate to the value one below the
+  // ceiling and exercise the guard against incrementing past it.
+  s.nostrAccountIndex = 2 ** 31 - 1;
+
+  try {
+    await s.rotateNostrIdentity();
+    assert.fail('expected rotation to throw at the ceiling');
+  } catch (err) {
+    assert.equal(err.code, 'NOSTR_ACCOUNT_EXHAUSTED');
+  }
+  assert.equal(s.nostrAccountIndex, 2 ** 31 - 1);
+});
+
+await test('rotateNostrIdentity throws IDENTITY_NOT_BOOTSTRAPPED when no seed', async () => {
+  const s = freshEnv();
+  try {
+    await s.rotateNostrIdentity();
+    assert.fail('expected rotation to throw');
+  } catch (err) {
+    assert.equal(err.code, 'IDENTITY_NOT_BOOTSTRAPPED');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// revealNostrSecret + loadNostrIdentity
+// ---------------------------------------------------------------------------
+
+await test('revealNostrSecret returns the nsec without persisting it', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const { privateKeyHex, nsec } = await s.revealNostrSecret();
+  assert.match(privateKeyHex, /^[0-9a-f]{64}$/);
+  assert.match(nsec, /^nsec1[02-9ac-hj-np-z]+$/);
+  // The persisted metadata must NOT contain the secret in any form.
+  const raw = globalThis.localStorage.getItem('buhoGO_identity_v1');
+  assert.equal(raw.includes(privateKeyHex), false);
+  assert.equal(raw.includes(nsec), false);
+});
+
+await test('revealNostrSecret reflects the rotated account', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const before = await s.revealNostrSecret();
+  await s.rotateNostrIdentity();
+  const after = await s.revealNostrSecret();
+  assert.notEqual(before.nsec, after.nsec);
+});
+
+await test('exporting an inactive identity pins its account without switching', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const original = await s.revealNostrSecret();
+  await s.createAnotherNostrIdentity({ pointer: false });
+  const activeNpub = s.nostrNpub;
+  const activeAccount = s.nostrAccountIndex;
+  const inactive = await s.revealNostrSecret(0);
+  assert.equal(inactive.nsec, original.nsec);
+  assert.notEqual(inactive.nsec, (await s.revealNostrSecret()).nsec);
+  assert.equal(s.nostrAccountIndex, activeAccount);
+  assert.equal(s.nostrNpub, activeNpub);
+  await assert.rejects(() => s.revealNostrSecret(100), /Unknown identity/);
+  assert.equal(JSON.stringify(s.$state).includes(inactive.nsec), false);
+});
+
+await test('loadNostrIdentity lazily backfills the cache for legacy users', async () => {
+  // Simulate a user whose persisted metadata predates the Nostr feature:
+  // bootstrapped=true, but nostrPubkeyHex/nostrNpub are absent.
+  const seed = freshEnv();
+  await seed.importMnemonic(FIXED_SEED);
+  const raw = JSON.parse(globalThis.localStorage.getItem('buhoGO_identity_v1'));
+  delete raw.nostrPubkeyHex;
+  delete raw.nostrNpub;
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify(raw));
+
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nostrPubkeyHex, null);
+  assert.equal(s.nostrNpub, null);
+
+  const result = await s.loadNostrIdentity();
+  assert.ok(result?.npub?.startsWith('npub1'));
+  assert.equal(result.pubkeyHex, s.nostrPubkeyHex);
+  assert.equal(result.npub, s.nostrNpub);
+});
+
+await test('loadNostrIdentity returns null when no identity exists', async () => {
+  const s = freshEnv();
+  assert.equal(await s.loadNostrIdentity(), null);
+});
+
+// ---------------------------------------------------------------------------
+// _tryCacheNostrPublic — must swallow derivation failures so a NostrCore
+// crash never takes down identity bootstrap.
+// ---------------------------------------------------------------------------
+
+/**
+ * Helper: capture console.warn for the duration of a callback so the
+ * happy-path test output isn't polluted by warnings the swallow paths
+ * legitimately emit. Also asserts that exactly the expected warns fired.
+ */
+function withSilencedWarn(fn) {
+  const calls = [];
+  const orig = console.warn;
+  console.warn = (...args) => { calls.push(args); };
+  try {
+    fn();
+  } finally {
+    console.warn = orig;
+  }
+  return calls;
+}
+
+await test('_tryCacheNostrPublic swallows an invalid mnemonic and logs once', () => {
+  const s = freshEnv();
+  const warns = withSilencedWarn(() => {
+    s._tryCacheNostrPublic('not a valid mnemonic at all');
+  });
+  assert.equal(s.nostrPubkeyHex, null);
+  assert.equal(s.nostrNpub, null);
+  assert.equal(warns.length, 1);
+  assert.match(warns[0][0], /Nostr cache failed/);
+});
+
+await test('_tryCacheNostrPublic swallows out-of-range account index', () => {
+  const s = freshEnv();
+  // Directly poison the account index past the valid range. The next
+  // _tryCacheNostrPublic call hits a RangeError inside deriveNostrIdentity,
+  // which must be swallowed.
+  s.nostrAccountIndex = -1;
+  withSilencedWarn(() => {
+    s._tryCacheNostrPublic(FIXED_SEED);
+  });
+  assert.equal(s.nostrPubkeyHex, null);
+  assert.equal(s.nostrNpub, null);
+});
+
+await test('ensureIdentity survives a Nostr cache failure mid-bootstrap', async () => {
+  // End-to-end robustness: if Nostr derivation breaks for any reason,
+  // the BuhoGO identity itself (and therefore LUD-04 sign-in) must keep
+  // working. We force the failure by poisoning the account index, then
+  // confirm that a follow-up cache attempt does not corrupt the rest of
+  // the identity state.
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const fp = s.fingerprint;
+  s.nostrAccountIndex = -1;
+  withSilencedWarn(() => {
+    s._tryCacheNostrPublic('any string'); // input doesn't matter, account range fails first
+  });
+  assert.equal(s.bootstrapped, true);
+  assert.equal(s.fingerprint, fp);
+  assert.equal(s.nostrPubkeyHex, null);
+});
+
+// ---------------------------------------------------------------------------
+// connectedSites + reset
+// ---------------------------------------------------------------------------
+
+await test('recordConnectedSite stores and bumps useCount', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  s.recordConnectedSite({ domain: 'a.example', action: 'login', linkingPubHex: 'aa' });
+  s.recordConnectedSite({ domain: 'b.example', action: 'login', linkingPubHex: 'bb' });
+  s.recordConnectedSite({ domain: 'a.example', action: 'login', linkingPubHex: 'aa' });
+  assert.equal(s.connectedSites.length, 2);
+  const a = s.connectedSites.find(x => x.domain === 'a.example');
+  assert.equal(a.useCount, 2);
+});
+
+await test('reset removes both localStorage entries and zeroes state', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  await s.reset();
+  assert.equal(s.bootstrapped, false);
+  assert.equal(s.fingerprint, null);
+  assert.equal(s.nostrPubkeyHex, null);
+  assert.equal(s.nostrNpub, null);
+  assert.equal(s.nostrAccountIndex, 0);
+  assert.equal(globalThis.localStorage.getItem('buhoGO_identity_v1'), null);
+  assert.equal(globalThis.localStorage.getItem('buhoGO_identity_seed_v1'), null);
+});
+
+await test('regenerate wipes and creates a fresh identity in one call', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const npubBefore = s.nostrNpub;
+  await s.regenerate();
+  assert.equal(s.bootstrapped, true);
+  assert.equal(s.backupConfirmed, false); // fresh seed, not yet backed up
+  assert.notEqual(s.nostrNpub, npubBefore);
+});
+
+// ---------------------------------------------------------------------------
+// Username purchase record and pending claims
+// ---------------------------------------------------------------------------
+
+await test('hydrate: empty store starts with an empty nip05Handles list', async () => {
+  const s = freshEnv();
+  await s.hydrate();
+  assert.ok(Array.isArray(s.nip05Handles));
+  assert.equal(s.nip05Handles.length, 0);
+  assert.equal(s.nip05ActiveEntry, null);
+  assert.equal(s.pendingNip05Claim, null);
+});
+
+await test('hydrate: migrates legacy single-handle persisted shape to array', async () => {
+  // Simulate an old localStorage blob from a user who registered before
+  // the marketplace landed. Hand-roll the persisted shape so we test the
+  // migration path, not the recordOwnedHandle action.
+  globalThis.localStorage = new MemoryStorage();
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify({
+    version: 1,
+    backupConfirmed: true,
+    fingerprint: null,
+    connectedSites: [],
+    nostrAccountIndex: 0,
+    nostrPubkeyHex: 'aa'.repeat(32),
+    nostrNpub: 'npub1legacy',
+    nip05Handle: 'satoshi.482913',
+    nip05RotationSecret: 'rot-secret-abc',
+    profileIntroSeenAt: null,
+  }));
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nip05Handles.length, 1);
+  assert.equal(s.nip05Handles[0].handle, 'satoshi.482913');
+  assert.equal(s.nip05Handles[0].rotationSecret, 'rot-secret-abc');
+  assert.equal(s.nip05Handles[0].isFree, true);
+  assert.equal(s.nip05Handles[0].isActive, true);
+  assert.equal(s.nip05ActiveEntry.handle, 'satoshi.482913');
+});
+
+await test('hydrate: malformed array entries are dropped, valid ones kept', async () => {
+  globalThis.localStorage = new MemoryStorage();
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify({
+    version: 1,
+    nip05Handles: [
+      { handle: 'good.123456', isFree: true, isActive: true, createdAt: 5 },
+      { handle: '', isActive: true },           // empty handle → drop
+      { rotationSecret: 'x' },                  // missing handle → drop
+      { handle: 'also-good', isFree: false, isActive: false, createdAt: 9 },
+    ],
+  }));
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nip05Handles.length, 2);
+  assert.deepEqual(s.nip05Handles.map((h) => h.handle), ['good.123456', 'also-good']);
+});
+
+await test('hydrate: two-actives blob is repaired to first-wins', async () => {
+  globalThis.localStorage = new MemoryStorage();
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify({
+    version: 1,
+    nip05Handles: [
+      { handle: 'first', isActive: true },
+      { handle: 'second', isActive: true },
+    ],
+  }));
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nip05Handles.filter((h) => h.isActive).length, 1);
+  assert.equal(s.nip05Handles[0].isActive, true);
+  assert.equal(s.nip05Handles[1].isActive, false);
+});
+
+await test('hydrate: no-active blob promotes the first entry', async () => {
+  globalThis.localStorage = new MemoryStorage();
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify({
+    version: 1,
+    nip05Handles: [
+      { handle: 'only', isActive: false },
+    ],
+  }));
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.equal(s.nip05Handles[0].isActive, true);
+});
+
+await test('recordOwnedHandle: records a paid name, active, and persists', async () => {
+  const s = freshEnv();
+  await s.hydrate();
+  s.recordOwnedHandle({ handle: 'Alice', rotationSecret: 'r1', addressId: 'aid' });
+  assert.equal(s.nip05Handles.length, 1);
+  assert.deepEqual(
+    { ...s.nip05Handles[0], createdAt: 0 },
+    { handle: 'alice', rotationSecret: 'r1', isFree: false, isActive: true, addressId: 'aid', createdAt: 0, expiresAt: null },
+  );
+  setActivePinia(createPinia());
+  const s2 = useIdentityStore();
+  await s2.hydrate();
+  assert.equal(s2.nip05ActiveEntry.handle, 'alice');
+});
+
+await test('recordOwnedHandle: a newer claim becomes the active record', async () => {
+  const s = freshEnv();
+  await s.hydrate();
+  s.recordOwnedHandle({ handle: 'alice' });
+  s.recordOwnedHandle({ handle: 'alice2' });
+  assert.equal(s.nip05Handles.length, 2);
+  assert.equal(s.nip05ActiveEntry.handle, 'alice2');
+});
+
+await test('recordOwnedHandle: switching back reuses the record and keeps its secret', async () => {
+  const s = freshEnv();
+  await s.hydrate();
+  s.recordOwnedHandle({ handle: 'alice', rotationSecret: 'keep-me' });
+  s.recordOwnedHandle({ handle: 'alice2' });
+  s.recordOwnedHandle({ handle: 'alice' });
+  assert.equal(s.nip05Handles.length, 2);
+  assert.equal(s.nip05ActiveEntry.handle, 'alice');
+  assert.equal(s.nip05ActiveEntry.rotationSecret, 'keep-me');
+  assert.equal(s.nip05Handles.filter((h) => h.isActive).length, 1);
+});
+
+await test('recordOwnedHandle: keeps the end date of the purchase', async () => {
+  const s = freshEnv();
+  await s.hydrate();
+  s.recordOwnedHandle({ handle: 'alice', expiresAt: 1234 });
+  s.recordOwnedHandle({ handle: 'alice' });
+  assert.equal(s.usernameExpiresAt('alice'), 1234, 'switching back does not forget it');
+  assert.equal(s.usernameExpiresAt('nobody'), null);
+});
+
+await test('recordOwnedHandle: empty handle is a no-op', async () => {
+  const s = freshEnv();
+  await s.hydrate();
+  s.recordOwnedHandle({ handle: '' });
+  s.recordOwnedHandle();
+  assert.equal(s.nip05Handles.length, 0);
+});
+
+await test('pending claim: set, update, clear, and survives a reload', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  s.setPendingNip05Claim({ handle: 'maria', paymentHash: 'h1', invoice: 'lnbc1', addressId: 'a1', rotationSecret: 'r1' });
+  assert.equal(s.pendingNip05Claim.handle, 'maria');
+  assert.equal(s.pendingNip05Claim.paidAt, null);
+  s.updatePendingNip05Claim({ paidAt: 123 });
+  assert.equal(s.pendingNip05Claim.paidAt, 123);
+
+  setActivePinia(createPinia());
+  const s2 = useIdentityStore();
+  await s2.hydrate();
+  assert.equal(s2.pendingNip05Claim.paymentHash, 'h1');
+  assert.equal(s2.pendingNip05Claim.paidAt, 123);
+
+  s2.clearPendingNip05Claim();
+  assert.equal(s2.pendingNip05Claim, null);
+});
+
+await test('pending claim: belongs to the identity it was bought for', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  s.setPendingNip05Claim({ handle: 'owl', paymentHash: 'h0' });
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  assert.equal(s.pendingNip05Claim, null, 'another identity does not see it');
+  await s.switchNostrIdentity(0, { pointer: stub.opts });
+  assert.equal(s.pendingNip05Claim?.handle, 'owl', 'the original identity still has it');
+});
+
+await test('pending claim: malformed entries are dropped, old claims retained for payment verification', async () => {
+  globalThis.localStorage = new MemoryStorage();
+  const now = Date.now();
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify({
+    version: 1,
+    nostrPubkeyHex: 'aa'.repeat(32),
+    pendingNip05Claims: {
+      ['aa'.repeat(32)]: { handle: 'fresh', paymentHash: 'h', createdAt: now },
+      ['bb'.repeat(32)]: { handle: 'old', paymentHash: 'h', createdAt: now - 8 * 24 * 60 * 60 * 1000 },
+      ['cc'.repeat(32)]: { handle: '', paymentHash: 'h', createdAt: now },
+      'not-a-key': { handle: 'x', paymentHash: 'h', createdAt: now },
+    },
+  }));
+  setActivePinia(createPinia());
+  const s = useIdentityStore();
+  await s.hydrate();
+  assert.deepEqual(Object.keys(s.pendingNip05Claims), ['aa'.repeat(32), 'bb'.repeat(32)]);
+  assert.equal(s.pendingNip05Claim.handle, 'fresh');
+});
+
+await test('rotateNostrIdentity clears the purchase record (new key)', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  s.recordOwnedHandle({ handle: 'old', rotationSecret: 'r' });
+  assert.equal(s.nip05Handles.length, 1);
+  await s.rotateNostrIdentity();
+  assert.equal(s.nip05Handles.length, 0);
+  assert.equal(s.nip05ActiveEntry, null);
+});
+
+// ---------------------------------------------------------------------------
+// Multiple identities — the account-index climb + pointer
+// ---------------------------------------------------------------------------
+
+/** Pointer opts that keep the store off the network and record calls. */
+function pointerStub({ fetched = null, accept = true } = {}) {
+  const calls = { published: [] };
+  return {
+    calls,
+    opts: {
+      relays: ['wss://stub.test'],
+      fetcher: async () => fetched,
+      publisher: ({ event }) => {
+        calls.published.push(event);
+        return {
+          firstAccept: Promise.resolve(accept ? { relay: 'wss://stub.test' } : null),
+          allSettled: Promise.resolve([]),
+        };
+      },
+    },
+  };
+}
+
+await test('createAnotherNostrIdentity climbs to the next unused index and persists the roster', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+
+  const first = await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  assert.equal(first.account, 1);
+  assert.equal(s.nostrAccountIndex, 1);
+  const second = await s.createAnotherNostrIdentity({ label: 'Business', pointer: stub.opts });
+  assert.equal(second.account, 2);
+  assert.deepEqual(s.nostrKnownAccounts.map((a) => a.i), [0, 1, 2]);
+  assert.equal(s.nostrKnownAccounts.find((a) => a.i === 2).label, 'Business');
+  assert.equal(s.pointerDirty, false);
+  assert.equal(stub.calls.published.length, 2);
+
+  // The roster survives a reload.
+  setActivePinia(createPinia());
+  const reloaded = useIdentityStore();
+  await reloaded.hydrate();
+  assert.deepEqual(reloaded.nostrKnownAccounts.map((a) => a.i), [0, 1, 2]);
+  assert.equal(reloaded.nostrAccountIndex, 2);
+});
+
+await test('a refused pointer publish leaves the identity created but flagged dirty', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub({ accept: false });
+  const created = await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  assert.equal(created.account, 1);
+  assert.equal(s.nostrAccountIndex, 1);
+  assert.equal(s.pointerDirty, true);
+});
+
+await test('switchNostrIdentity validates roster membership and re-caches the key', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  const npubOfOne = s.nostrNpub;
+
+  await s.switchNostrIdentity(0, { pointer: stub.opts });
+  assert.equal(s.nostrAccountIndex, 0);
+  assert.notEqual(s.nostrNpub, npubOfOne);
+
+  await s.switchNostrIdentity(1, { pointer: stub.opts });
+  assert.equal(s.nostrNpub, npubOfOne);
+
+  await assert.rejects(
+    () => s.switchNostrIdentity(9, { pointer: stub.opts }),
+    (err) => err.code === 'NOSTR_ACCOUNT_UNKNOWN',
+  );
+});
+
+await test('removeNostrIdentityFromDevice hides an identity without touching the roster or pointer', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  await s.switchNostrIdentity(0, { pointer: stub.opts });
+  const published = stub.calls.published.length;
+
+  s.removeNostrIdentityFromDevice(1);
+  assert.deepEqual((await s.listNostrIdentities()).map((r) => r.account), [0, 2]);
+  assert.deepEqual(s.nostrKnownAccounts.map((a) => a.i), [0, 1, 2], 'the roster keeps the account');
+  assert.equal(stub.calls.published.length, published, 'nothing is published');
+
+  // Its index is never handed out again.
+  const next = await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  assert.equal(next.account, 3);
+
+  // The removal survives a reload; idempotent.
+  s.removeNostrIdentityFromDevice(1);
+  setActivePinia(createPinia());
+  const reloaded = useIdentityStore();
+  await reloaded.hydrate();
+  assert.deepEqual(reloaded.nostrRemovedAccounts, [1]);
+});
+
+await test('restoreNostrIdentityToDevice undoes a removal and survives a reload', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  await s.switchNostrIdentity(0, { pointer: stub.opts });
+  s.removeNostrIdentityFromDevice(1);
+  s.restoreNostrIdentityToDevice(1);
+  s.restoreNostrIdentityToDevice(1);
+  assert.deepEqual((await s.listNostrIdentities()).map((r) => r.account), [0, 1]);
+  setActivePinia(createPinia());
+  const reloaded = useIdentityStore();
+  await reloaded.hydrate();
+  assert.deepEqual(reloaded.nostrRemovedAccounts, []);
+});
+
+await test('removeNostrIdentityFromDevice refuses the identity in use and unknown accounts', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  assert.throws(() => s.removeNostrIdentityFromDevice(1), (err) => err.code === 'NOSTR_ACCOUNT_ACTIVE');
+  assert.throws(() => s.removeNostrIdentityFromDevice(7), (err) => err.code === 'NOSTR_ACCOUNT_UNKNOWN');
+  assert.deepEqual(s.nostrRemovedAccounts, []);
+});
+
+await test('a removed identity made active again still lists, and a new phrase clears removals', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  await s.switchNostrIdentity(0, { pointer: stub.opts });
+  s.removeNostrIdentityFromDevice(1);
+  await s.switchNostrIdentity(1, { pointer: stub.opts });
+  assert.deepEqual((await s.listNostrIdentities()).map((r) => r.account), [0, 1]);
+
+  await s.importMnemonic(FIXED_SEED);
+  assert.deepEqual(s.nostrRemovedAccounts, []);
+});
+
+await test('a corrupt removed list can only show identities, never hide unknown ones', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const stub = pointerStub();
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  const raw = JSON.parse(globalThis.localStorage.getItem('buhoGO_identity_v1'));
+  raw.nostrRemovedAccounts = [1, 1, 'x', 9, -2, 0.5];
+  globalThis.localStorage.setItem('buhoGO_identity_v1', JSON.stringify(raw));
+  setActivePinia(createPinia());
+  const reloaded = useIdentityStore();
+  await reloaded.hydrate();
+  assert.deepEqual(reloaded.nostrRemovedAccounts, [1]);
+});
+
+await test('per-account NIP-05 handles survive a switch round-trip', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  s.recordOwnedHandle({ handle: 'owl-zero' });
+  const stub = pointerStub();
+
+  await s.createAnotherNostrIdentity({ pointer: stub.opts });
+  assert.equal(s.nip05Handles.length, 0, 'new identity starts with no handles');
+  s.recordOwnedHandle({ handle: 'owl-one' });
+
+  await s.switchNostrIdentity(0, { pointer: stub.opts });
+  assert.equal(s.nip05Handles[0].handle, 'owl-zero');
+  await s.switchNostrIdentity(1, { pointer: stub.opts });
+  assert.equal(s.nip05Handles[0].handle, 'owl-one');
+});
+
+await test('resolveActiveNostrAccount adopts a higher pointer account and merges the roster', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const npubOfZero = s.nostrNpub;
+
+  const result = await s.resolveActiveNostrAccount({
+    fetcher: async () => ({
+      active: 3,
+      accounts: [{ i: 0 }, { i: 1, label: 'Work' }, { i: 3 }],
+      eventCreatedAt: 1_700_000_000,
+      decrypted: true,
+    }),
+  });
+  assert.deepEqual(result, { found: true, active: 3, upgraded: true });
+  assert.equal(s.nostrAccountIndex, 3);
+  assert.notEqual(s.nostrNpub, npubOfZero);
+  assert.deepEqual(s.nostrKnownAccounts.map((a) => a.i), [0, 1, 3]);
+  assert.equal(s.nostrKnownAccounts.find((a) => a.i === 1).label, 'Work');
+});
+
+await test('resolveActiveNostrAccount stays on account 0 when no pointer exists', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const result = await s.resolveActiveNostrAccount({ fetcher: async () => null });
+  assert.deepEqual(result, { found: false, active: 0, upgraded: false });
+  assert.equal(s.nostrAccountIndex, 0);
+});
+
+await test('resolveActiveNostrAccount is single-flight while a lookup runs', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  let fetches = 0;
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const fetcher = async () => {
+    fetches += 1;
+    await gate;
+    return null;
+  };
+  const a = s.resolveActiveNostrAccount({ fetcher });
+  const b = s.resolveActiveNostrAccount({ fetcher });
+  release();
+  await Promise.all([a, b]);
+  assert.equal(fetches, 1, 'second caller shares the in-flight lookup');
+});
+
+await test('createAnotherNostrIdentity refuses to overflow past 2^31', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  s.nostrKnownAccounts = [{ i: 0 }, { i: 2 ** 31 - 1 }];
+  await assert.rejects(
+    () => s.createAnotherNostrIdentity({ pointer: pointerStub().opts }),
+    (err) => err.code === 'NOSTR_ACCOUNT_EXHAUSTED',
+  );
+});
+
+await test('importMnemonic still lands on account 0 with a reset roster', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  await s.createAnotherNostrIdentity({ pointer: pointerStub().opts });
+  assert.equal(s.nostrAccountIndex, 1);
+
+  await s.importMnemonic(FIXED_SEED);
+  assert.equal(s.nostrAccountIndex, 0);
+  assert.deepEqual(s.nostrKnownAccounts.map((a) => a.i), [0]);
+  assert.equal(s.pointerDirty, false);
+});
+
+await test('republishNostrPointer merges the fetched roster instead of outbidding it away', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  assert.deepEqual(s.nostrKnownAccounts.map((a) => a.i), [0], 'local roster starts minimal');
+
+  // Another device created accounts 1 and 2; this device never heard
+  // of them. Its publish must carry them forward, not orphan them.
+  let published = null;
+  const result = await s.republishNostrPointer({
+    relays: ['wss://stub.test'],
+    fetcher: async () => ({
+      active: 2,
+      accounts: [{ i: 0 }, { i: 1, label: 'Work' }, { i: 2 }],
+      eventCreatedAt: 1_700_000_000,
+      decrypted: true,
+    }),
+    publisher: ({ event }) => {
+      published = event;
+      return {
+        firstAccept: Promise.resolve({ relay: 'wss://stub.test' }),
+        allSettled: Promise.resolve([]),
+      };
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(s.nostrKnownAccounts.map((a) => a.i), [0, 1, 2], 'store learned the union');
+  assert.equal(s.nostrKnownAccounts.find((a) => a.i === 1).label, 'Work');
+  // The event carries the union too; active stays LOCAL intent (0).
+  const { nip44 } = await import('nostr-core');
+  const { deriveSelfConversationKey } = await import('../../utils/nostrAddressBook.js');
+  const sk0 = await s.getNostrSecretKeyBytes();
+  const payload = JSON.parse(nip44.decrypt(
+    published.content,
+    deriveSelfConversationKey(sk0, s.nostrPubkeyHex),
+  ));
+  assert.equal(payload.active, 0);
+  assert.deepEqual(payload.accounts.map((a) => a.i), [0, 1, 2]);
+  assert.ok(published.created_at >= 1_700_000_001, 'outbids the fetched clock');
+});
+
+await test('rotateNostrIdentity flags the pointer as lagging', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  assert.equal(s.pointerDirty, false);
+  await s.rotateNostrIdentity();
+  assert.equal(s.pointerDirty, true, 'dormant path inherits the retry surface');
+});
+
+await test('resolveActiveNostrAccount finds a pointer that lives only on the NIP-65 relays', async () => {
+  const s = freshEnv();
+  await s.importMnemonic(FIXED_SEED);
+  const sk0 = await s.getNostrSecretKeyBytes();
+  const pubkey0 = s.nostrPubkeyHex;
+
+  const { finalizeEvent } = await import('nostr-core');
+  const { buildPointerEvent } = await import('../../utils/nostrIdentityPointer.js');
+  const { DEFAULT_RELAYS } = await import('../../utils/nostrRelays.js');
+
+  // Account 0's NIP-65 list (on a default relay) names a custom write
+  // relay; the pointer sits ONLY there. Restore must still find it.
+  const relayList = finalizeEvent({
+    kind: 10002,
+    created_at: 1_700_000_000,
+    tags: [['r', 'wss://custom.test']],
+    content: '',
+  }, sk0);
+  const pointer = buildPointerEvent({
+    secretKey0: sk0,
+    pubkey0,
+    active: 1,
+    accounts: [{ i: 0 }, { i: 1 }],
+    createdAt: 1_700_000_100,
+  });
+  const eventsByUrl = {
+    [DEFAULT_RELAYS[0]]: [relayList],
+    'wss://custom.test': [pointer],
+  };
+  const pool = {
+    async querySync(urls, filter) {
+      const kinds = Array.isArray(filter?.kinds) ? filter.kinds : [];
+      const out = [];
+      for (const url of urls) {
+        for (const ev of eventsByUrl[url] || []) {
+          if (kinds.includes(ev.kind)) out.push(ev);
+        }
+      }
+      return out;
+    },
+  };
+
+  const result = await s.resolveActiveNostrAccount({ pool });
+  assert.deepEqual(result, { found: true, active: 1, upgraded: true });
+  assert.equal(s.nostrAccountIndex, 1);
+});
+
+
+// ---------------------------------------------------------------------------
+// Identities from another app
+// ---------------------------------------------------------------------------
+
+const { generateSecretKey: genKey, getPublicKey: pubOf, finalizeEvent: signWith } = await import('nostr-core');
+
+await test('an imported secret key is kept, used, and signs as that key', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const derivedPubkey = s.nostrPubkeyHex;
+  const imported = genKey();
+  const { key, added } = await s.addExternalIdentity({ kind: 'secretKey', pubkeyHex: pubOf(imported), secretKey: imported });
+  assert.equal(added, true);
+  assert.equal(s.nostrPubkeyHex, derivedPubkey, 'adding does not switch');
+  assert.ok(!JSON.stringify(JSON.parse(globalThis.localStorage.getItem('buhoGO_identity_v1'))).includes(Buffer.from(imported).toString('hex')), 'the key never sits in metadata');
+
+  s.switchToExternalIdentity(key);
+  assert.equal(s.nostrPubkeyHex, pubOf(imported));
+  assert.deepEqual(s.identityCapabilities, { kind: 'secretKey', rawKey: true, needsApproval: false });
+  const { signer, release } = await s.acquireSigner();
+  const event = await signer.signEvent({ kind: 1, tags: [], content: 'hi', created_at: 1 });
+  release();
+  assert.equal(event.pubkey, pubOf(imported));
+  assert.equal((await s.listNostrIdentities()).some((row) => row.active), false, 'no derived row is in use');
+  assert.match((await s.revealExternalSecret(key)).nsec, /^nsec1/);
+
+  // Back to the derived identity, then a reload keeps the import.
+  await s.switchNostrIdentity(0, { pointer: pointerStub().opts });
+  assert.equal(s.nostrPubkeyHex, derivedPubkey);
+  assert.equal(s.activeExternalId, null);
+  s.switchToExternalIdentity(key);
+  setActivePinia(createPinia());
+  const reloaded = useIdentityStore();
+  await reloaded.hydrate();
+  assert.equal(reloaded.activeExternalId, key);
+  assert.equal(reloaded.nostrPubkeyHex, pubOf(imported));
+});
+
+await test('a key already on this phone is never added twice', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const own = await s.addExternalIdentity({ kind: 'nip07', pubkeyHex: s.nostrPubkeyHex });
+  assert.deepEqual(own, { key: 0, added: false }, 'the derived identity is named instead');
+  const imported = genKey();
+  const first = await s.addExternalIdentity({ kind: 'secretKey', pubkeyHex: pubOf(imported), secretKey: imported });
+  const again = await s.addExternalIdentity({ kind: 'nip07', pubkeyHex: pubOf(imported) });
+  assert.deepEqual(again, { key: first.key, added: false });
+  assert.equal(s.externalIdentities.length, 1);
+});
+
+await test('usernames stay with the identity they belong to across external switches', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  s.recordOwnedHandle({ handle: 'owl-zero' });
+  const imported = genKey();
+  const { key } = await s.addExternalIdentity({ kind: 'secretKey', pubkeyHex: pubOf(imported), secretKey: imported });
+  s.switchToExternalIdentity(key);
+  assert.equal(s.nip05Handles.length, 0);
+  s.recordOwnedHandle({ handle: 'imported-name' });
+  await s.switchNostrIdentity(0, { pointer: pointerStub().opts });
+  assert.equal(s.nip05Handles[0].handle, 'owl-zero');
+  s.switchToExternalIdentity(key);
+  assert.equal(s.nip05Handles[0].handle, 'imported-name');
+});
+
+await test('a signer app identity never hands out a raw key, and a wrong answer is refused', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const theirs = genKey();
+  const someoneElse = genKey();
+  globalThis.window = { nostr: { getPublicKey: async () => pubOf(theirs), signEvent: async (t) => signWith(t, theirs) } };
+  try {
+    const { key } = await s.addExternalIdentity({ kind: 'nip07', pubkeyHex: pubOf(theirs) });
+    s.switchToExternalIdentity(key);
+    assert.deepEqual(s.identityCapabilities, { kind: 'nip07', rawKey: false, needsApproval: true });
+    await assert.rejects(() => s.getNostrSecretKeyBytes(), (err) => err.code === 'IDENTITY_NO_RAW_KEY');
+    const { signer } = await s.acquireSigner();
+    assert.equal((await signer.signEvent({ kind: 1, tags: [], content: 'x', created_at: 1 })).pubkey, pubOf(theirs));
+
+    globalThis.window.nostr.signEvent = async (t) => signWith(t, someoneElse);
+    const { signer: switched } = await s.acquireSigner();
+    await assert.rejects(() => switched.signEvent({ kind: 1, tags: [], content: 'x', created_at: 1 }), (err) => err.code === 'SIGNER_MISMATCH');
+  } finally {
+    delete globalThis.window;
+  }
+});
+
+await test('deleting an import removes its stored key; never the identity in use', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const imported = genKey();
+  const { key } = await s.addExternalIdentity({ kind: 'secretKey', pubkeyHex: pubOf(imported), secretKey: imported });
+  s.switchToExternalIdentity(key);
+  assert.throws(() => s.deleteExternalIdentity(key), (err) => err.code === 'NOSTR_ACCOUNT_ACTIVE');
+  await s.switchNostrIdentity(0, { pointer: pointerStub().opts });
+  s.deleteExternalIdentity(key);
+  assert.equal(s.externalIdentities.length, 0);
+  assert.equal(globalThis.localStorage.getItem(`buhoGO_identity_external_${key}`), null);
+});
+
+await test('erasing everything removes imports too; a restored phrase leaves them but takes over', async () => {
+  const s = freshEnv();
+  await s.ensureIdentity();
+  const imported = genKey();
+  const { key } = await s.addExternalIdentity({ kind: 'secretKey', pubkeyHex: pubOf(imported), secretKey: imported });
+  s.switchToExternalIdentity(key);
+  await s.importMnemonic(FIXED_SEED);
+  assert.equal(s.activeExternalId, null, 'the restored phrase is in use');
+  assert.equal(s.externalIdentities.length, 1, 'the import stays');
+
+  await s.regenerate();
+  assert.equal(s.externalIdentities.length, 0);
+  assert.equal(globalThis.localStorage.getItem(`buhoGO_identity_external_${key}`), null);
+});
+
+console.log(`\n  ${passed} passed, ${failed} failed`);
+if (failed > 0) process.exit(1);

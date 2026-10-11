@@ -1,0 +1,196 @@
+/**
+ * walletBrands — consumer-wallet recognition by Lightning Address domain.
+ *
+ * Coverage focus:
+ *   - known domains resolve to the expected name + logo
+ *   - the ecash family (Minibits, npub.cash) shares the single Cashu brand
+ *   - case-insensitive, whitespace-tolerant domain matching
+ *   - unknown domains and junk inputs miss (return null) so the caller
+ *     cleanly falls back to the raw/generic identity
+ *   - every registered logo path is an absolute /public URL
+ *
+ * Run directly with Node:
+ *   node src/services/__tests__/walletBrands.spec.js
+ */
+
+import { strict as assert } from 'node:assert'
+import { matchWalletBrand, matchWalletBrandByAddress, WALLET_BRANDS } from '../walletBrands.js'
+
+let passed = 0
+let failed = 0
+
+function test(name, fn) {
+  try {
+    fn()
+    console.log(`  ✓ ${name}`)
+    passed += 1
+  } catch (err) {
+    console.error(`  ✗ ${name}`)
+    console.error(`    ${err.message}`)
+    failed += 1
+  }
+}
+
+test('Wallet of Satoshi: resolves name + logo from walletofsatoshi.com', () => {
+  const b = matchWalletBrand('walletofsatoshi.com')
+  assert.equal(b.name, 'Wallet of Satoshi')
+  assert.equal(b.logo, '/Social_Wallet_logos/walletofsatoshi-icon.svg')
+})
+
+test('Community domains: ereignishorizont.xyz crops, bamo21.de is contained', () => {
+  const eh = matchWalletBrand('ereignishorizont.xyz')
+  assert.equal(eh.name, 'Ereignishorizont')
+  assert.equal(eh.logo, '/Social_Wallet_logos/Axel_ereignishorizont.png')
+  assert.ok(!eh.logoContain)
+
+  const bamo = matchWalletBrand('bamo21.de')
+  assert.equal(bamo.name, 'Axels Gemüsegärten')
+  assert.equal(bamo.logo, '/Social_Wallet_logos/Bamo_Axels_Guemuesegaerten.png')
+  assert.equal(bamo.logoContain, true)
+})
+
+test('Coinsnap: resolves from coinsnap.app and is contained, not cropped', () => {
+  const b = matchWalletBrand('coinsnap.app')
+  assert.equal(b.name, 'Coinsnap')
+  assert.equal(b.logo, '/Social_Wallet_logos/coinsnap.svg')
+  // A bare logomark taller than it is wide: cropping it edge-to-edge in the
+  // circular avatar would slice the top and bottom off the mark.
+  assert.equal(b.logoContain, true)
+  assert.equal(b.logoInset, '10%')
+})
+
+test('Plate-less marks (Wallet of Satoshi, Alby) are contained, not cropped', () => {
+  // Neither ships a background plate: cropped edge-to-edge the WoS frame loses
+  // its corners and Alby's tail gets sliced. Both must stay contained, with a
+  // per-brand inset that fits the whole mark inside the circular avatar.
+  for (const d of ['walletofsatoshi.com', 'getalby.com']) {
+    const b = matchWalletBrand(d)
+    assert.equal(b.logoContain, true, `${d} -> contained`)
+    assert.match(b.logoInset, /^\d{1,2}%$/, `${d} -> percentage inset`)
+  }
+  // App-icon art keeps the full-bleed crop — a stray inset would shrink it.
+  for (const d of ['phoenixwallet.me', 'primal.net', 'strike.me', 'damus.io']) {
+    assert.equal(matchWalletBrand(d).logoContain, undefined, `${d} -> full-bleed`)
+    assert.equal(matchWalletBrand(d).logoInset, undefined, `${d} -> no inset`)
+  }
+})
+
+test('Phoenix: resolves from phoenixwallet.me', () => {
+  assert.equal(matchWalletBrand('phoenixwallet.me').name, 'Phoenix')
+})
+
+test('Blink / Alby / Primal / ZBD / Fountain / Wavlake / Wavespace / YakiHonne / zap.stream / Damus', () => {
+  assert.equal(matchWalletBrand('blink.sv').name, 'Blink')
+  assert.equal(matchWalletBrand('getalby.com').name, 'Alby')
+  assert.equal(matchWalletBrand('primal.net').name, 'Primal')
+  assert.equal(matchWalletBrand('zbd.gg').name, 'ZBD')
+  assert.equal(matchWalletBrand('fountain.fm').name, 'Fountain')
+  assert.equal(matchWalletBrand('wavlake.com').name, 'Wavlake')
+  assert.equal(matchWalletBrand('wave.space').name, 'Wavespace')
+  assert.equal(matchWalletBrand('yakihonne.com').name, 'YakiHonne')
+  assert.equal(matchWalletBrand('zap.stream').name, 'zap.stream')
+  assert.equal(matchWalletBrand('damus.io').name, 'Damus')
+  // ZBD's white wordmark needs a dark backdrop + contain to render in the avatar.
+  assert.equal(matchWalletBrand('zbd.gg').logoContain, true)
+  assert.match(matchWalletBrand('zbd.gg').logoBg, /^#[0-9a-fA-F]{6}$/)
+  assert.equal(matchWalletBrand('blitzwalletapp.com').name, 'Blitz Wallet')
+  assert.equal(matchWalletBrand('strike.me').name, 'Strike')
+  assert.equal(matchWalletBrand('strik.me').name, 'Strike')
+})
+
+test('LNbits flagship (lnbits.com) uses the bolt icon', () => {
+  const com = matchWalletBrand('lnbits.com')
+  assert.equal(com.name, 'LNbits')
+  assert.equal(com.logo, '/LNBits/lnbits-icon.svg')
+})
+
+test('German LNbits instances carry the Business Bitcoin brand', () => {
+  for (const d of ['lnbits.de', 'timecatcher.lnbits.de']) {
+    const b = matchWalletBrand(d)
+    assert.equal(b.name, 'Business Bitcoin', `${d} -> Business Bitcoin`)
+    assert.equal(b.logo, '/Social_Wallet_logos/BusinessBitcoin.png', `${d} logo`)
+  }
+})
+
+test('Buho brand domains resolve to the Buho logo', () => {
+  for (const d of ['mybuho.de', 'pay.mybuho.de', 'btc.mybuho.de']) {
+    const b = matchWalletBrand(d)
+    assert.equal(b.name, 'Buho', `${d} -> Buho`)
+    assert.equal(b.logo, '/buho_logo_grey.svg', `${d} logo`)
+  }
+})
+
+test('Ecash family (npub.cash / minibits.cash / sats.contact / nutstash.app) shares the one Cashu brand + logo', () => {
+  const domains = ['npub.cash', 'minibits.cash', 'sats.contact', 'nutstash.app']
+  assert.equal(domains.length, 4)
+  for (const d of domains) {
+    const b = matchWalletBrand(d)
+    assert.equal(b.name, 'Cashu', `${d} -> Cashu`)
+    assert.equal(b.logo, '/cashu/cashuu.png', `${d} -> Cashu logo`)
+  }
+})
+
+test('matching is case-insensitive and trims whitespace', () => {
+  assert.equal(matchWalletBrand('WalletOfSatoshi.com').name, 'Wallet of Satoshi')
+  assert.equal(matchWalletBrand('  blink.sv  ').name, 'Blink')
+})
+
+test('unknown domains and junk inputs miss (null)', () => {
+  assert.equal(matchWalletBrand('example.com'), null)
+  assert.equal(matchWalletBrand('demo.lnbits.com'), null) // self-hosted instance, intentionally unmapped
+  assert.equal(matchWalletBrand(''), null)
+  assert.equal(matchWalletBrand(null), null)
+  assert.equal(matchWalletBrand(undefined), null)
+  assert.equal(matchWalletBrand(42), null)
+})
+
+test('every registered logo is an absolute /public URL', () => {
+  for (const [domain, entry] of Object.entries(WALLET_BRANDS)) {
+    assert.ok(entry.name, `${domain} has a name`)
+    assert.match(entry.logo, /^\/[\w./-]+\.(svg|png)$/, `${domain} logo is an absolute asset path`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Address-level lookup — what the tx list, tx details and address book use
+// ---------------------------------------------------------------------------
+
+test('matchWalletBrandByAddress resolves a whole Lightning Address', () => {
+  assert.equal(matchWalletBrandByAddress('satoshi@coinsnap.app').name, 'Coinsnap')
+  assert.equal(matchWalletBrandByAddress('feudaltribe162@walletofsatoshi.com').name, 'Wallet of Satoshi')
+  // Splits on the LAST "@", as a Lightning Address does.
+  assert.equal(matchWalletBrandByAddress('a@b@strike.me').name, 'Strike')
+  assert.equal(matchWalletBrandByAddress('  Satoshi@CoinSnap.App  ').name, 'Coinsnap')
+})
+
+test('matchWalletBrandByAddress misses cleanly on anything that is not an address', () => {
+  // A miss must be null, never a half-built row: the avatar then renders the
+  // silhouette instead of an <img> pointing at nothing.
+  for (const input of [
+    'someone@example.com',   // unknown host
+    'coinsnap.app',          // a bare domain is not an address
+    '@coinsnap.app',         // no handle
+    'satoshi@',              // no domain
+    '', null, undefined, 42, {},
+  ]) {
+    assert.equal(matchWalletBrandByAddress(input), null, JSON.stringify(input))
+  }
+})
+
+test('fit hints only ever qualify contained art', () => {
+  // These logos now render on four surfaces at once (send sheet, tx list, tx
+  // details, address book), so a stray inset or backdrop would be wrong in
+  // four places rather than one.
+  for (const [domain, brand] of Object.entries(WALLET_BRANDS)) {
+    if (brand.logoInset) {
+      assert.equal(brand.logoContain, true, `${domain}: an inset only applies to contained art`)
+      assert.match(brand.logoInset, /^\d+(\.\d+)?%$/, `${domain}: inset should be a percentage`)
+    }
+    if (brand.logoBg) {
+      assert.equal(brand.logoContain, true, `${domain}: a backdrop only applies to contained art`)
+    }
+  }
+})
+
+console.log(`\n  ${passed} passed, ${failed} failed`)
+if (failed > 0) process.exit(1)

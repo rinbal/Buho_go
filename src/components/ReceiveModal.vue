@@ -1,23 +1,34 @@
 <template>
   <q-dialog
     v-model="show"
-    maximized
+    position="bottom"
     transition-show="slide-up"
     transition-hide="slide-down"
     class="receive-modal"
-    @before-hide="stopPaymentMonitor"
+    :aria-label="showVouchers ? $t('Vouchers') : $t('Receive')"
+    @before-hide="stopPaymentMonitor();"
+    @hide="onHidden"
   >
-    <q-card class="receive-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
+    <VoucherSheet
+      v-if="showVouchers"
+      :vouchers="vouchers"
+      :checking="voucherChecking"
+      :display-sats="voucherDisplaySats"
+      @back="backFromVouchers"
+      @redeem="selectVoucher"
+      @remove="$emit('remove-voucher', $event)"
+    />
+    <q-card v-else class="receive-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
+      <div class="sheet-grabber" aria-hidden="true"><div class="grabber-bar"></div></div>
       <!-- Header -->
-      <q-card-section class="receive-header" :class="$q.dark.isActive ? 'header-dark' : 'header-light'">
+      <q-card-section class="receive-header">
         <div class="header-content">
           <q-btn
             flat
             round
             dense
-            @click="closeModal"
-            class="back-btn"
-            :class="$q.dark.isActive ? 'back_btn_dark' : 'back_btn_light'"
+            @click="handleHeaderBack"
+            class="back-btn glass-back-btn"
           >
             <svg v-if="$q.dark.isActive" xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 20 20"
                  fill="none">
@@ -32,114 +43,181 @@
             </svg>
           </q-btn>
           <div class="header-title" :class="$q.dark.isActive ? 'main_page_title_dark' : 'main_page_title_light'">
-            {{ $t('Receive') }}
+            {{ headerTitle }}
           </div>
-          <div class="header-actions">
-            <q-btn
-              v-if="hasLightningAddress"
-              flat
-              round
-              dense
-              @click="showLightningAddress"
-              class="address-btn"
-              :class="$q.dark.isActive ? 'back-btn-dark' : 'back-btn-light'"
-            >
-              <Icon icon="tabler:at" width="20" height="20" />
-            </q-btn>
-          </div>
+          <div class="header-actions"></div>
         </div>
       </q-card-section>
 
+      <!-- LUD-14: one line, only while a saved voucher still holds money.
+           A voucher is money the user can pull in, so it belongs on the
+           receive sheet, but it is not a receive view: this single row with a
+           disclosure opens the Vouchers sheet, where the list and its
+           management live. Outside the content section so every receive view
+           shows it. One native button, nothing nested. -->
+      <button
+        v-if="vouchers.length"
+        type="button"
+        class="voucher-summary"
+        ref="voucherSummary"
+        :aria-label="voucherSummaryTitle + ', ' + voucherSummaryLeft"
+        @click="openVouchers"
+      >
+        <span class="voucher-summary-icon" aria-hidden="true">
+          <Icon icon="tabler:ticket" width="18" height="18" />
+        </span>
+        <span class="voucher-summary-copy" aria-hidden="true">
+          <strong class="voucher-summary-title">{{ voucherSummaryTitle }}</strong>
+          <small class="voucher-summary-sub">{{ voucherSummaryLeft }}</small>
+        </span>
+        <Icon icon="tabler:chevron-right" width="18" height="18" class="voucher-summary-chevron" aria-hidden="true" />
+      </button>
+
       <!-- Content -->
       <q-card-section class="receive-content">
-        <!-- Receive Mode Toggle (for Spark wallets) -->
-        <div v-if="isSparkWallet && !generatedInvoice && !showAddressView" class="receive-type-toggle">
-          <q-btn-toggle
-            v-model="receiveMode"
-            toggle-color="primary"
-            :options="receiveModeOptions"
-            class="type-toggle"
-            :class="$q.dark.isActive ? 'toggle-dark' : 'toggle-light'"
-            no-caps
-            unelevated
-            spread
-          />
-          <div class="mode-hint" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-            <template v-if="receiveMode === 'spark'">
-              {{ $t('Spark-to-Spark only, zero fees') }}
-            </template>
-            <template v-else-if="receiveMode === 'bitcoin'">
-              {{ $t('From any Bitcoin wallet (takes ~10-60 min)') }}
-            </template>
-            <template v-else>
-              {{ $t('One-time request with amount') }}
-            </template>
-          </div>
-        </div>
+        <!-- Arkade unified Bitcoin view: ONE code carrying the on-chain
+             boarding address as its base, the ark1 address as ark= and,
+             once an amount is set, the Lightning invoice as lightning=.
+             A wallet that knows none of the extras still reads a plain
+             bitcoin: URI (BIP21 requires ignoring unknown params). -->
+        <div v-if="showArkadeUnifiedView" class="spark-address-view">
+          <!-- Hero: badge, code and rails centered in the space the header
+               and the bottom action row leave. -->
+          <div class="unified-hero">
+            <template v-if="arkadeBoardingAddress">
+              <!-- The request the QR currently carries; tapping edits it. -->
+              <button
+                v-if="generatedInvoice && generatedInvoice.amount > 0"
+                type="button"
+                class="invoice-badge"
+                :class="$q.dark.isActive ? 'invoice-badge-dark' : 'invoice-badge-light'"
+                @click="tapAmountButton"
+              >
+                <span class="invoice-badge-amount">{{ formatInvoiceAmount(generatedInvoice.amount) }}</span>
+                <span v-if="formatInvoiceFiat(generatedInvoice.amount)" class="invoice-badge-fiat">{{ formatInvoiceFiat(generatedInvoice.amount) }}</span>
+                <span v-if="description" class="invoice-badge-note">{{ description }}</span>
+                <Icon icon="tabler:edit" width="14" height="14" />
+              </button>
 
-        <!-- Spark Address View -->
-        <div v-if="showSparkAddressView && sparkAddress" class="spark-address-view">
-          <!-- QR Code Section -->
-          <div class="qr-section">
-            <div class="qr-card" @click="copySparkAddress">
-              <div class="qr-frame">
-                <vue-qrcode
-                  :value="sparkAddress"
-                  :options="sparkQrOptions"
-                  class="qr-code"
-                />
+            </template>
+
+            <div v-if="arkadeBoardingAddress" class="qr-section">
+              <div class="qr-card" @click="copyArkadeBoardingAddress">
+                <div class="qr-frame">
+                  <vue-qrcode
+                    ref="arkadeBoardingQr"
+                    :value="arkadeUnifiedQrValue"
+                    :options="sparkQrOptions"
+                    class="qr-code"
+                  />
+                  <!-- One mark on every code: this is a BuhoGO code,
+                       whatever rail ends up paying it. -->
+                  <span class="qr-logo" aria-hidden="true">
+                    <img src="/buho_logo.svg" alt="" />
+                  </span>
+                </div>
               </div>
             </div>
-            <div class="qr-hint" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-              {{ $t('Tap QR to copy address') }}
+
+            <div v-else class="default-zero-loading">
+              <q-spinner-dots size="40px" :color="$q.dark.isActive ? 'white' : 'grey-7'" />
+              <div class="default-zero-loading-text" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
+                {{ $t('Preparing address...') }}
+              </div>
+            </div>
+
+            <!-- The rails this one code carries, stacked like profile
+                 avatars. The address strings live behind Copy on purpose -
+                 showing one under the QR made the code read as on-chain
+                 only. -->
+            <div v-if="arkadeBoardingAddress" class="rail-stack" aria-hidden="true">
+              <span class="rail-badge rail-badge-btc" :class="$q.dark.isActive ? 'rail-ring-dark' : 'rail-ring-light'">
+                <Icon icon="tabler:currency-bitcoin" width="18" height="18" />
+              </span>
+              <span class="rail-badge" :class="$q.dark.isActive ? 'rail-badge-dark rail-ring-dark' : 'rail-badge-light rail-ring-light'">
+                <ArkadeLogo :size="18" :color="$q.dark.isActive ? 'orange' : 'purple'" alt="" />
+              </span>
+              <span class="rail-badge" :class="$q.dark.isActive ? 'rail-badge-dark rail-ring-dark' : 'rail-badge-light rail-ring-light'">
+                <img :src="$q.dark.isActive ? '/Spark/Spark Asterisk White.svg' : '/Spark/Spark Asterisk Black.svg'" alt="" />
+              </span>
             </div>
           </div>
 
-          <!-- Address Display - Compact Pill -->
-          <div
-            class="address-pill"
-            :class="$q.dark.isActive ? 'pill-dark' : 'pill-light'"
-            @click="copySparkAddress"
-          >
-            <img :src="sparkPillIcon" class="pill-icon-img" />
-            <span class="pill-address">{{ truncateSparkAddress(sparkAddress) }}</span>
-            <Icon icon="tabler:copy" width="14" height="14" class="pill-copy" />
-          </div>
-
-          <!-- Action Buttons -->
-          <div class="action-buttons">
-            <button
-              class="chip-outline"
-              @click="copySparkAddress"
-            >
-              <Icon icon="tabler:copy" width="14" height="14" />
-              <span>{{ $t('Copy Request') }}</span>
-            </button>
-            <button
-              class="share-btn-gradient"
-              @click="shareSparkAddress"
-            >
-              <Icon icon="tabler:share" width="14" height="14" />
-              <span>{{ $t('Share Invoice') }}</span>
-            </button>
-          </div>
-
-          <!-- User Hint -->
           <div class="address-hint" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-            {{ $t('Share this address to receive zero-fee payments from other Spark wallets.') }}
+            {{ $t('Arkade pays instantly - on-chain needs a confirmation') }}
+          </div>
+
+          <!-- One row of equal, labeled actions in the thumb zone. Copy asks
+               which identity instead of guessing; Share hands out the full
+               unified string - exactly what the QR encodes. -->
+          <div v-if="arkadeBoardingAddress" class="cta-row">
+            <button class="cta" @click="tapAmountButton">
+              <span class="cta-circle cta-circle-accent" :class="$q.dark.isActive ? 'cta-accent-dark' : 'cta-accent-light'">
+                <Icon icon="tabler:edit" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Amount') }}</span>
+            </button>
+            <button class="cta">
+              <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+                <Icon icon="tabler:copy" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Copy') }}</span>
+              <q-menu anchor="top middle" self="bottom middle" :offset="[0, 6]">
+                <q-list class="copy-menu">
+                  <q-item v-if="generatedInvoice && generatedInvoice.amount > 0 && generatedInvoice.payment_request" v-close-popup clickable @click="copyInvoice">
+                    <div class="copy-item">
+                      <span>{{ $t('Lightning invoice') }}</span>
+                      <small>{{ truncateArkadeAddress(generatedInvoice.payment_request) }}</small>
+                    </div>
+                  </q-item>
+                  <q-item v-close-popup clickable @click="copyArkadeBoardingAddress">
+                    <div class="copy-item">
+                      <span>{{ $t('Bitcoin address') }}</span>
+                      <small>{{ truncateArkadeAddress(arkadeBoardingAddress) }}</small>
+                    </div>
+                  </q-item>
+                  <q-item v-if="arkadeAddress" v-close-popup clickable @click="copyArkadeAddress">
+                    <div class="copy-item">
+                      <span>{{ $t('Arkade address') }}</span>
+                      <small>{{ truncateArkadeAddress(arkadeAddress) }}</small>
+                    </div>
+                  </q-item>
+                </q-list>
+              </q-menu>
+            </button>
+            <button class="cta" @click="shareArkadeBoardingAddress">
+              <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+                <Icon icon="tabler:share" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Share') }}</span>
+            </button>
+            <button class="cta" @click="$emit('scan-withdraw')">
+              <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+                <Icon icon="tabler:scan" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Redeem') }}</span>
+            </button>
           </div>
         </div>
 
-        <!-- Bitcoin (L1) Receive View -->
+        <!-- Unified Bitcoin receive view (Spark): the component owns the
+             QR + deposit tracking; the modal owns the invoice the QR's
+             lightning= rail carries, and the amount badge above it. -->
         <L1BitcoinReceive
-          v-if="showBitcoinReceiveView"
+          v-if="showUnifiedBitcoinView"
           :qr-options="qrOptions"
+          :lightning-invoice="generatedInvoice ? generatedInvoice.payment_request : ''"
+          :amount-sats="generatedInvoice ? generatedInvoice.amount : 0"
+          :amount-fiat="generatedInvoice ? formatInvoiceFiat(generatedInvoice.amount) : ''"
+          :note="description"
           @deposit-claimed="handleBitcoinDepositClaimed"
           @deposits-updated="handleBitcoinDepositsUpdated"
+          @request-amount="tapAmountButton"
+          @scan-withdraw="$emit('scan-withdraw')"
         />
 
-        <!-- Lightning Invoice Display -->
-        <div class="lightning-receive" v-if="generatedInvoice">
+        <!-- Specific-amount Lightning Invoice Display -->
+        <div class="lightning-receive" v-if="showSpecificInvoiceView">
           <!-- Amount Section -->
           <div class="ln-amount-section">
             <span class="ln-amount" :class="$q.dark.isActive ? 'text-white' : 'text-grey-9'">
@@ -159,6 +237,7 @@
             <div class="qr-card" @click="copyInvoice">
               <div class="qr-frame">
                 <vue-qrcode
+                  ref="invoiceQr"
                   :value="'lightning:' + generatedInvoice.payment_request.toUpperCase()"
                   :options="invoiceQrOptions"
                   class="qr-code"
@@ -175,29 +254,32 @@
           <!-- Action Buttons -->
           <div class="action-buttons">
             <button
-              class="chip-outline"
+              class="action-btn"
+              :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
               @click="copyInvoice"
             >
-              <Icon icon="tabler:copy" width="14" height="14" />
+              <Icon icon="tabler:copy" width="18" height="18" />
               <span>{{ $t('Copy Request') }}</span>
             </button>
             <button
-              class="share-btn-gradient"
+              class="action-btn"
+              :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
               @click="shareInvoice"
             >
-              <Icon icon="tabler:share" width="14" height="14" />
+              <Icon icon="tabler:share" width="18" height="18" />
               <span>{{ $t('Share Invoice') }}</span>
             </button>
           </div>
         </div>
 
-        <!-- Lightning Address View -->
-        <div v-else-if="showAddressView && hasLightningAddress" class="address-view">
+        <!-- Lightning Address View (default for NWC/LNbits with LN address) -->
+        <div v-else-if="showLightningAddressView" class="address-view">
           <!-- Centered QR Section -->
           <div class="address-qr-section">
             <div class="qr-container" @click="copyLightningAddress">
               <div class="qr-wrapper">
                 <vue-qrcode
+                  ref="lightningAddressQr"
                   :value="'lightning:' + lightningAddress"
                   :options="qrOptions"
                   class="qr-code"
@@ -211,89 +293,127 @@
               :class="$q.dark.isActive ? 'address-box-dark' : 'address-box-light'"
               @click="copyLightningAddress"
             >
-              <Icon icon="tabler:at" width="18" height="18" class="address-icon" />
               <span class="address-text-value">{{ lightningAddress }}</span>
               <Icon icon="tabler:copy" width="14" height="14" class="copy-icon" />
             </div>
+          </div>
 
-            <!-- User Hint -->
-            <div class="address-hint" :class="$q.dark.isActive ? 'text-grey-6' : 'text-grey-5'">
-              {{ $t('Your permanent payment address. Share this QR or address to receive payments anytime.') }}
-            </div>
+          <div class="cta-row">
+            <button class="cta" @click="tapAmountButton">
+              <span class="cta-circle cta-circle-accent" :class="$q.dark.isActive ? 'cta-accent-dark' : 'cta-accent-light'">
+                <Icon icon="tabler:edit" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Amount') }}</span>
+            </button>
+            <button class="cta" @click="copyLightningAddress">
+              <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+                <Icon icon="tabler:copy" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Copy') }}</span>
+            </button>
+            <button class="cta" @click="shareLightningAddress">
+              <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+                <Icon icon="tabler:share" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Share') }}</span>
+            </button>
+            <button class="cta" @click="$emit('scan-withdraw')">
+              <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+                <Icon icon="tabler:scan" width="20" height="20" />
+              </span>
+              <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Redeem') }}</span>
+            </button>
           </div>
         </div>
 
-        <!-- Amount Section (only for invoice creation, not for static address views) -->
-        <div class="amount-section" v-else-if="!showSparkAddressView && !showBitcoinReceiveView">
-          <!-- Currency Toggle -->
-          <div class="currency-toggle" @click="toggleCurrency"
-               :class="$q.dark.isActive ? 'currency-toggle-dark' : 'currency-toggle-light'">
-            <span class="currency-label">{{ currentCurrency }}</span>
-            <Icon icon="tabler:refresh" class="toggle-icon"/>
-          </div>
-
-          <!-- Amount Input -->
-          <div class="amount-input-container">
-            <div class="amount-display">
-              <!--              <span class="currency-symbol"-->
-              <!--                    :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-6'">{{ getCurrencySymbol() }}</span>-->
-              <input
-                v-model="displayAmount"
-                @input="onAmountChange"
-                @focus="onAmountFocus"
-                @blur="onAmountBlur"
-                type="text"
-                inputmode="decimal"
-                class="amount-input"
-                :class="$q.dark.isActive ? 'amount-input-dark' : 'amount-input-light'"
-                :placeholder="getAmountPlaceholder()"
-              />
+        <!-- Keypad View: amount display + description link + numeric grid -->
+        <div class="keypad-view" v-else-if="showAmountKeypadView">
+          <!-- Amount display: primary on top, secondary (with swap) below -->
+          <div class="keypad-amount">
+            <div
+              class="keypad-amount-primary"
+              :class="[
+                $q.dark.isActive ? 'text-white' : 'text-grey-9',
+                amountInSats === 0 ? 'keypad-amount-empty' : ''
+              ]"
+              :style="{ fontSize: primaryFontSize }"
+            >
+              {{ primaryDisplay }}<span v-if="!isFiatMode" class="keypad-amount-suffix">sats</span>
+            </div>
+            <div
+              class="keypad-amount-secondary"
+              :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'"
+              @click="swapKeypadMode"
+            >
+              <span>{{ secondaryDisplay }}</span>
+              <Icon v-if="fiatRate" icon="tabler:arrows-up-down" width="16" height="16" class="keypad-swap-icon" />
             </div>
           </div>
-        </div>
 
-        <!-- Description Section (only for invoice creation) -->
-        <div class="description-section" v-if="!generatedInvoice && !showAddressView && !showSparkAddressView && !showBitcoinReceiveView">
-          <div class="description-label" :class="$q.dark.isActive ? 'view_title_dark' : 'view_title'">
-            {{ $t('Description (optional)') }}
-          </div>
-          <div class="description-input-container">
-            <input
-              v-model="description"
-              type="text"
-              :placeholder="$t('No description')"
-              class="description-input"
-              :class="$q.dark.isActive ? 'search_bg' : 'search_light'"
-              maxlength="100"
-            />
+          <!-- Description: link if empty, chip if set. Both open the sheet. -->
+          <button
+            v-if="!description"
+            type="button"
+            class="keypad-desc-link"
+            :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'"
+            @click="openDescriptionSheet"
+          >
+            <Icon icon="tabler:notes" width="18" height="18" />
+            <span>{{ $t('Add Description') }}</span>
+          </button>
+          <button
+            v-else
+            type="button"
+            class="keypad-desc-chip"
+            :class="$q.dark.isActive ? 'desc-chip-dark' : 'desc-chip-light'"
+            @click="openDescriptionSheet"
+          >
+            <Icon icon="tabler:notes" width="14" height="14" />
+            <span class="keypad-desc-chip-text">{{ description }}</span>
+            <Icon icon="tabler:edit" width="14" height="14" />
+          </button>
+
+          <!-- Numeric keypad grid -->
+          <div class="keypad-grid">
+            <button
+              v-for="key in keypadKeys"
+              :key="key"
+              type="button"
+              class="keypad-key"
+              :class="$q.dark.isActive ? 'keypad-key-dark' : 'keypad-key-light'"
+              @click="keypadTap(key)"
+            >
+              <Icon v-if="key === 'del'" icon="tabler:backspace" width="22" height="22" />
+              <template v-else>{{ key }}</template>
+            </button>
           </div>
         </div>
       </q-card-section>
 
-      <!-- Footer (only for invoice creation) -->
-      <q-card-section class="receive-footer" v-if="!generatedInvoice && !showAddressView && !showSparkAddressView && !showBitcoinReceiveView">
+      <!-- Footer (only on the keypad) -->
+      <q-card-section class="receive-footer" v-if="showAmountKeypadView">
         <div class="receive-footer-buttons">
           <q-btn
+            v-if="!showAmountInput"
             flat
-            round
-            dense
-            class="scan-withdraw-btn"
-            :class="$q.dark.isActive ? 'scan-btn-dark' : 'scan-btn-light'"
+            no-caps
+            class="footer-redeem-btn"
+            :class="$q.dark.isActive ? 'footer-redeem-dark' : 'footer-redeem-light'"
             @click="$emit('scan-withdraw')"
           >
-            <Icon icon="tabler:qrcode" width="20" height="20" />
-            <q-tooltip>{{ $t('Scan to redeem') }}</q-tooltip>
+            <Icon icon="tabler:scan" width="18" height="18" class="q-mr-xs" />
+            {{ $t('Redeem') }}
           </q-btn>
           <q-btn
             class="create-invoice-btn"
-            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
+            :class="$q.dark.isActive ? 'create-invoice-btn-dark' : 'create-invoice-btn-light'"
             :loading="isCreatingInvoice"
             @click="createInvoice"
-            :disable="!isValidAmount"
+            :disable="!isValidAmount || !hasActiveWallet"
             no-caps
             unelevated
           >
-            <span v-if="!isCreatingInvoice">{{ $t('Create Invoice') }}</span>
+            <span v-if="!isCreatingInvoice">{{ isArkadeWallet ? $t('Set Amount') : $t('Create Invoice') }}</span>
             <template v-slot:loading>
               <q-spinner-dots class="q-mr-sm"/>
               {{ $t('Creating...') }}
@@ -302,6 +422,40 @@
         </div>
       </q-card-section>
     </q-card>
+
+    <!-- Description bottom sheet (opens on top of the receive modal). -->
+    <q-dialog v-model="showDescriptionSheet" position="bottom">
+      <q-card class="desc-sheet" :class="$q.dark.isActive ? 'desc-sheet-dark' : 'desc-sheet-light'">
+        <q-card-section class="desc-sheet-section">
+          <div class="desc-sheet-header">
+            <span class="desc-sheet-title" :class="$q.dark.isActive ? 'text-white' : 'text-grey-9'">
+              {{ $t('Add Description') }}
+            </span>
+            <q-btn flat round dense @click="closeDescriptionSheet" class="desc-sheet-close">
+              <Icon icon="tabler:x" width="20" height="20" />
+            </q-btn>
+          </div>
+          <input
+            v-model="description"
+            type="text"
+            :placeholder="$t('What is this payment for?')"
+            class="desc-sheet-input"
+            :class="$q.dark.isActive ? 'search_bg' : 'search_light'"
+            maxlength="100"
+            @keyup.enter="closeDescriptionSheet"
+          />
+          <q-btn
+            class="desc-sheet-save"
+            :class="$q.dark.isActive ? 'create-invoice-btn-dark' : 'create-invoice-btn-light'"
+            @click="closeDescriptionSheet"
+            no-caps
+            unelevated
+          >
+            {{ $t('Save') }}
+          </q-btn>
+        </q-card-section>
+      </q-card>
+    </q-dialog>
   </q-dialog>
 
   <!-- Payment Confirmation Screen -->
@@ -310,58 +464,109 @@
     :amount="confirmedAmount"
     :fiat-amount="confirmedFiatAmount"
     :description="generatedInvoice?.description"
-    :auto-close-delay="5"
     @closed="handleConfirmationClosed"
   />
 </template>
 
 <script>
 import VueQrcode from '@chenfengyuan/vue-qrcode';
+import ArkadeLogo from './ArkadeLogo.vue';
 import { NostrWebLNProvider } from "@getalby/sdk";
 import { Invoice } from "@getalby/lightning-tools";
 import { formatAmount } from '../utils/amountFormatting.js';
+import { fiatSymbol as fiatSymbolFor } from '../utils/fiatCurrencies.js';
+import { fiatRatesService } from '../utils/fiatRates.js';
+import { paymentHashOf } from '../utils/breezPayments.js';
+
+/** Does this settled SDK payment pay the invoice with this payment hash? */
+export function invoiceMatchesPayment(expectedHash, payment) {
+  if (!expectedHash || !payment) return false;
+  const got = String(paymentHashOf(payment) || '').toLowerCase();
+  return !!got && got === expectedHash;
+}
+
+function receivedSats(payment) {
+  const n = Number(payment?.amount ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
 import { useWalletStore } from '../stores/wallet';
 import { createPaymentMonitor, PaymentStatus, checkNWCPaymentStatus } from '../utils/paymentMonitor';
 import { shareContent } from '../utils/share';
+import { qrBlobFromRef } from '../utils/qrShare';
 import { truncateAddress } from '../utils/addressUtils';
 import { getQrOptions } from '../utils/qrConfig';
+import { composeUnifiedBip21 } from '../utils/bip21';
 import PaymentConfirmation from './PaymentConfirmation.vue';
 import L1BitcoinReceive from './L1BitcoinReceive.vue';
+import VoucherSheet from './VoucherSheet.vue';
 
 export default {
   name: 'ReceiveModal',
   components: {
     VueQrcode,
+    ArkadeLogo,
     PaymentConfirmation,
-    L1BitcoinReceive
+    L1BitcoinReceive,
+    VoucherSheet
   },
   setup() {
     const walletStore = useWalletStore();
     return { walletStore };
   },
   props: {
+    voucherChecking: { type: Object, default: () => ({}) },
+    voucherDisplaySats: { type: Function, default: voucher => voucher?.maxSats || 0 },
     modelValue: {
       type: Boolean,
       default: false
+    },
+    // LUD-14 vouchers with a balance left (withdrawVouchers store `active`).
+    // Owned by the wallet page; this sheet shows one summary line and
+    // owns the Vouchers subview in the same dialog.
+    vouchers: {
+      type: Array,
+      default: () => []
+    },
+    // Sum of what those vouchers still hold (store `activeTotalSats`).
+    totalVoucherSats: {
+      type: Number,
+      default: 0
     }
   },
-  emits: ['update:modelValue', 'invoice-created', 'bitcoin-deposits-updated', 'scan-withdraw'],
+  emits: [
+    'update:modelValue', 'invoice-created', 'bitcoin-deposits-updated', 'scan-withdraw',
+    'open-vouchers', 'redeem-voucher', 'remove-voucher',
+  ],
   data() {
     return {
-      displayAmount: '',
+      showVouchers: false,
+      selectedVoucher: null,
+      // In-app keypad state. `keypadValue` is the raw string the user has
+      // typed in the *current* mode (digits + optional `.` in fiat mode;
+      // digits only in sats mode). The actual sats amount is computed.
+      keypadValue: '',
+      isFiatMode: false,
+      showDescriptionSheet: false,
       description: '',
-      currentCurrency: 'sats',
       isCreatingInvoice: false,
       generatedInvoice: null,
       walletState: {},
-      amountInSats: 0,
-      isAmountFocused: false,
-      showAddressView: false,
-      receiveMode: 'lightning', // 'lightning', 'spark', or 'bitcoin'
+      // True after the user taps the "Amount" button to override the default
+      // QR view (LN address or zero-amount BOLT11) and enter the keypad.
+      // Stays false for wallets that have no default view — those land on
+      // the keypad directly because nothing else makes sense.
+      showAmountInput: false,
+      // Guard so we don't fire two parallel mints if the modal-open and
+      // tab-change paths both trigger.
+      isMintingDefaultZero: false,
+      arkadeBoardingAddress: '', // on-chain boarding address (Arkade unified view)
       // Payment monitoring
       paymentMonitor: null,
       sparkEventUnsubscribe: null, // For Spark event-based monitoring
+      sparkMonitorGeneration: 0, // bumped on stop: late async work of an old monitor is dropped
       nwcNotificationUnsubscribe: null, // For NWC notification-based monitoring
+      sparkPollState: null, // { cancelled: boolean } cancellation token for Spark invoice polling
+      sparkVisibilityHandler: null, // visibilitychange listener for mobile resume catch-up
       paymentStatus: PaymentStatus.PENDING,
       paymentStatusMessage: '',
       isPaymentConfirmed: false,
@@ -374,6 +579,15 @@ export default {
     }
   },
   computed: {
+    /** One voucher shows its own title; several show a count. */
+    voucherSummaryTitle() {
+      if (this.vouchers.length === 1) return this.vouchers[0].title || this.vouchers[0].domain || '';
+      return this.$t('{count} vouchers', { count: this.vouchers.length });
+    },
+    voucherSummaryLeft() {
+      return this.$t('{amount} left', { amount: this.formatInvoiceAmount(this.totalVoucherSats) });
+    },
+
     show: {
       get() {
         return this.modelValue;
@@ -385,6 +599,96 @@ export default {
     isValidAmount() {
       return this.amountInSats > 0;
     },
+    /**
+     * True when the Pinia wallet store has an active wallet that exists.
+     * Used to short-circuit createInvoice and disable the button when the
+     * store is empty (fresh install, HMR state wipe, etc.) instead of
+     * letting `activeWalletType` crash inside `inferWalletType(undefined)`.
+     */
+    hasActiveWallet() {
+      const id = this.walletStore.activeWalletId;
+      const wallets = this.walletStore.wallets || [];
+      return !!id && wallets.some((w) => w.id === id);
+    },
+    /**
+     * Source of truth for invoice amount. Derived from the keypad input
+     * + current mode. Fiat mode converts via the live exchange rate; sats
+     * mode parses the integer directly.
+     */
+    amountInSats() {
+      if (this.isFiatMode) {
+        const fiat = parseFloat(this.keypadValue) || 0;
+        return this.fiatToSats(fiat);
+      }
+      return parseInt(this.keypadValue, 10) || 0;
+    },
+    /**
+     * Active fiat currency for the keypad's secondary display + fiat-mode
+     * conversion. Falls back to USD if the user hasn't picked one.
+     */
+    fiatCode() {
+      return (this.walletStore.preferredFiatCurrency || this.walletState.preferredFiatCurrency || 'USD').toLowerCase();
+    },
+    fiatRate() {
+      // The store table is canonical; the page cache can predate a currency.
+      return this.walletStore.exchangeRates?.[this.fiatCode]
+        || this.walletState.exchangeRates?.[this.fiatCode]
+        || 0;
+    },
+    /**
+     * The typed amount must always fit on one line. 44px holds about eleven
+     * characters on a 360px phone; past that the size steps down with the
+     * length shown, so 999,999,999,999 sats stays fully visible.
+     */
+    primaryFontSize() {
+      const chars = String(this.primaryDisplay).length + (this.isFiatMode ? 0 : 3);
+      if (chars <= 11) return '44px';
+      return `${Math.max(22, Math.floor(44 * 11 / chars))}px`;
+    },
+    fiatSymbol() {
+      return fiatSymbolFor(this.fiatCode);
+    },
+    /**
+     * Keys for the 3x4 keypad grid. The bottom-left key swaps between
+     * `000` (sats mode — fast PoS-style entry) and `.` (fiat mode — for
+     * cents). Bottom-right is always backspace.
+     */
+    keypadKeys() {
+      return [
+        '1', '2', '3',
+        '4', '5', '6',
+        '7', '8', '9',
+        this.isFiatMode ? '.' : '000',
+        '0',
+        'del',
+      ];
+    },
+    /**
+     * Primary display: what the user is actively typing.
+     * Sats mode: "1,000 sats". Fiat mode: "$ 0.00".
+     */
+    primaryDisplay() {
+      if (this.isFiatMode) {
+        return `${this.fiatSymbol}${this.groupedFiatInput(this.keypadValue)}`;
+      }
+      const formatted = this.keypadValue
+        ? Number(this.keypadValue).toLocaleString('en-US')
+        : '0';
+      return formatted;
+    },
+    /**
+     * Secondary display: the *other* unit's value, derived from the
+     * primary input. Tapping the swap icon promotes this to primary.
+     */
+    secondaryDisplay() {
+      if (this.isFiatMode) {
+        const sats = this.amountInSats;
+        return sats > 0 ? `${sats.toLocaleString('en-US')} sats` : '0 sats';
+      }
+      // No rate is "unknown", never a zero value.
+      if (!this.fiatRate) return '--';
+      return fiatRatesService.formatFiatAmount(this.satsToFiat(this.amountInSats), this.fiatCode);
+    },
     hasLightningAddress() {
       return !!this.walletStore.activeWalletLightningAddress;
     },
@@ -394,17 +698,95 @@ export default {
     isSparkWallet() {
       return this.walletStore.isActiveWalletSpark;
     },
+    isArkadeWallet() {
+      return this.walletStore.isActiveWalletArkade;
+    },
     isLNBitsWallet() {
       return this.walletStore.isActiveWalletLNBits;
     },
     sparkAddress() {
       return this.walletStore.activeSparkAddress;
     },
-    showSparkAddressView() {
-      return this.isSparkWallet && this.receiveMode === 'spark' && !this.generatedInvoice;
+    arkadeAddress() {
+      return this.walletStore.activeArkadeAddress;
     },
-    showBitcoinReceiveView() {
-      return this.isSparkWallet && this.receiveMode === 'bitcoin' && !this.generatedInvoice;
+    // The unified Bitcoin view (Spark): ONE QR carrying the deposit
+    // address, the current BOLT11 (zero-amount by default, amount-carrying
+    // after the keypad) and the Spark address. Everything except the keypad
+    // happens on this one page.
+    showUnifiedBitcoinView() {
+      return this.isSparkWallet && !this.showAmountInput;
+    },
+    // The Arkade sibling: boarding address as the base, the ark1 address as
+    // ark=, and the Lightning invoice as lightning= once an amount is set.
+    showArkadeUnifiedView() {
+      return this.isArkadeWallet && !this.showAmountInput;
+    },
+    /** The Arkade unified code - every rail the wallet can receive on. */
+    arkadeUnifiedQrValue() {
+      if (!this.arkadeBoardingAddress) return '';
+      const invoice = this.generatedInvoice?.amount > 0
+        ? this.generatedInvoice.payment_request
+        : '';
+      return composeUnifiedBip21({
+        address: this.arkadeBoardingAddress,
+        lightning: invoice,
+        ark: this.arkadeAddress || '',
+        amountSats: this.generatedInvoice?.amount || null,
+        // With no invoice to carry a memo, the note rides BIP21's own
+        // message= field so BIP21-aware payers still see it.
+        message: this.generatedInvoice?.description || '',
+      });
+    },
+    // The user-created specific-amount invoice screen (LNbits / NWC). The
+    // unified views show their amount on their own QR instead.
+    showSpecificInvoiceView() {
+      return !!this.generatedInvoice
+        && this.generatedInvoice.amount > 0
+        && !this.isSparkWallet
+        && !this.isArkadeWallet;
+    },
+    // LN-address-capable wallets (NWC/LNbits with an address attached) open
+    // straight to this view. Spark is excluded because it has its own zero-
+    // amount default and a separate Spark-address tab.
+    showLightningAddressView() {
+      return !this.showAmountInput
+        && !this.generatedInvoice
+        && !this.isSparkWallet
+        && !this.isArkadeWallet
+        && this.hasLightningAddress;
+    },
+    headerTitle() {
+      if (this.showSpecificInvoiceView || this.showAmountKeypadView) {
+        // Arkade mints no invoice while its Lightning rail is out - the
+        // keypad only sets the request amount on the unified code.
+        return this.isArkadeWallet ? this.$t('Set Amount') : this.$t('Invoice');
+      }
+      return this.$t('Receive');
+    },
+    // The keypad view is the catch-all when no other view matches. Wallets
+    // without a LN address (and that aren't on Spark Lightning) land here
+    // by default; users with a default view land here only after tapping
+    // the "Amount" button.
+    showAmountKeypadView() {
+      return !this.showUnifiedBitcoinView
+        && !this.showArkadeUnifiedView
+        && !this.showSpecificInvoiceView
+        && !this.showLightningAddressView;
+    },
+    /**
+     * Public accessor — the sats amount the user currently intends to
+     * receive. The wallet reads this when a withdraw (a Bolt Card or an
+     * LNURL-withdraw voucher) is initiated from this modal, so the redeem
+     * sheet pre-fills the amount instead of opening at 0. A created
+     * specific-amount invoice wins; otherwise the value typed on the keypad.
+     * Returns 0 when neither applies (a default amountless invoice, or an
+     * untouched keypad), which the caller reads as "nothing to carry".
+     */
+    intendedReceiveSats() {
+      if (this.generatedInvoice?.amount > 0) return this.generatedInvoice.amount;
+      if (this.showAmountKeypadView && this.amountInSats > 0) return this.amountInSats;
+      return 0;
     },
     paymentStatusClass() {
       switch (this.paymentStatus) {
@@ -457,21 +839,6 @@ export default {
         color: { dark: '#000000', light: '#ffffff' }
       };
     },
-    receiveModeOptions() {
-      const sparkIcon = this.$q.dark.isActive
-        ? 'img:/Spark/Spark Asterisk White.svg'
-        : 'img:/Spark/Spark Asterisk Black.svg';
-      return [
-        { label: this.$t('Lightning'), value: 'lightning', icon: 'bolt' },
-        { label: this.$t('Spark'), value: 'spark', icon: sparkIcon },
-        { label: this.$t('Bitcoin'), value: 'bitcoin', icon: 'currency_bitcoin' }
-      ];
-    },
-    sparkPillIcon() {
-      return this.$q.dark.isActive
-        ? '/Spark/Spark Asterisk White.svg'
-        : '/Spark/Spark Asterisk Black.svg';
-    },
     sparkQrOptions() {
       return getQrOptions();
     },
@@ -484,8 +851,19 @@ export default {
       if (newVal) {
         this.loadWalletState();
         this.resetForm();
+        // Land on a scannable code with no taps: Spark mints the default
+        // zero-amount invoice for the unified QR's lightning= rail; Arkade
+        // loads its boarding address and arms the live incoming-funds
+        // monitor so an ark1 receipt shows the in-modal success.
+        this.$nextTick(() => {
+          if (this.isSparkWallet) {
+            this.mintDefaultZeroInvoice();
+          } else if (this.isArkadeWallet) {
+            this.loadArkadeBoardingAddress();
+            this.startArkadeNativeMonitor();
+          }
+        });
       } else {
-        // Stop monitoring when modal closes
         this.stopPaymentMonitor();
       }
     }
@@ -500,6 +878,25 @@ export default {
     window.removeEventListener('resize', this.handleResize);
   },
   methods: {
+    openVouchers() {
+      this.showVouchers = true;
+      this.$emit('open-vouchers');
+    },
+    backFromVouchers() {
+      this.showVouchers = false;
+      this.$nextTick(() => this.$refs.voucherSummary?.focus());
+    },
+    selectVoucher(voucher) {
+      this.selectedVoucher = voucher;
+      this.show = false;
+    },
+    onHidden() {
+      this.showVouchers = false;
+      const voucher = this.selectedVoucher;
+      this.selectedVoucher = null;
+      // Present the withdrawal review only after this dialog has disappeared.
+      if (voucher) this.$emit('redeem-voucher', voucher);
+    },
     // ... (keeping all existing methods from the original component)
     loadWalletState() {
       const savedState = localStorage.getItem('buhoGO_wallet_state');
@@ -517,12 +914,14 @@ export default {
 
     resetForm() {
       this.stopPaymentMonitor();
-      this.displayAmount = '';
+      this.keypadValue = '';
+      this.isFiatMode = false;
+      this.showDescriptionSheet = false;
       this.description = '';
       this.generatedInvoice = null;
-      this.amountInSats = 0;
-      this.showAddressView = false;
-      this.receiveMode = 'lightning';
+      this.showAmountInput = false;
+      this.isMintingDefaultZero = false;
+      this.arkadeBoardingAddress = '';
       this.paymentStatus = PaymentStatus.PENDING;
       this.paymentStatusMessage = '';
       this.isPaymentConfirmed = false;
@@ -537,19 +936,178 @@ export default {
     },
 
     /**
-     * Set receive mode programmatically (for parent component access)
-     * @param {string} mode - 'lightning', 'spark', or 'bitcoin'
+     * Header back-arrow handler. Context-aware:
+     * - Specific-amount invoice → return to default view (or close).
+     * - Keypad after tapping Amount → return to default view.
+     * - No default view → close the modal.
      */
-    setReceiveMode(mode) {
-      if (['lightning', 'spark', 'bitcoin'].includes(mode)) {
-        this.receiveMode = mode;
+    handleHeaderBack() {
+      if (this.showSpecificInvoiceView) {
+        this.backFromInvoice();
+        return;
+      }
+      // Spark and Arkade always have the unified view to return to; other
+      // wallets return to their Lightning-address view when they have one.
+      const canReturnToDefault = this.hasLightningAddress
+        || this.isSparkWallet
+        || this.isArkadeWallet;
+      if (this.showAmountInput && canReturnToDefault) {
+        this.showAmountInput = false;
+        this.keypadValue = '';
+        if (this.isSparkWallet && !this.generatedInvoice) {
+          this.mintDefaultZeroInvoice();
+        } else if (this.isArkadeWallet && !this.generatedInvoice) {
+          // The unified view's live incoming-funds monitor was stopped when
+          // the keypad took over - re-arm it.
+          this.startArkadeNativeMonitor();
+        }
+        return;
+      }
+      this.closeModal();
+    },
+
+    /**
+     * Tap "Amount" on a default QR view. Tear down the default zero-amount
+     * monitor (if running), clear the default invoice, and switch to the
+     * keypad.
+     */
+    tapAmountButton() {
+      // On the unified views the QR's invoice belongs to the amount being
+      // replaced - tear its monitor down and clear it. Other wallets only
+      // clear the default zero-amount invoice; their specific-amount screen
+      // owns its own back path.
+      const clearInvoice = !!this.generatedInvoice
+        && (this.generatedInvoice.amount === 0 || this.isSparkWallet || this.isArkadeWallet);
+      if (clearInvoice) {
+        this.stopPaymentMonitor();
+        this.generatedInvoice = null;
+        this.paymentStatus = PaymentStatus.PENDING;
+        this.paymentStatusMessage = '';
+      } else if (this.isArkadeWallet) {
+        // The native ark1 monitor runs without an invoice; stop it so the
+        // upcoming invoice's monitor is the only listener.
+        this.stopPaymentMonitor();
+      }
+      this.showAmountInput = true;
+      this.keypadValue = '';
+    },
+
+    /**
+     * Back from a specific-amount invoice. Returns to whatever default view
+     * the wallet has — LN address, or a freshly minted Spark zero-amount.
+     * Closes the modal if there is no default view to return to.
+     */
+    backFromInvoice() {
+      this.stopPaymentMonitor();
+      this.generatedInvoice = null;
+      this.paymentStatus = PaymentStatus.PENDING;
+      this.paymentStatusMessage = '';
+      this.isPaymentConfirmed = false;
+      this.keypadValue = '';
+      this.description = '';
+
+      if (this.isSparkWallet) {
+        this.showAmountInput = false;
+        this.mintDefaultZeroInvoice();
+      } else if (this.isArkadeWallet) {
+        this.showAmountInput = false;
+        this.startArkadeNativeMonitor();
+      } else if (this.hasLightningAddress) {
+        this.showAmountInput = false;
+      } else {
+        // No default view — close out.
+        this.closeModal();
       }
     },
+
+    /**
+     * Mint a zero-amount BOLT11 for the Spark unified view's lightning=
+     * rail and start the payment monitor. No-op on non-Spark wallets or
+     * if a mint is already in flight / cached.
+     *
+     * The invoice is stored in `generatedInvoice` (with `amount === 0`) so
+     * the existing Spark monitor wiring in `startSparkEventMonitor()` works
+     * unchanged. Views distinguish between this default and a user-created
+     * specific-amount invoice via the `amount > 0` check.
+     */
+    async mintDefaultZeroInvoice() {
+      if (this.isMintingDefaultZero) return;
+      if (this.generatedInvoice) return;
+      if (!this.isSparkWallet) return;
+      if (this.showAmountInput) return;
+
+      this.isMintingDefaultZero = true;
+      try {
+        const provider = this.walletStore.getActiveProvider();
+        if (!provider) {
+          // Wallet locked or unavailable. The user can still tap Amount to
+          // create a fixed-amount invoice (which will prompt for unlock).
+          return;
+        }
+
+        const result = await provider.createInvoice({
+          amount: 0,
+          description: 'BuhoGO Payment',
+        });
+
+        // Race guard: the user may have switched tabs, tapped Amount, or
+        // closed the modal while the mint was in flight (e.g.
+        // openReceiveModalBitcoin sets the tab via $nextTick). Drop the
+        // result silently in those cases — we'd otherwise leak an orphaned
+        // invoice + monitor.
+        if (!this.show
+            || this.showAmountInput
+            || this.generatedInvoice) {
+          return;
+        }
+
+        const paymentRequest = result.paymentRequest;
+        if (!paymentRequest) {
+          console.warn('Zero-amount mint returned no paymentRequest');
+          return;
+        }
+
+        let paymentHash = result.paymentHash;
+        if (!paymentHash) {
+          paymentHash = this._extractPaymentHashFromBolt11(paymentRequest);
+        }
+
+        this.generatedInvoice = {
+          payment_request: paymentRequest,
+          payment_hash: paymentHash,
+          invoice_id: result.id || null,
+          // The wallet that minted it: only that wallet's receipt confirms it.
+          walletId: this.walletStore.activeWalletId,
+          amount: 0,
+          description: 'BuhoGO Payment',
+          expires_at: result.expiresAt,
+          created_at: Math.floor(Date.now() / 1000),
+        };
+
+        this.startPaymentMonitor();
+      } catch (error) {
+        // Non-fatal — the user can still tap Amount to create a fixed-
+        // amount invoice. Network blips, wallet relocked, etc.
+        console.warn('Failed to mint default zero-amount invoice:', error?.message || error);
+      } finally {
+        this.isMintingDefaultZero = false;
+      }
+    },
+
+    /**
+     * Kept for parent callers (the wallet home's deposit chip used to jump
+     * to the Bitcoin tab). The unified view already shows every rail and
+     * the incoming deposits, so there is nothing to switch any more.
+     */
+    setReceiveMode() {},
 
     /**
      * Handle Bitcoin deposit claimed - show confirmation
      */
     handleBitcoinDepositClaimed(result) {
+      // A pending claim already has progress feedback in the claim sheet;
+      // do not cover it with a completed-payment confirmation.
+      if (result.processing) return;
       // Show success confirmation similar to Lightning payments
       this.confirmedAmount = result.amount;
       this.confirmedFiatAmount = this.calculateFiatAmount(result.amount);
@@ -568,17 +1126,23 @@ export default {
      * Calculate fiat amount for confirmation display
      */
     calculateFiatAmount(sats) {
-      const rate = this.walletState.exchangeRates?.['usd'];
-      if (!rate) return '--';
-      const btc = sats / 100000000;
-      const fiat = btc * rate;
-      return `$${fiat.toFixed(2)}`;
+      if (!this.fiatRate) return '--';
+      return fiatRatesService.formatFiatAmount(this.satsToFiat(sats), this.fiatCode);
+    },
+
+    /** "1234567.5" -> "1,234,567.5": groups the whole part, keeps typed decimals. */
+    groupedFiatInput(value) {
+      if (!value) return '0';
+      const [whole, decimals] = String(value).split('.');
+      const grouped = Number(whole || 0).toLocaleString('en-US');
+      return decimals !== undefined ? `${grouped}.${decimals}` : grouped;
     },
 
     /**
      * Stop the payment monitor if running
      */
     stopPaymentMonitor() {
+      this.sparkMonitorGeneration = (this.sparkMonitorGeneration || 0) + 1;
       // Stop polling-based monitor (NWC)
       if (this.paymentMonitor) {
         this.paymentMonitor.stop();
@@ -594,11 +1158,26 @@ export default {
         this.nwcNotificationUnsubscribe();
         this.nwcNotificationUnsubscribe = null;
       }
+      // Cancel Spark invoice polling
+      if (this.sparkPollState) {
+        this.sparkPollState.cancelled = true;
+        this.sparkPollState = null;
+      }
+      // Remove visibility-change listener
+      if (this.sparkVisibilityHandler) {
+        document.removeEventListener('visibilitychange', this.sparkVisibilityHandler);
+        this.sparkVisibilityHandler = null;
+      }
+      // Stop the Arkade incoming-funds subscription
+      if (this._arkadeStopIncoming) {
+        try { this._arkadeStopIncoming(); } catch (e) { /* ignore */ }
+        this._arkadeStopIncoming = null;
+      }
     },
 
     /**
      * Start monitoring for payment confirmation
-     * Uses event-based for Spark (instant), polling for LNBits/NWC
+     * Uses event-based for Spark (instant), polling for LNbits/NWC
      */
     async startPaymentMonitor() {
       if (!this.generatedInvoice?.payment_hash) {
@@ -619,24 +1198,176 @@ export default {
     },
 
     /**
-     * Start Spark event-based payment monitoring (real-time, no polling)
+     * Live monitor for the native ark1 address tab (no generated invoice). The
+     * received amount isn't known up front, so we capture the balance at open
+     * and report the delta when funds land. Best-effort: balance/tx list still
+     * reflect the payment if the stream is unavailable.
+     */
+    async startArkadeNativeMonitor() {
+      let provider;
+      try {
+        provider = await this.walletStore.ensureArkadeConnected();
+      } catch (error) {
+        console.warn('Could not connect Arkade provider for native monitoring:', error);
+        return;
+      }
+      let baseline = 0;
+      try { baseline = Number((await provider.getBalance())?.balance ?? 0); } catch (e) { /* ignore */ }
+      // The awaits above race a quick modal close (and the four call sites
+      // never await this method): registering now would orphan a listener
+      // that pops the success screen with a stale baseline after close.
+      if (!this.show) return;
+      if (this._arkadeStopIncoming) {
+        try { this._arkadeStopIncoming(); } catch { /* already gone */ }
+        this._arkadeStopIncoming = null;
+      }
+      this.paymentStatus = PaymentStatus.PENDING;
+      try {
+        this._arkadeStopIncoming = await provider.startIncomingFundsListener(async () => {
+          if (!this.show) return;
+          if (this.isPaymentConfirmed) return;
+          let received;
+          try {
+            const now = Number((await provider.getBalance())?.balance ?? 0);
+            const delta = now - baseline;
+            received = delta > 0 ? delta : undefined;
+          } catch (e) { /* fall back to unknown amount */ }
+          this.handlePaymentStatus(PaymentStatus.CONFIRMED, { amount: received });
+        });
+      } catch (error) {
+        console.warn('Could not start Arkade native incoming monitor:', error);
+      }
+    },
+
+    /**
+     * Start Spark payment monitoring.
+     *
+     * Uses two independent paths so a stuck event or stalled poll cannot
+     * block confirmation:
+     *   1. SDK `transfer:claimed` event — instant for Spark-to-Spark
+     *      transfers, but unreliable for Lightning invoice receives.
+     *   2. `getLightningReceiveRequest(id)` polling — ground truth for any
+     *      receive path (Spark address, Spark invoice, or BOLT11).
+     *
+     * Whichever path detects payment first wins; the second is a no-op via
+     * the `isPaymentConfirmed` idempotency guard in handlePaymentStatus.
+     * On mobile resume we run an immediate catch-up check because JS timers
+     * stall while the app is backgrounded.
      */
     async startSparkEventMonitor() {
+      // Bound to the invoice's own wallet and payment hash. With every Spark
+      // account live, "some receive on the active provider" is not proof:
+      // a payment to another account, or an unrelated receive on this one,
+      // must never confirm the invoice on screen.
+      const invoice = this.generatedInvoice;
+      const walletId = invoice?.walletId || this.walletStore.activeWalletId;
+      const expectedHash = String(invoice?.payment_hash || '').toLowerCase();
+      const invoiceId = invoice?.invoice_id;
+      const generation = this.sparkMonitorGeneration || 0;
+      // Still the same monitor for the same invoice: a closed sheet or a
+      // replacement invoice must not be confirmed by this one's late work.
+      const current = () => generation === (this.sparkMonitorGeneration || 0) && this.generatedInvoice === invoice;
+      let provider;
       try {
-        const provider = await this.walletStore.ensureSparkConnected();
+        provider = await this.walletStore.ensureSparkConnected(walletId);
+      } catch (error) {
+        console.warn('Could not connect Spark provider for monitoring:', error);
+        return;
+      }
+      if (!current()) return; // closed or replaced while connecting
 
-        // Subscribe to payment events
-        this.sparkEventUnsubscribe = provider.onPaymentReceived((transferId, newBalance) => {
+      // Fast path: SDK event (best-effort — may not fire for Lightning)
+      try {
+        this.sparkEventUnsubscribe = provider.onPaymentReceived((transferId, newBalance, payment) => {
+          if (!current()) return;
+          if (!invoiceMatchesPayment(expectedHash, payment)) return;
           this.handlePaymentStatus(PaymentStatus.CONFIRMED, {
             transferId,
-            amount: this.generatedInvoice?.amount,
+            amount: receivedSats(payment) || invoice?.amount,
             newBalance
           });
         });
       } catch (error) {
-        console.warn('Could not start Spark event monitoring, falling back to polling:', error);
-        // Fallback to polling if events fail
-        await this.startNWCPollingMonitor();
+        console.warn('Could not subscribe to Spark transfer:claimed event:', error);
+      }
+
+      // Ground-truth poll
+      if (invoiceId && typeof provider.getLightningReceiveStatus === 'function') {
+        this.startSparkInvoicePolling(provider, invoiceId, walletId);
+
+        this.sparkVisibilityHandler = () => {
+          if (document.visibilityState === 'visible' && current()) {
+            this.checkSparkInvoiceOnce(provider, invoiceId, walletId);
+          }
+        };
+        document.addEventListener('visibilitychange', this.sparkVisibilityHandler);
+      }
+    },
+
+    /**
+     * Poll Spark `getLightningReceiveRequest(id)` until paid, expired, or
+     * cancelled. Runs alongside the SDK event subscription; the first to
+     * detect a settled payment wins (idempotency is enforced in
+     * handlePaymentStatus).
+     */
+    startSparkInvoicePolling(provider, invoiceId, walletId) {
+      const intervalMs = 3000;
+      this.sparkPollState = { cancelled: false };
+      const state = this.sparkPollState;
+
+      const tick = async () => {
+        if (state.cancelled || this.isPaymentConfirmed) return;
+        try {
+          // The live provider for the invoice's wallet: a rebuild replaces it.
+          const liveProvider = walletId ? await this.walletStore.ensureSparkConnected(walletId) : provider;
+          if (state.cancelled) return;
+          const status = await liveProvider.getLightningReceiveStatus(invoiceId);
+          if (state.cancelled || this.isPaymentConfirmed || this.generatedInvoice?.invoice_id !== invoiceId) return;
+          if (status.isPaid) {
+            // `amountReceived` is the actual paid amount — required for
+            // zero-amount invoices where `status.amount` is 0.
+            this.handlePaymentStatus(PaymentStatus.CONFIRMED, {
+              amount: status.amountReceived
+                || status.amount
+                || this.generatedInvoice?.amount,
+              preimage: status.preimage
+            });
+            return;
+          }
+          if (status.isExpired) {
+            this.handlePaymentStatus(PaymentStatus.EXPIRED, {});
+            return;
+          }
+        } catch (e) {
+          // Transient error (wallet relocked, network blip) — keep polling.
+        }
+        if (!state.cancelled && !this.isPaymentConfirmed) {
+          setTimeout(tick, intervalMs);
+        }
+      };
+      setTimeout(tick, intervalMs);
+    },
+
+    async checkSparkInvoiceOnce(provider, invoiceId, walletId) {
+      if (!invoiceId || this.isPaymentConfirmed) return;
+      const generation = this.sparkMonitorGeneration || 0;
+      try {
+        const liveProvider = walletId ? await this.walletStore.ensureSparkConnected(walletId) : provider;
+        const status = await liveProvider.getLightningReceiveStatus(invoiceId);
+        // The resume lookup belongs to one invoice: a newer invoice (or a
+        // closed sheet) must not be confirmed by it.
+        if (this.isPaymentConfirmed || generation !== (this.sparkMonitorGeneration || 0)
+          || this.generatedInvoice?.invoice_id !== invoiceId) return;
+        if (status.isPaid) {
+          this.handlePaymentStatus(PaymentStatus.CONFIRMED, {
+            amount: status.amountReceived
+              || status.amount
+              || this.generatedInvoice?.amount,
+            preimage: status.preimage
+          });
+        }
+      } catch (e) {
+        // Catch-up check is best-effort; the polling tick will retry.
       }
     },
 
@@ -674,24 +1405,43 @@ export default {
         return;
       }
 
-      // Wrap the provider with robust payment status detection
-      // Many NWC wallets don't support lookupInvoice, so we use listTransactions as fallback
+      // Per-session capability flag for `lookup_invoice`.
+      //
+      // Some NWC wallets either don't implement lookup_invoice or only
+      // index invoices once they've been paid — both surface as
+      // "invoice not found" rejections when we poll. The Alby SDK logs
+      // each failure to console.error *before* rejecting the promise,
+      // so a multi-minute receive window can produce 30+ noisy log
+      // lines for a flow that's actually working (via the
+      // listTransactions fallback below).
+      //
+      // After the first failure we mark lookup_invoice unavailable for
+      // the rest of this monitor session and skip straight to the
+      // fallback. The flag is intentionally per-session (closure-scoped)
+      // rather than memoised across sessions — wallet capabilities can
+      // change between connections, so the next receive should re-probe.
+      let lookupInvoiceAvailable = true;
+
       wrappedProvider = {
         lookupInvoice: async (hash) => {
-          // Try lookupInvoice first (may not be supported by all wallets)
-          try {
-            const invoice = await rawProvider.lookupInvoice({ payment_hash: hash });
-            if (invoice) {
-              const isPaid = checkNWCPaymentStatus(invoice);
-              if (isPaid) {
+          if (lookupInvoiceAvailable) {
+            try {
+              const invoice = await rawProvider.lookupInvoice({ payment_hash: hash });
+              if (invoice && checkNWCPaymentStatus(invoice)) {
                 return { paid: true, preimage: invoice?.preimage, amount: invoice?.amount };
               }
+            } catch {
+              // Sticky-flag the wallet's lookup_invoice as unreliable
+              // for the rest of this monitor session — see comment
+              // above. The fallback below takes over from here.
+              lookupInvoiceAvailable = false;
             }
-          } catch (e) {
-            // lookupInvoice not supported or timed out - use fallback
           }
 
-          // Fallback: Search in recent transactions
+          // Fallback: scan recent incoming transactions for our
+          // payment_hash. Used when lookup_invoice isn't available, or
+          // when it returned an unpaid result and the transaction list
+          // might already reflect a payment the invoice index hasn't.
           try {
             const txResponse = await rawProvider.listTransactions({
               limit: 50,
@@ -712,8 +1462,10 @@ export default {
                 };
               }
             }
-          } catch (listError) {
-            // listTransactions also failed - return not paid
+          } catch {
+            // listTransactions also failed — return not paid; the
+            // monitor accumulates consecutive errors and stops after
+            // the configured threshold.
           }
 
           return { paid: false };
@@ -739,8 +1491,8 @@ export default {
     },
 
     /**
-     * Start LNBits payment monitoring using polling
-     * Uses the LNBits API to check payment status
+     * Start LNbits payment monitoring using polling
+     * Uses the LNbits API to check payment status
      */
     async startLNBitsPollingMonitor() {
       let rawProvider = null;
@@ -748,24 +1500,24 @@ export default {
       try {
         rawProvider = this.walletStore.getActiveProvider();
       } catch (error) {
-        console.warn('Could not get LNBits provider for payment monitoring:', error.message);
+        console.warn('Could not get LNbits provider for payment monitoring:', error.message);
         return;
       }
 
       if (!rawProvider) {
-        console.warn('No LNBits provider available for payment monitoring');
+        console.warn('No LNbits provider available for payment monitoring');
         return;
       }
 
-      // Wrap the LNBits provider with the expected interface
+      // Wrap the LNbits provider with the expected interface
       const wrappedProvider = {
         lookupInvoice: async (hash) => {
           try {
-            // LNBits lookupInvoice expects a string payment hash
+            // LNbits lookupInvoice expects a string payment hash
             const result = await rawProvider.lookupInvoice(hash);
             return result;
           } catch (error) {
-            console.warn('LNBits lookupInvoice error:', error.message);
+            console.warn('LNbits lookupInvoice error:', error.message);
             return { paid: false };
           }
         }
@@ -797,6 +1549,8 @@ export default {
 
       switch (status) {
         case PaymentStatus.CONFIRMED:
+          // Idempotency guard — event and poll can both fire for the same payment.
+          if (this.isPaymentConfirmed) return;
           this.isPaymentConfirmed = true;
           this.paymentStatusMessage = this.$t('Payment received!');
 
@@ -827,7 +1581,6 @@ export default {
             caption: this.$t('Please create a new invoice'),
             
             timeout: 4000,
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           });
           break;
 
@@ -842,100 +1595,106 @@ export default {
       }
     },
 
-    toggleCurrency() {
-      const currencies = ['sats', this.walletState.preferredFiatCurrency?.toLowerCase() || 'usd'];
-      const currentIndex = currencies.indexOf(this.currentCurrency);
-      const nextIndex = (currentIndex + 1) % currencies.length;
-      this.currentCurrency = currencies[nextIndex];
-      this.convertAmount();
+    /**
+     * Handle a key press from the in-app keypad.
+     * - digits: append, collapsing leading zeros (so '0' + '5' = '5', not '05')
+     * - '0': allowed as a stable single-zero state
+     * - '000' (sats mode): append three zeros
+     * - '.' (fiat mode): append decimal if not already present; cap to 2 places
+     * - 'del': pop last char
+     */
+    keypadTap(key) {
+      if (key === 'del') {
+        this.keypadValue = this.keypadValue.slice(0, -1);
+        return;
+      }
+      if (key === '.') {
+        if (this.keypadValue.includes('.')) return;
+        this.keypadValue = (this.keypadValue || '0') + '.';
+        return;
+      }
+      // Cap input length to keep the display readable.
+      if (this.keypadValue.length >= 12) return;
+
+      // Fiat mode: enforce 2 decimal places max.
+      if (this.isFiatMode && this.keypadValue.includes('.')) {
+        const decimals = this.keypadValue.split('.')[1] || '';
+        if (decimals.length >= 2) return;
+      }
+
+      let next = this.keypadValue + key;
+      // Collapse leading zeros (e.g. '00' → '0', '05' → '5'), but keep
+      // '0.' / '0.5' intact for fiat decimal entry.
+      while (next.length > 1 && next.startsWith('0') && !next.startsWith('0.')) {
+        next = next.slice(1);
+      }
+      // Re-cap after the 000 expansion may have pushed us over.
+      if (next.length > 12) next = next.slice(0, 12);
+      this.keypadValue = next;
     },
 
-    getCurrencySymbol() {
-      switch (this.currentCurrency) {
-        case 'sats':
-          return 'Sats';
-        case 'btc':
-          return '₿';
-        case 'usd':
-          return '$';
-        case 'eur':
-          return '€';
-        case 'gbp':
-          return '£';
-        case 'jpy':
-          return '¥';
-        default:
-          return '$';
+    /**
+     * Swap the primary input mode (sats ↔ fiat) and convert the current
+     * value so the displayed amount stays roughly the same. Conversions
+     * are floor-rounded for sats and 2-decimal for fiat.
+     */
+    swapKeypadMode() {
+      if (!this.fiatRate) return; // Can't swap without an exchange rate.
+      if (this.isFiatMode) {
+        const sats = this.amountInSats;
+        this.keypadValue = sats > 0 ? String(sats) : '';
+        this.isFiatMode = false;
+      } else {
+        const fiat = this.satsToFiat(this.amountInSats);
+        this.keypadValue = fiat > 0 ? fiat.toFixed(2) : '';
+        this.isFiatMode = true;
       }
     },
 
-    getAmountPlaceholder() {
-      switch (this.currentCurrency) {
-        case 'sats':
-          return '0';
-        case 'btc':
-          return '0.00000000';
-        default:
-          return '0.00';
-      }
+    /** Convert a fiat amount (in fiatCode) to integer sats. */
+    fiatToSats(fiat) {
+      if (!this.fiatRate || fiat <= 0) return 0;
+      const btc = fiat / this.fiatRate;
+      return Math.floor(btc * 100000000);
     },
 
-    onAmountChange() {
-      this.convertAmount();
+    /** Convert integer sats to fiat (in fiatCode). */
+    satsToFiat(sats) {
+      if (!this.fiatRate || sats <= 0) return 0;
+      return (sats / 100000000) * this.fiatRate;
     },
 
-    onAmountFocus() {
-      this.isAmountFocused = true;
+    openDescriptionSheet() {
+      this.showDescriptionSheet = true;
     },
 
-    onAmountBlur() {
-      this.isAmountFocused = false;
-      this.formatDisplayAmount();
-    },
-
-    convertAmount() {
-      const amount = parseFloat(this.displayAmount) || 0;
-
-      switch (this.currentCurrency) {
-        case 'sats':
-          this.amountInSats = Math.floor(amount);
-          break;
-        case 'btc':
-          this.amountInSats = Math.floor(amount * 100000000);
-          break;
-        default:
-          const rate = this.walletState.exchangeRates?.[this.currentCurrency];
-          if (!rate) return;
-          const btcAmount = amount / rate;
-          this.amountInSats = Math.floor(btcAmount * 100000000);
-          break;
-      }
-    },
-
-    formatDisplayAmount() {
-      if (!this.isAmountFocused && this.displayAmount) {
-        const amount = parseFloat(this.displayAmount);
-        if (!isNaN(amount)) {
-          switch (this.currentCurrency) {
-            case 'sats':
-              this.displayAmount = Math.floor(amount).toString();
-              break;
-            case 'btc':
-              this.displayAmount = amount.toFixed(8);
-              break;
-            default:
-              this.displayAmount = amount.toFixed(2);
-              break;
-          }
-        }
-      }
+    closeDescriptionSheet() {
+      this.showDescriptionSheet = false;
     },
 
     async createInvoice() {
       if (!this.isValidAmount) return;
 
+      // Guard against missing active wallet — the activeWalletType getter
+      // crashes inside inferWalletType(undefined) and surfaces an opaque
+      // TypeError. Catch it here with a clear message instead.
+      if (!this.hasActiveWallet) {
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t('No active wallet. Please connect a wallet first.'),
+        });
+        return;
+      }
+
       this.isCreatingInvoice = true;
       try {
+        // LUD-09 note: `successAction` does not apply to a plain BOLT11 invoice.
+        // It is an LNURL-pay concept returned alongside the invoice from a
+        // pay-link callback. BuhoGO runs no HTTP server, so the only
+        // receiver-side successAction we can set is on an LNbits Lightning
+        // address at creation time (success_text/success_url) — see
+        // LNBitsWalletProvider.createLightningAddress. Spark/NWC addresses are
+        // served by their own infrastructure and cannot carry one.
         const invoiceParams = {
           amount: this.amountInSats,
           description: this.description || 'BuhoGO Payment',
@@ -958,15 +1717,16 @@ export default {
           invoice = {
             paymentRequest: result.paymentRequest,
             payment_hash: result.paymentHash,
+            invoice_id: result.id,
             amount: this.amountInSats,
             description: invoiceParams.description,
             expires_at: result.expiresAt
           };
         } else if (walletType === 'lnbits') {
-          // Use LNBits wallet provider
+          // Use LNbits wallet provider
           const provider = this.walletStore.getActiveProvider();
           if (!provider) {
-            throw new Error('LNBits wallet not connected');
+            throw new Error('LNbits wallet not connected');
           }
 
           const result = await provider.createInvoice(invoiceParams);
@@ -977,6 +1737,25 @@ export default {
             description: invoiceParams.description,
             expires_at: result.expiresAt
           };
+        } else if (walletType === 'arkade') {
+          // Arkade Lightning is out of service (its Boltz swap rail is
+          // retired - see Plans WIP/arkade-maintenance-map.md). The request
+          // still deserves an amount: it rides the unified QR's amount=
+          // param for ark and on-chain payers, with no lightning= leg.
+          this.generatedInvoice = {
+            payment_request: '',
+            payment_hash: null,
+            invoice_id: null,
+            amount: this.amountInSats,
+            description: invoiceParams.description,
+            created_at: Math.floor(Date.now() / 1000)
+          };
+          this.showAmountInput = false;
+          // tapAmountButton stopped the native ark1 monitor; nothing
+          // invoice-shaped will watch for the payment, so re-arm it.
+          this.startArkadeNativeMonitor();
+          this.isCreatingInvoice = false;
+          return;
         } else {
           // Use NWC for NWC wallets
           const activeWallet = this.walletState.connectedWallets?.find(
@@ -992,7 +1771,15 @@ export default {
           });
 
           await nwc.enable();
-          invoice = await nwc.makeInvoice(invoiceParams);
+          // @getalby/sdk's NostrWebLNProvider.makeInvoice only reads
+          // `defaultMemo` for the invoice description — passing our
+          // `description` key (as used by every other provider's
+          // createInvoice) is silently ignored, which is why NWC invoices
+          // came back with an empty d-tag despite the user typing a note.
+          invoice = await nwc.makeInvoice({
+            amount: invoiceParams.amount,
+            defaultMemo: invoiceParams.description,
+          });
         }
 
         const paymentRequest = invoice.paymentRequest || invoice.payment_request;
@@ -1011,6 +1798,8 @@ export default {
         const processedInvoice = {
           payment_request: paymentRequest,
           payment_hash: paymentHash,
+          invoice_id: invoice.invoice_id || invoice.id || null,
+          walletId: this.walletStore.activeWalletId,
           amount: invoice.amount || this.amountInSats,
           description: invoice.description || this.description || 'BuhoGO Payment',
           expires_at: invoice.expires_at || invoice.expiresAt,
@@ -1020,11 +1809,16 @@ export default {
         this.generatedInvoice = processedInvoice;
         this.$emit('invoice-created', processedInvoice);
 
+        // The unified views show the new amount on their own QR; other
+        // wallets move to the dedicated invoice screen.
+        if (this.isSparkWallet || this.isArkadeWallet) {
+          this.showAmountInput = false;
+        }
+
         this.$q.notify({
           type: 'positive',
           message: this.$t('Invoice ready'),
           
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
 
         // Start monitoring for payment confirmation
@@ -1033,12 +1827,17 @@ export default {
       } catch (error) {
         console.error('Error creating invoice:', error);
 
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Couldn\'t create invoice'),
-          caption: this.$t('Please try again'),
-          
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+        // Funnel into the global payment-error dialog so the upstream
+        // prose (NWC Nip47WalletError message, LNbits detail, Spark SDK
+        // error) reaches the user verbatim instead of being swallowed by
+        // a generic "Please try again" toast. See utils/userErrors.js
+        // and stores/wallet.js → showPaymentError for the contract.
+        this.walletStore.showPaymentError(error, {
+          context: 'receive',
+          walletType: this.walletStore.activeWalletType,
+          route: 'Invoice creation',
+          amountSats: this.amountInSats,
+          t: this.$t.bind(this),
         });
 
         this.generatedInvoice = null;
@@ -1056,7 +1855,6 @@ export default {
           type: 'positive',
           message: this.$t('Invoice copied'),
           
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       } catch (error) {
         console.error('Failed to copy invoice:', error);
@@ -1064,14 +1862,28 @@ export default {
           type: 'negative',
           message: this.$t('Couldn\'t copy'),
           
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       }
     },
 
-    showLightningAddress() {
-      this.showAddressView = true;
-      this.generatedInvoice = null;
+    async shareLightningAddress() {
+      if (!this.lightningAddress) return;
+
+      const qrBlob = await qrBlobFromRef(this.$refs.lightningAddressQr, { label: this.lightningAddress });
+      const result = await shareContent({
+        title: this.$t('Lightning Address'),
+        text: this.lightningAddress,
+        files: qrBlob ? [{ blob: qrBlob, name: 'lightning-address.png', mimeType: 'image/png' }] : undefined,
+      });
+
+      if (result.success) {
+        this.$q.notify({ type: 'positive', message: this.$t('Shared') });
+      } else if (result.reason === 'unsupported') {
+        await this.copyLightningAddress();
+      } else if (result.reason === 'error') {
+        console.error('Failed to share Lightning address:', result.error);
+        await this.copyLightningAddress();
+      }
     },
 
     async copyLightningAddress() {
@@ -1083,66 +1895,75 @@ export default {
           type: 'positive',
           message: this.$t('Address copied'),
           
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       } catch (error) {
         this.$q.notify({
           type: 'negative',
           message: this.$t('Couldn\'t copy'),
           
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       }
     },
 
-    async copySparkAddress() {
-      if (!this.sparkAddress) return;
-
-      try {
-        await navigator.clipboard.writeText(this.sparkAddress);
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Spark address copied'),
-          
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        });
-      } catch (error) {
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Couldn\'t copy'),
-          
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        });
-      }
-    },
-
-    async shareSparkAddress() {
-      if (!this.sparkAddress) return;
-
-      const result = await shareContent({
-        title: this.$t('Spark Address'),
-        text: this.sparkAddress
-      });
-
-      if (result.success) {
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Shared'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        });
-      } else if (result.reason === 'unsupported') {
-        // Fallback: copy to clipboard
-        await this.copySparkAddress();
-      } else if (result.reason === 'error') {
-        console.error('Failed to share Spark address:', result.error);
-        await this.copySparkAddress();
-      }
-      // Don't do anything for 'cancelled' - user just closed the dialog
-    },
-
-    truncateSparkAddress(address) {
+    truncateArkadeAddress(address) {
       return truncateAddress(address);
+    },
+
+    async loadArkadeBoardingAddress() {
+      try {
+        const provider = await this.walletStore.ensureArkadeConnected();
+        this.arkadeBoardingAddress = await provider.getBoardingAddress();
+      } catch (error) {
+        console.warn('Could not load Arkade boarding address:', error);
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t("Couldn't load address"),
+        });
+      }
+    },
+
+    async copyArkadeBoardingAddress() {
+      if (!this.arkadeBoardingAddress) return;
+      try {
+        await navigator.clipboard.writeText(this.arkadeBoardingAddress);
+        this.$q.notify({ type: 'positive', message: this.$t('Address copied') });
+      } catch (error) {
+        this.$q.notify({ type: 'negative', message: this.$t('Couldn\'t copy') });
+      }
+    },
+
+    async shareArkadeBoardingAddress() {
+      if (!this.arkadeBoardingAddress) return;
+      const qrBlob = await qrBlobFromRef(this.$refs.arkadeBoardingQr, { label: this.arkadeBoardingAddress });
+      const result = await shareContent({
+        title: this.$t('Bitcoin Address'),
+        // The full unified string - exactly what the QR encodes, so the
+        // recipient's wallet gets every rail.
+        text: this.arkadeUnifiedQrValue,
+        files: qrBlob ? [{ blob: qrBlob, name: 'bitcoin-address.png', mimeType: 'image/png' }] : undefined,
+      });
+      if (result.success) {
+        this.$q.notify({ type: 'positive', message: this.$t('Shared') });
+      } else if (result.reason === 'unsupported' || result.reason === 'error') {
+        if (result.reason === 'error') console.error('Failed to share boarding address:', result.error);
+        await this.copyArkadeBoardingAddress();
+      }
+    },
+
+    async copyArkadeAddress() {
+      if (!this.arkadeAddress) return;
+      try {
+        await navigator.clipboard.writeText(this.arkadeAddress);
+        this.$q.notify({
+          type: 'positive',
+          message: this.$t('Arkade address copied'),
+        });
+      } catch (error) {
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t('Couldn\'t copy'),
+        });
+      }
     },
 
     formatInvoiceAmount(sats) {
@@ -1165,45 +1986,44 @@ export default {
     async shareInvoice() {
       if (!this.generatedInvoice) return;
 
-      // Lightning URI for sharing (most wallets recognize this format)
+      // Lightning URI so every wallet we share to can open it directly.
       const lightningUri = `lightning:${this.generatedInvoice.payment_request}`;
 
+      const qrBlob = await qrBlobFromRef(this.$refs.invoiceQr, { label: this.generatedInvoice?.payment_request || '' });
       const result = await shareContent({
         title: this.$t('Lightning Invoice'),
-        text: lightningUri
+        // Pure invoice URI so recipients can copy-paste cleanly. The
+        // BuhoGO wordmark is baked into the QR image by qrShare.
+        text: lightningUri,
+        files: qrBlob ? [{ blob: qrBlob, name: 'lightning-invoice.png', mimeType: 'image/png' }] : undefined,
       });
 
       if (result.success) {
         this.$q.notify({
           type: 'positive',
           message: this.$t('Shared'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       } else if (result.reason === 'unsupported' || result.reason === 'error') {
         if (result.reason === 'error') {
           console.error('Failed to share invoice:', result.error);
         }
-        // Fallback: copy to clipboard
+        // Fallback: copy the raw invoice so the user still has something.
         try {
           await navigator.clipboard.writeText(this.generatedInvoice.payment_request);
           this.$q.notify({
             type: 'positive',
             message: this.$t('Invoice copied'),
-
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           });
         } catch (copyError) {
           this.$q.notify({
             type: 'negative',
             message: this.$t('Couldn\'t share'),
-
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           });
         }
       }
-      // Don't do anything for 'cancelled' - user just closed the dialog
+      // 'cancelled' → user closed the dialog, no action needed.
     },
+
 
     /**
      * Handle when the payment confirmation screen is closed
@@ -1245,27 +2065,36 @@ export default {
   padding: 0;
 }
 
+/* Full-height bottom sheet: rounded top, a sliver of the wallet left
+   visible above so it reads as a sheet, not a page. */
 .receive-card {
   width: 100%;
-  height: 100%;
+  max-width: 100%;
+  height: calc(100dvh - var(--safe-top, 0px) - 10px);
   display: flex;
   flex-direction: column;
+  border-radius: 24px 24px 0 0;
+  overflow: hidden;
+}
+
+.sheet-grabber {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 2px;
+  flex-shrink: 0;
+}
+
+.grabber-bar {
+  width: 36px;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.35);
 }
 
 /* Header */
 .receive-header {
-  border-bottom: 1px solid;
-  padding: 0.75rem 1rem;
-  padding-top: calc(var(--safe-top, 0px) + 0.75rem);
+  padding: 0.25rem 1rem 0.5rem;
   flex-shrink: 0;
-}
-
-.header-dark {
-  border-bottom-color: #2A342A;
-}
-
-.header-light {
-  border-bottom-color: #E5E7EB;
 }
 
 .header-content {
@@ -1275,18 +2104,22 @@ export default {
   height: 44px;
 }
 
-.back-btn-dark {
-  color: #FFF;
-}
-
-.back-btn-light {
-  color: #212121;
-}
+/* The back circle itself comes from the shared .glass-back-btn utility
+   (src/css/app.css); the inline SVG keeps its per-theme fill. */
 
 .header-title {
   flex: 1;
   text-align: center;
   margin: 0 1rem;
+}
+
+/* Phantom right-side spacer that mirrors the back button's footprint, so
+   the centered title is visually centered on screen rather than centered
+   between the back button and the right edge. */
+.header-actions {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
 }
 
 .address-btn {
@@ -1299,6 +2132,9 @@ export default {
   flex: 1;
   display: flex;
   flex-direction: column;
+  width: 100%;
+  max-width: 28rem;
+  margin: 0 auto;
   padding: 1rem;
   overflow-y: auto;
   justify-content: space-between;
@@ -1337,15 +2173,39 @@ export default {
 }
 
 .qr-frame {
+  position: relative;
   background: #FFFFFF;
   padding: 14px;
   border-radius: var(--radius-md);
   box-shadow: 0 4px 20px rgba(0, 0, 0, 0.08);
 }
 
+/* No radius on the code itself: margin-0 modules reach the image edge and
+   rounding would shave the finder squares. The frame is the rounded part. */
 .qr-frame .qr-code {
   display: block;
-  border-radius: 8px;
+  border-radius: 0;
+}
+
+.qr-logo {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  width: 44px;
+  height: 44px;
+  align-items: center;
+  justify-content: center;
+  margin: auto;
+  padding: 6px;
+  border-radius: 10px;
+  background: #FFFFFF;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.10);
+}
+
+.qr-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .qr-hint {
@@ -1512,6 +2372,40 @@ export default {
   margin-top: 12px;
 }
 
+/* Default zero-amount loading state */
+.default-zero-loading {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 48px 16px;
+}
+.default-zero-loading-text {
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+/* 3-button row: icon above label, equal width. Used on default-QR views
+   (LN address, Spark Lightning zero-amount) for Redeem/Share/Amount.
+   `margin-top: auto` anchors the row to the bottom of its flex-column
+   parent so the QR sits up top and the actions live at the bottom edge. */
+.action-buttons-three {
+  width: 100%;
+  margin-top: auto;
+  padding-top: 16px;
+}
+.action-buttons-three .action-btn {
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 8px;
+  min-height: 68px;
+  font-size: 13px;
+}
+
 /* Share Invoice gradient button */
 .share-btn-gradient {
   display: inline-flex;
@@ -1533,13 +2427,19 @@ export default {
 }
 
 .action-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
+  justify-content: center;
   gap: 6px;
   padding: 10px 16px;
   border-radius: 10px;
+  border: none;
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
   font-size: 14px;
   font-weight: 500;
+  letter-spacing: -0.005em;
+  transition: background-color 0.18s ease, color 0.18s ease;
 }
 
 .action-btn-dark {
@@ -1588,7 +2488,7 @@ export default {
   display: inline-flex;
   align-items: center;
   gap: 0.5rem;
-  background: #E5E7EB;
+  background: var(--bg-input);
   padding: 0.375rem 0.75rem;
   border-radius: 16px;
   cursor: pointer;
@@ -1647,6 +2547,15 @@ export default {
   text-align: center;
   min-width: min(200px, 60vw);
   max-width: 100%;
+  /* Use the brand green for the caret so it signals interactivity
+     without clashing with the numeric display. */
+  caret-color: #15DE72;
+}
+/* Suppress the caret while the placeholder (e.g. "0") is showing
+   so the vertical bar doesn't visually slice through the digit.
+   As soon as the user types, the caret returns. */
+.amount-input:placeholder-shown {
+  caret-color: transparent;
 }
 
 .amount-input-dark {
@@ -1654,7 +2563,7 @@ export default {
 }
 
 .amount-input-light {
-  color: #374151;
+  color: var(--text-primary);
 }
 
 .amount-input::placeholder {
@@ -1706,7 +2615,11 @@ export default {
 
 /* Footer */
 .receive-footer {
-  padding: 1rem 1.5rem 1.5rem;
+  padding: 1rem 1.5rem;
+  /* var(--safe-bottom) so the Android boot fallback applies; env()
+     returns 0 on Android WebViews and would leave the CTA flush
+     against the gesture-nav bar. */
+  padding-bottom: max(1.5rem, var(--safe-bottom, 1.5rem));
   flex-shrink: 0;
 }
 
@@ -1716,33 +2629,63 @@ export default {
   gap: 12px;
 }
 
-.scan-withdraw-btn {
-  width: 52px;
-  height: 52px;
-  border-radius: 50%;
-  flex-shrink: 0;
-}
 
-.scan-btn-dark {
-  background: rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.7);
-}
 
-.scan-btn-light {
-  background: rgba(0, 0, 0, 0.05);
-  color: rgba(0, 0, 0, 0.5);
-}
 
+/* Primary CTA for the receive flow — tinted green fill, same
+   grammar as the Receive button on the wallet and the Spark/
+   Lightning/Bitcoin toggle's active state. Rounded to match the
+   app's card language (16px) rather than the old pill (24px). */
 .create-invoice-btn {
   width: 100%;
   height: 52px;
-  border-radius: 24px;
+  border-radius: 16px;
   font-family: 'Manrope', sans-serif;
-  font-size: 14px;
-  font-weight: 400;
-  transition: all 0.2s ease;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
   border: none;
   cursor: pointer;
+  transition:
+    background-color 0.18s ease,
+    color 0.18s ease,
+    box-shadow 0.18s ease,
+    transform 0.18s cubic-bezier(0.4, 0, 0.2, 1),
+    filter 0.18s ease;
+}
+
+.create-invoice-btn-dark {
+  background: rgba(21, 222, 114, 0.14) !important;
+  color: #15DE72 !important;
+  box-shadow: inset 0 0 0 1px rgba(21, 222, 114, 0.22);
+}
+
+.create-invoice-btn-light {
+  /* Neutralise to the shared "primary action on cream" style so
+     the invoice CTA carries the same weight as the wallet-home
+     Receive/Send pair it follows from. Dark theme keeps the green
+     tinted-wash above because it still reads as an accent there. */
+  background: var(--btn-neutral-bg) !important;
+  color: var(--btn-neutral-fg) !important;
+  box-shadow: none;
+}
+
+.create-invoice-btn:hover:not(:disabled) {
+  filter: brightness(1.06);
+}
+
+.create-invoice-btn:active:not(:disabled) {
+  transform: scale(0.98);
+  transition-duration: 0.08s;
+  filter: brightness(0.94);
+}
+
+/* Disabled state stays muted so newbies see clearly that an amount
+   is required before they can create the invoice. */
+.create-invoice-btn:disabled,
+.create-invoice-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* Responsive Design */
@@ -1795,7 +2738,8 @@ export default {
   }
 
   .receive-footer {
-    padding: 0.75rem 1rem 1.25rem;
+    padding: 0.75rem 1rem;
+    padding-bottom: max(1.25rem, var(--safe-bottom, 1.25rem));
   }
 
   .create-invoice-btn {
@@ -1847,52 +2791,214 @@ export default {
   min-height: 0;
 }
 
-/* Address Pill - Shared by Spark */
-.address-pill {
-  display: inline-flex;
+/* ==========================================
+   Unified receive: rail stack, CTA row, copy chooser and the amount
+   badge. Kept visually in sync with L1BitcoinReceive.vue (the Spark
+   unified view).
+   ========================================== */
+.rail-stack {
+  display: flex;
+  justify-content: center;
+  margin-top: 13px;
+}
+
+.rail-badge {
+  display: flex;
+  width: 34px;
+  height: 34px;
   align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-radius: 20px;
+  justify-content: center;
+  border-radius: 50%;
+  border: 2.5px solid transparent;
+}
+
+.rail-badge + .rail-badge {
+  margin-left: -9px;
+}
+
+.rail-badge img {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
+}
+
+.rail-badge-btc {
+  background: #F7931A;
+  color: #FFFFFF;
+}
+
+.rail-badge-light { background: #FFFFFF; }
+.rail-badge-dark  { background: #2A2A2A; }
+
+/* The ring wears the sheet's own surface color, so where badges overlap
+   the joint reads as a clean cutout instead of a stray white halo. */
+.rail-ring-light { border-color: var(--bg-card, #FAF7EF); }
+.rail-ring-dark  { border-color: var(--bg-card, #1A1A1A); }
+
+/* Centers the badge + code + rails in whatever space the header and the
+   bottom action row leave - the natural focus point on a phone. */
+.unified-hero {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  min-height: 0;
+}
+
+.hero-subhint {
+  margin-bottom: 10px;
+}
+
+.cta-row {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  align-self: stretch;
+  margin-top: 13px;
+  padding-bottom: max(10px, var(--safe-bottom, 0px));
+}
+
+.cta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 56px;
+  padding: 0;
+  border: 0;
+  background: none;
   cursor: pointer;
-  transition: all 0.2s ease;
-  margin: 12px auto 0;
+  font-family: 'Manrope', sans-serif;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.address-pill:active {
-  transform: scale(0.98);
+.cta:active .cta-circle {
+  transform: scale(0.94);
 }
 
-.pill-dark {
+.cta-circle {
+  display: flex;
+  width: 52px;
+  height: 52px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: transform 0.12s ease, background-color 0.18s ease;
+}
+
+.cta-circle-light { background: rgba(0, 0, 0, 0.05); color: rgba(0, 0, 0, 0.75); }
+.cta-circle-light:hover { background: rgba(0, 0, 0, 0.08); }
+.cta-circle-dark { background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.85); }
+.cta-circle-dark:hover { background: rgba(255, 255, 255, 0.12); }
+
+.cta-accent-light { background: rgba(247, 147, 26, 0.14); color: #B86E0F; }
+.cta-accent-light:hover { background: rgba(247, 147, 26, 0.20); }
+.cta-accent-dark { background: rgba(247, 147, 26, 0.18); color: #FBBF77; }
+.cta-accent-dark:hover { background: rgba(247, 147, 26, 0.24); }
+
+.cta-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.cta-label-light { color: rgba(0, 0, 0, 0.65); }
+.cta-label-dark  { color: rgba(255, 255, 255, 0.7); }
+
+/* Keypad footer's Redeem - the labeled sibling of the primary action. */
+.footer-redeem-btn {
+  height: 52px;
+  padding: 0 16px;
+  border-radius: 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.footer-redeem-light {
+  color: rgba(0, 0, 0, 0.65);
+  background: rgba(0, 0, 0, 0.05);
+}
+
+.footer-redeem-dark {
+  color: rgba(255, 255, 255, 0.75);
   background: rgba(255, 255, 255, 0.08);
 }
 
-.pill-dark:hover {
-  background: rgba(255, 255, 255, 0.12);
+.copy-menu {
+  min-width: 230px;
+  padding: 4px 0;
 }
 
-.pill-light {
-  background: rgba(0, 0, 0, 0.04);
+.copy-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 
-.pill-light:hover {
-  background: rgba(0, 0, 0, 0.06);
+.copy-item span {
+  font-size: 14px;
+  font-weight: 600;
 }
 
-.pill-icon-img {
-  width: 16px;
-  height: 16px;
-}
-
-.pill-address {
+.copy-item small {
   font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.02em;
+  font-size: 11px;
+  opacity: 0.55;
 }
 
-.pill-copy {
-  opacity: 0.4;
+
+.invoice-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  max-width: 100%;
+  margin-bottom: 13px;
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  -webkit-tap-highlight-color: transparent;
 }
+
+.invoice-badge:active { transform: scale(0.98); }
+
+.invoice-badge-light { background: rgba(0, 0, 0, 0.05); color: rgba(0, 0, 0, 0.85); }
+.invoice-badge-dark  { background: rgba(255, 255, 255, 0.10); color: rgba(255, 255, 255, 0.9); }
+
+.invoice-badge-amount {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.invoice-badge-fiat {
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.invoice-badge-note {
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+
+/* Address Pill - Shared by Spark */
+
+
+
+
+
+
+
+
 
 .address-hint {
   font-family: 'Manrope', sans-serif;
@@ -1960,11 +3066,6 @@ export default {
   transform: scale(0.98);
 }
 
-.address-icon {
-  color: #15DE72;
-  flex-shrink: 0;
-}
-
 .address-text-value {
   font-family: var(--font-mono);
   font-size: 13px;
@@ -2010,73 +3111,78 @@ export default {
 }
 
 /* Spark/Lightning Toggle */
-.receive-type-toggle {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 0.75rem;
-  margin-bottom: 1.5rem;
-}
 
-.type-toggle {
-  border-radius: 12px;
-  overflow: hidden;
-  max-width: 280px;
-  width: 100%;
-}
+/* Spark / Lightning / Bitcoin segmented control — compact row of
+   tabs: tight padding, icons tucked left of each label. Active
+   segment keeps the green tinted fill that matches the rest of the
+   receive flow. */
 
-.type-toggle :deep(.q-btn) {
-  font-family: 'Manrope', sans-serif;
-  font-size: 13px;
-  font-weight: 500;
-  padding: 0.625rem 1rem;
-  min-height: 40px;
-}
 
-.type-toggle :deep(.q-btn__content) {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-}
 
-.type-toggle :deep(.q-btn__content .q-icon) {
-  margin: 0;
-}
 
+
+/* Wipe Quasar's utility active fill so our grey pane wins */
+
+
+
+/* Hairline dividers sit in the 3px gap between segments
+   (margin-left on each btn after the first). Hidden next
+   to the active segment so the grey pane reads cleanly. */
+
+
+/* Kill Quasar's default pre-active overlay so tinted fills read
+   cleanly without a darkening wash over the top. */
+
+/* --- Dark --- */
 .toggle-dark {
   background: #1A1A1A;
-  border: 1px solid #2A342A;
+  border: 1px solid rgba(255, 255, 255, 0.04);
 }
 
 .toggle-dark :deep(.q-btn) {
-  color: #B0B0B0;
+  color: var(--text-muted);
+  background: transparent;
 }
 
 .toggle-dark :deep(.q-btn--active) {
-  background: linear-gradient(90deg, #059573, #15DE72);
-  color: #FFFFFF;
+  background: #2A2A2A !important;
+  color: #FFFFFF !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.18),
+    0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
+.toggle-dark :deep(.q-btn + .q-btn)::before {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* --- Light --- */
 .toggle-light {
-  background: #F3F4F6;
-  border: 1px solid #E5E7EB;
+  /* Warm container so the pill sits inside the cream family, not a cool island. */
+  background: var(--bg-input);
+  border: 1px solid var(--border-card);
 }
 
 .toggle-light :deep(.q-btn) {
-  color: #6B7280;
+  color: var(--text-secondary);
+  background: transparent;
 }
 
-.toggle-light :deep(.q-btn--active) {
-  background: linear-gradient(90deg, #059573, #15DE72);
-  color: #FFFFFF;
+/* Higher specificity (.q-btn.q-btn--active) beats Quasar's `.text-white`
+   class, which was making the active label invisible on the pill. */
+.toggle-light :deep(.q-btn.q-btn--active),
+.toggle-light :deep(.q-btn.q-btn--active.text-white) {
+  background: #FFFFFF !important;
+  color: var(--text-primary) !important;
+  box-shadow:
+    inset 0 0 0 1px var(--border-card),
+    0 1px 2px rgba(40, 34, 20, 0.08) !important;
 }
 
-.mode-hint {
-  font-family: 'Manrope', sans-serif;
-  font-size: 12px;
-  text-align: center;
+.toggle-light :deep(.q-btn + .q-btn)::before {
+  background: rgba(40, 34, 20, 0.12);
 }
+
 
 /* Spark Address Specific */
 .spark-icon {
@@ -2097,17 +3203,320 @@ export default {
 
 @media (max-width: 480px) {
   .type-toggle {
-    max-width: 260px;
+    max-width: 240px;
   }
 
   .type-toggle :deep(.q-btn) {
-    font-size: 12px;
-    padding: 0.5rem 0.75rem;
-    min-height: 36px;
+    font-size: 11px;
+    padding: 0 0.6rem;
+    min-height: 32px;
   }
 
   .spark-actions {
     max-width: 280px;
   }
+}
+
+/* ===========================================
+   In-app Keypad (Alby-inspired)
+   =========================================== */
+.keypad-view {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  padding-top: 0.5rem;
+  min-height: 0;
+}
+
+/* Amount display */
+.keypad-amount {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 1rem 0 0.5rem;
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.keypad-amount-primary {
+  font-family: 'Manrope', sans-serif;
+  font-size: 44px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1;
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 0.4rem;
+  /* primaryFontSize keeps the number on one line; never spill off-screen. */
+  max-width: 100%;
+  padding: 0 1rem;
+  box-sizing: border-box;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  transition: font-size 0.12s ease;
+}
+
+.keypad-amount-primary.keypad-amount-empty {
+  opacity: 0.35;
+}
+
+.keypad-amount-suffix {
+  font-size: 18px;
+  font-weight: 500;
+  letter-spacing: 0;
+  opacity: 0.6;
+}
+
+.keypad-amount-secondary {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 500;
+  padding: 0.4rem 0.8rem;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+  user-select: none;
+}
+
+.keypad-amount-secondary:active {
+  background: rgba(128, 128, 128, 0.12);
+}
+
+.keypad-swap-icon {
+  opacity: 0.6;
+}
+
+/* Description link / chip */
+.keypad-desc-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  background: transparent;
+  border: none;
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0.5rem 0.75rem;
+  border-radius: 8px;
+  transition: background-color 0.15s ease;
+}
+
+.keypad-desc-link:active {
+  background: rgba(128, 128, 128, 0.1);
+}
+
+.keypad-desc-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  border: none;
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 0.4rem 0.75rem;
+  border-radius: 999px;
+  max-width: 80%;
+}
+
+.desc-chip-light {
+  background: rgba(0, 0, 0, 0.06);
+  color: rgba(0, 0, 0, 0.75);
+}
+
+.desc-chip-dark {
+  background: rgba(255, 255, 255, 0.08);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.keypad-desc-chip-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 3x4 keypad grid */
+.keypad-grid {
+  width: 100%;
+  max-width: 360px;
+  margin-top: auto;
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.keypad-key {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60px;
+  border: none;
+  border-radius: 14px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  transition: background-color 0.12s ease, transform 0.08s ease;
+  user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.keypad-key:active {
+  transform: scale(0.96);
+}
+
+.keypad-key-light {
+  background: rgba(0, 0, 0, 0.04);
+  color: #1A1A1A;
+}
+
+.keypad-key-light:active {
+  background: rgba(0, 0, 0, 0.09);
+}
+
+.keypad-key-dark {
+  background: rgba(255, 255, 255, 0.06);
+  color: #FFFFFF;
+}
+
+.keypad-key-dark:active {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+@media (max-width: 360px) {
+  .keypad-amount-primary { font-size: 36px; }
+  .keypad-amount-suffix { font-size: 15px; }
+  .keypad-key { height: 52px; font-size: 22px; }
+}
+
+/* Description bottom sheet */
+.desc-sheet {
+  width: 100%;
+  border-top-left-radius: 18px;
+  border-top-right-radius: 18px;
+  padding-bottom: env(safe-area-inset-bottom, 0);
+}
+
+.desc-sheet-light { background: #FFFFFF; }
+.desc-sheet-dark { background: #1A1A1A; }
+
+.desc-sheet-section {
+  padding: 1.25rem 1rem 1rem;
+}
+
+.desc-sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+
+.desc-sheet-title {
+  font-family: 'Manrope', sans-serif;
+  font-size: 17px;
+  font-weight: 600;
+}
+
+.desc-sheet-input {
+  width: 100%;
+  height: 48px;
+  padding: 0 0.875rem;
+  border-radius: 12px;
+  border: none;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 500;
+  margin-bottom: 1rem;
+}
+
+.desc-sheet-input:focus {
+  outline: none;
+}
+
+.desc-sheet-save {
+  width: 100%;
+  height: 48px;
+  border-radius: 12px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+/* ─────────────────────────────────────────────────────────────
+   LUD-14 voucher summary: one line while a saved voucher holds money
+   ───────────────────────────────────────────────────────────── */
+.voucher-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: calc(100% - 32px);
+  min-height: 52px;
+  margin: 0 16px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--border-card);
+  border-radius: 16px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  text-align: left;
+  font-family: inherit;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.voucher-summary:active {
+  opacity: 0.85;
+}
+
+.voucher-summary:focus-visible {
+  outline: 2px solid var(--brand-accent);
+  outline-offset: 2px;
+}
+
+.voucher-summary-icon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--brand-accent-soft);
+  color: var(--brand-accent);
+}
+
+.voucher-summary-copy {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.voucher-summary-title {
+  font: 700 0.9375rem/1.3 'Manrope', sans-serif;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.voucher-summary-sub {
+  font: 0.8125rem/1.3 'Manrope', sans-serif;
+  color: var(--text-secondary);
+}
+
+.voucher-summary-chevron {
+  flex-shrink: 0;
+  color: var(--text-secondary);
 }
 </style>

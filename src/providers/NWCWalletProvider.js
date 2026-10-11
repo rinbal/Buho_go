@@ -13,6 +13,22 @@
 import { WalletProvider } from './WalletProvider';
 import { NostrWebLNProvider, NWCClient } from '@getalby/sdk';
 
+/**
+ * The settlement state of one NIP-47 transaction record.
+ *
+ * NIP-47 reports `state`: settled | pending | failed | accepted. "accepted"
+ * means a hold invoice the recipient has taken but not settled, so the money
+ * has not moved and it is not completed. A service that predates `state` is
+ * read from `settled_at` instead, which is set only once it has.
+ */
+function resolveNwcStatus(tx) {
+  const state = String(tx?.state || '').toLowerCase();
+  if (state === 'settled') return 'completed';
+  if (state === 'failed') return 'failed';
+  if (state) return 'pending';
+  return tx?.settled_at || tx?.settledAt ? 'completed' : 'pending';
+}
+
 export class NWCWalletProvider extends WalletProvider {
   constructor(walletId, walletData) {
     super(walletId, walletData);
@@ -131,7 +147,14 @@ export class NWCWalletProvider extends WalletProvider {
     try {
       const info = await this.nwc.getInfo();
 
-      // Extract lightning address from NWC URL if not in info
+      // Extract lightning address from NWC URL if not in info.
+      //
+      // LUD-09 receiver-side limitation: this lud16 address is served by the
+      // backend NWC wallet (e.g. Alby), not by BuhoGO — the app runs no HTTP
+      // server — so we cannot attach a `successAction` to payments received
+      // here. Any such message is configured in that wallet's own service. As
+      // the payer we still read and display a recipient's successAction (see
+      // payInvoice).
       let lightningAddress = info.lud16 || this.metadata.lud16;
       if (!lightningAddress && this.nwcUrl) {
         try {
@@ -166,7 +189,12 @@ export class NWCWalletProvider extends WalletProvider {
     try {
       const invoice = await this.nwc.makeInvoice({
         amount: amount,
-        description: description || 'BuhoGO Payment',
+        // @getalby/sdk's NostrWebLNProvider.makeInvoice only ever reads
+        // `defaultMemo` off this argument (see RequestInvoiceArgs in its
+        // webln.js) — a `description` key here is silently ignored, which is
+        // exactly why user-typed invoice descriptions were ending up empty
+        // (blank d-tag) in the bolt11 this method returned.
+        defaultMemo: description || 'BuhoGO Payment',
         expiry: expiry
       });
 
@@ -194,6 +222,12 @@ export class NWCWalletProvider extends WalletProvider {
 
       return {
         preimage: payment.preimage,
+        // Note: @getalby/sdk's NostrWebLNProvider.sendPayment strips
+        // `fees_paid` from the response (only `preimage` is returned).
+        // Kept here as a defensive fallback in case the SDK adds it
+        // back in a later version. Values come in sats — the WebLN
+        // wrapper does its own msats→sats conversion internally on
+        // every method that returns amounts (see `mapNip47TransactionToTransaction`).
         fee: payment.fees_paid || payment.feesPaid || 0,
         status: 'completed'
       };
@@ -302,27 +336,52 @@ export class NWCWalletProvider extends WalletProvider {
     this._ensureConnected();
 
     try {
-      // NWC may have limited transaction history support
+      // `from`/`until` are NIP-47 unix TIMESTAMPS bounding when a payment
+      // happened, not a row window. Passing the paging offset into them asked
+      // a spec-compliant service for the hundred seconds after 1 January 1970
+      // and got an empty list back, while `offset` was never sent at all.
       const transactions = await this.nwc.listTransactions({
-        from: offset,
-        until: offset + limit,
-        limit: limit,
-        unpaid: false,
-        type: undefined
+        limit,
+        offset,
+        unpaid: false
       });
 
       if (!transactions || !Array.isArray(transactions.transactions)) {
         return [];
       }
 
+      // `this.nwc` is `NostrWebLNProvider`, whose `listTransactions`
+      // already converts msats→sats internally via the SDK's
+      // `mapNip47TransactionToTransaction` helper before handing
+      // results to us. Values arrive in sats — no further unit
+      // conversion needed here.
+      //
+      // Spread the raw NIP-47 record first so nothing it carries (e.g. a
+      // description_hash, or a field a future SDK version adds) is lost,
+      // then layer the canonical names on top.
       return transactions.transactions.map(tx => ({
+        ...tx,
         id: tx.payment_hash || tx.paymentHash || tx.id,
-        type: tx.type === 'incoming' || tx.amount > 0 ? 'receive' : 'send',
+        // NIP-47 states the direction itself, and its `amount` is UNSIGNED.
+        // Falling back to `amount > 0` therefore matched every row, including
+        // sends, and reported a spent bitcoin as income.
+        type: tx.type === 'outgoing' ? 'send' : 'receive',
         amount: Math.abs(tx.amount || 0),
         timestamp: tx.settled_at || tx.settledAt || tx.created_at || tx.createdAt || null,
+        created_at: tx.created_at || tx.createdAt || null,
+        settled_at: tx.settled_at || tx.settledAt || null,
         description: tx.description || tx.memo || '',
-        status: tx.settled ? 'completed' : 'pending',
-        fee: tx.fees_paid || tx.feesPaid || 0
+        // NIP-47 reports `state`, one of settled | pending | failed | accepted.
+        // There is no `settled` boolean on the record (see the SDK's
+        // Nip47Transaction type), so reading one marked every payment pending
+        // and the report then dropped all of them as unsettled. `settled_at`
+        // is the fallback for a service that omits `state`.
+        status: resolveNwcStatus(tx),
+        fee: tx.fees_paid || tx.feesPaid || 0,
+        paymentHash: tx.payment_hash || tx.paymentHash || null,
+        preimage: tx.preimage || null,
+        bolt11: tx.invoice || tx.bolt11 || tx.payment_request || null,
+        descriptionHash: tx.description_hash || tx.descriptionHash || null
       }));
     } catch (error) {
       // Many NWC wallets don't support listTransactions

@@ -1,3 +1,4 @@
+import { assertPaymentInput } from './lud23.js';
 /**
  * Lightning Payment Service
  *
@@ -5,18 +6,58 @@
  * Supports Lightning invoices, Lightning addresses, and LNURL-pay.
  *
  * @requires @getalby/sdk - For NWC WebLN provider
- * @requires @getalby/lightning-tools - For Lightning address and invoice handling
+ * @requires @getalby/lightning-tools - For invoice decoding
  * @requires bech32 - For LNURL decoding
  */
 
 import { NostrWebLNProvider } from '@getalby/sdk';
-import { LightningAddress, Invoice } from '@getalby/lightning-tools';
+import { Invoice } from '@getalby/lightning-tools';
 import { bech32 } from 'bech32';
+import { parseSuccessAction } from './successAction.js';
+import { isStoreablePayLink } from './lnurlPay.js';
+import { lnurlGetJson } from './lnurlHttp.js';
+import {
+  isLightningAddress as isLightningAddressShared,
+  isLightningInvoice as isLightningInvoiceShared,
+  isLnurl as isLnurlShared,
+  stripWrapperScheme,
+} from './addressUtils';
 
 /**
  * LUD-17 URL scheme prefixes mapped to their LNURL type.
  * @see https://github.com/lnurl/luds/blob/luds/17.md
  */
+/**
+ * LNURL descriptions that identify nobody.
+ *
+ * LUD-06 says `text/plain` is what the payer is shown about this payment. A
+ * few providers send one fixed sentence to every payer of every one of their
+ * users, so it carries no information and simply occupies the line where the
+ * recipient's name belongs. npub.cash is the one that matters here, because
+ * it is the address BuhoGO hands to every new identity: without this filter a
+ * BuhoGO user paying another BuhoGO user reads "A cashu lightning address...
+ * Neat!" under the recipient's own name.
+ *
+ * Matched case-insensitively after trimming. Keep this list to descriptions
+ * that are genuinely constant per provider; anything that names the person,
+ * the shop or the item is real content and must survive.
+ */
+const GENERIC_LNURL_DESCRIPTIONS = new Set([
+  'a cashu lightning address... neat!',
+  'lnurl payment',
+  'lightning address',
+  'lightning payment',
+  'payment',
+  'invoice',
+]);
+
+/** True when a provider description tells the payer nothing about the payee. */
+export function isGenericLnurlDescription(text) {
+  const value = String(text || '').trim().toLowerCase();
+  if (!value) return true;
+  return GENERIC_LNURL_DESCRIPTIONS.has(value);
+}
+
 const LUD17_SCHEMES = {
   'lnurlp://': 'payRequest',
   'lnurlw://': 'withdrawRequest',
@@ -99,40 +140,11 @@ export class LightningPaymentService {
   // Payment Input Detection
   // ============================================================================
 
-  /**
-   * Detects if the input is a Lightning address (email-like format)
-   * @param {string} input - The input string to check
-   * @returns {boolean}
-   */
-  isLightningAddress(input) {
-    const pattern = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-    return pattern.test(input);
-  }
-
-  /**
-   * Detects if the input is an LNURL
-   * @param {string} input - The input string to check
-   * @returns {boolean}
-   */
-  isLNURL(input) {
-    const lower = input.toLowerCase();
-    return lower.startsWith('lnurl') || lower.startsWith('lightning:lnurl') || lower.startsWith('keyauth://');
-  }
-
-  /**
-   * Detects if the input is a Lightning invoice (BOLT11)
-   * @param {string} input - The input string to check
-   * @returns {boolean}
-   */
-  isLightningInvoice(input) {
-    const lower = input.toLowerCase().replace(/^lightning:/i, '');
-    return (
-      lower.startsWith('lnbc') ||   // Mainnet
-      lower.startsWith('lntb') ||   // Testnet
-      lower.startsWith('lnbcrt') || // Regtest
-      lower.startsWith('lntbs')     // Signet
-    );
-  }
+  // Input-type predicates delegate to the shared addressUtils module to keep
+  // recognition consistent across the app.
+  isLightningAddress(input) { return isLightningAddressShared(input); }
+  isLNURL(input)            { return isLnurlShared(input); }
+  isLightningInvoice(input) { return isLightningInvoiceShared(input); }
 
   /**
    * Validates and identifies the payment input type
@@ -145,29 +157,15 @@ export class LightningPaymentService {
     if (!cleanInput) {
       return { valid: false, error: 'Please enter a payment request' };
     }
-
-    // Check Lightning Address
-    if (/^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/.test(cleanInput)) {
+    if (isLightningAddressShared(cleanInput)) {
       return { valid: true, type: PaymentType.LIGHTNING_ADDRESS };
     }
-
-    // Check LNURL (could be pay or withdraw - determined after fetching endpoint)
-    const lowerInput = cleanInput.toLowerCase();
-    if (lowerInput.startsWith('lnurl') || lowerInput.startsWith('lightning:lnurl')) {
+    if (isLnurlShared(cleanInput)) {
       return { valid: true, type: 'lnurl' };
     }
-
-    // Check Lightning Invoice
-    const invoiceCheck = lowerInput.replace(/^lightning:/i, '');
-    if (
-      invoiceCheck.startsWith('lnbc') ||
-      invoiceCheck.startsWith('lntb') ||
-      invoiceCheck.startsWith('lnbcrt') ||
-      invoiceCheck.startsWith('lntbs')
-    ) {
+    if (isLightningInvoiceShared(cleanInput)) {
       return { valid: true, type: PaymentType.LIGHTNING_INVOICE };
     }
-
     return {
       valid: false,
       error: 'Invalid format. Please enter a Lightning invoice, LNURL, or Lightning address.',
@@ -185,6 +183,7 @@ export class LightningPaymentService {
    * @throws {Error} If the input format is invalid or processing fails
    */
   async processPaymentInput(input) {
+    assertPaymentInput(input);
     const cleanInput = (input || '').trim();
 
     if (this.isLightningAddress(cleanInput)) {
@@ -211,16 +210,29 @@ export class LightningPaymentService {
    */
   async handleLightningAddress(address) {
     try {
-      const ln = new LightningAddress(address);
-      await ln.fetch();
+      // Resolve the .well-known endpoint directly over the CORS-safe
+      // transport (no third-party proxy involved), same rails as the
+      // other wallet backends.
+      const [username, domain] = address.split('@');
+      if (!username || !domain) {
+        throw new Error('Invalid Lightning address format');
+      }
 
-      const lnurlpData = ln.lnurlpData;
-      if (!lnurlpData) {
+      const response = await lnurlGetJson(`https://${domain}/.well-known/lnurlp/${username}`);
+      if (!response.ok) {
         throw new Error('Failed to fetch Lightning Address data');
       }
 
-      const minSendable = lnurlpData.min || 1000;
-      const maxSendable = lnurlpData.max || 100000000000;
+      const data = response.data;
+      if (!data || data.status === 'ERROR') {
+        throw new Error(data?.reason || 'Failed to fetch Lightning Address data');
+      }
+      if (data.tag !== 'payRequest' || !data.callback) {
+        throw new Error('Failed to fetch Lightning Address data');
+      }
+
+      const minSendable = data.minSendable || 1000;
+      const maxSendable = data.maxSendable || 100000000000;
 
       // Detect fixed amount: when min equals max, it's a fixed amount request
       const isFixedAmount = minSendable === maxSendable;
@@ -238,9 +250,9 @@ export class LightningPaymentService {
         isFixedAmount,
         fixedAmountSats,
         amount: fixedAmountSats, // Pre-fill amount if fixed
-        commentAllowed: lnurlpData.commentAllowed || 0,
-        callback: lnurlpData.callback,
-        metadata: lnurlpData.metadata,
+        commentAllowed: data.commentAllowed || 0,
+        callback: data.callback,
+        metadata: data.metadata,
         description: `Payment to ${address}`,
       };
     } catch (error) {
@@ -255,19 +267,20 @@ export class LightningPaymentService {
    * @returns {Promise<Object>} Payment data with callback, minSendable, maxSendable, etc.
    */
   async handleLNURL(lnurlInput) {
+    assertPaymentInput(lnurlInput);
     try {
-      const cleanLnurl = lnurlInput.replace(/^lightning:/i, '');
+      const cleanLnurl = stripWrapperScheme(lnurlInput);
       const url = this.decodeLNURL(cleanLnurl);
 
-      const response = await fetch(url);
+      const response = await lnurlGetJson(url);
       if (!response.ok) {
-        throw new Error(`LNURL fetch failed: ${response.status} ${response.statusText}`);
+        throw new Error(`LNURL fetch failed: ${response.status}`);
       }
 
-      const data = await response.json();
+      const data = response.data;
 
-      if (data.status === 'ERROR') {
-        throw new Error(data.reason || 'LNURL request failed');
+      if (!data || data.status === 'ERROR') {
+        throw new Error(data?.reason || 'LNURL request failed');
       }
 
       if (data.tag !== 'payRequest') {
@@ -398,19 +411,45 @@ export class LightningPaymentService {
 
     this.validateAmount(amount, paymentData);
 
-    const ln = new LightningAddress(paymentData.address);
-    await ln.fetch();
-
-    const invoiceParams = {
-      satoshi: amount,
-    };
-
-    if (comment && paymentData.commentAllowed > 0) {
-      invoiceParams.comment = comment.substring(0, paymentData.commentAllowed);
+    // Resolve the LNURL-pay callback. Reuse the one captured when the address
+    // was first parsed; fall back to a live re-resolve if absent.
+    let callback = paymentData.callback;
+    let commentAllowed = paymentData.commentAllowed || 0;
+    if (!callback) {
+      const resolved = await this.handleLightningAddress(paymentData.address);
+      callback = resolved.callback;
+      commentAllowed = resolved.commentAllowed || 0;
+      if (!callback) {
+        throw new Error('Failed to resolve Lightning address');
+      }
     }
 
-    const invoiceResponse = await ln.requestInvoice(invoiceParams);
-    return this.nwc.sendPayment(invoiceResponse.paymentRequest);
+    // Fetch the invoice ourselves rather than via lightning-tools'
+    // requestInvoice, whose return shape omits `successAction` entirely.
+    // Reading the raw callback response lets us keep the LUD-09 message,
+    // including the `aes` variant.
+    const url = new URL(callback);
+    url.searchParams.set('amount', String(amount * 1000));
+    if (comment && commentAllowed > 0) {
+      url.searchParams.set('comment', comment.substring(0, commentAllowed));
+    }
+
+    const response = await lnurlGetJson(url.toString());
+    if (!response.ok) {
+      throw new Error(`LNURL callback failed: ${response.status}`);
+    }
+    const data = response.data || {};
+    if (data.status === 'ERROR') {
+      throw new Error(data.reason || 'Lightning address payment request failed');
+    }
+    if (!data.pr) {
+      throw new Error('No payment request received from Lightning address');
+    }
+
+    const result = await this.nwc.sendPayment(data.pr);
+    // Preserve the recipient's LUD-09 post-payment message so the caller can
+    // surface it once the payment settles.
+    return { ...result, successAction: parseSuccessAction(data.successAction, callback) };
   }
 
   /**
@@ -425,10 +464,16 @@ export class LightningPaymentService {
       throw new Error('Amount is required for LNURL payments');
     }
 
-    // Handle raw LNURL that needs decoding
+    // Handle raw LNURL that needs decoding. Carry the original bech32 string
+    // along: it is the only thing worth storing if the service turns out to
+    // be LUD-11 storeable, and the decoded params don't contain it.
     if (!paymentData.callback && paymentData.data) {
       const decoded = await this.handleLNURL(paymentData.data);
-      return this.payLNURL(decoded, amount, comment);
+      return this.payLNURL(
+        { ...decoded, lnurl: paymentData.lnurl || paymentData.data },
+        amount,
+        comment,
+      );
     }
 
     this.validateAmount(amount, paymentData);
@@ -441,12 +486,12 @@ export class LightningPaymentService {
       callbackUrl.searchParams.set('comment', comment.substring(0, paymentData.commentAllowed));
     }
 
-    const response = await fetch(callbackUrl.toString());
+    const response = await lnurlGetJson(callbackUrl.toString());
     if (!response.ok) {
-      throw new Error(`LNURL callback failed: ${response.status} ${response.statusText}`);
+      throw new Error(`LNURL callback failed: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = response.data || {};
 
     if (data.status === 'ERROR') {
       throw new Error(data.reason || 'LNURL payment request failed');
@@ -456,7 +501,17 @@ export class LightningPaymentService {
       throw new Error('No payment request received from LNURL callback');
     }
 
-    return this.nwc.sendPayment(data.pr);
+    const result = await this.nwc.sendPayment(data.pr);
+    // Preserve the LUD-09 successAction (recipient's post-payment message) so
+    // the caller can show it once the payment settles, and the LUD-11 verdict
+    // on the link itself: `disposable: false` means this LNURL may be kept and
+    // paid again, which is what Transaction Details offers later.
+    const sourceLnurl = paymentData.lnurl || paymentData.data || null;
+    return {
+      ...result,
+      successAction: parseSuccessAction(data.successAction, paymentData.callback),
+      payLink: (isStoreablePayLink(data) && sourceLnurl) ? sourceLnurl : null,
+    };
   }
 
   // ============================================================================
@@ -569,7 +624,7 @@ export class LightningPaymentService {
    * @throws {Error} If decoding fails
    */
   decodeLNURL(lnurl) {
-    const clean = lnurl.trim().replace(/^lightning:/i, '');
+    const clean = stripWrapperScheme(lnurl);
 
     // LUD-17: lnurlp://, lnurlw://, lnurlc://, keyauth://
     const lud17Url = resolveLUD17URL(clean);
@@ -593,13 +648,26 @@ export class LightningPaymentService {
   parseMetadataDescription(metadata) {
     try {
       const parsed = typeof metadata === 'string' ? JSON.parse(metadata) : metadata;
-      if (!Array.isArray(parsed)) {
-        return 'LNURL payment';
-      }
+      if (!Array.isArray(parsed)) return '';
+
       const textEntry = parsed.find((entry) => entry[0] === 'text/plain');
-      return textEntry ? textEntry[1] : 'LNURL payment';
+      const text = textEntry ? String(textEntry[1] || '').trim() : '';
+      if (!text) return '';
+
+      // The description is meant to tell the payer something about who or
+      // what they are paying. Some providers send the same sentence to every
+      // payer of every user, which tells them nothing and pushes the useful
+      // line (the resolved name) out of the way. Better to say nothing and
+      // let the row fall back to its own label.
+      const identifier = parsed.find(
+        (entry) => entry[0] === 'text/identifier' || entry[0] === 'text/email',
+      );
+      const address = identifier ? String(identifier[1] || '').trim() : '';
+      if (address && text.toLowerCase() === address.toLowerCase()) return '';
+
+      return isGenericLnurlDescription(text) ? '' : text;
     } catch {
-      return 'LNURL payment';
+      return '';
     }
   }
 

@@ -1,15 +1,494 @@
 /**
- * Address utility functions
- * Shared across components for consistent address handling
+ * Address & payment-identifier utilities.
+ *
+ * Single source of truth for recognizing the destination types BuhoGO
+ * supports. Duplicating these prefix lists / regexes across components has
+ * burned us before (e.g. a Spark validator that only knew `sp1` while the
+ * rest of the app accepted the full `spark1/sparkrt1/...` family), so every
+ * call site should import from here.
+ *
+ * Identifier families:
+ *   - Spark          — `sp1`, `tsp1`, `sprt1` (legacy) and
+ *                      `spark1`, `sparkrt1`, `sparkt1`, `sparks1`, `sparkl1` (bech32m)
+ *   - BOLT11 invoice — `lnbc` (mainnet), `lntb` (testnet), `lntbs` (signet),
+ *                      `lnbcrt` (regtest)
+ *   - BOLT12 offer   — `lno1…` (recognized so unsupported offers receive a
+ *                      clear explanation instead of a generic payment error)
+ *   - LNURL          — bech32 `lnurl1…` and LUD-17 URI schemes
+ *                      (`lnurlp://`, `lnurlw://`, `lnurlc://`, `keyauth://`)
+ *   - Bitcoin on-chain — mainnet `bc1…` / `1…` / `3…`,
+ *                        testnet  `tb1…` / `m…` / `n…` / `2…`
+ *
+ * Identifier casing: BOLT11, LNURL bech32, and Spark addresses are all
+ * case-insensitive per their respective specs; we lowercase before matching.
+ * Base58 addresses (legacy `1…` / `3…` etc.) are case-sensitive — we keep
+ * them as-is, and the regex uses the `/i` flag only for the bech32 arms.
  */
 
+import { bech32, bech32m } from 'bech32';
+import { extractLnFallbackParam } from './bip21.js';
+import { BOLT12_OFFER_HRP as BOLT12_OFFER_HRP_VALUE, isValidBolt12Offer } from './bolt12.js';
+
+// ----------------------------------------------------------------------------
+// Constants — exported so other modules can reuse them without re-typing
+// ----------------------------------------------------------------------------
+
+/** @readonly */
+export const SPARK_PREFIXES = Object.freeze([
+  // New Bech32m format
+  'spark1', 'sparkrt1', 'sparkt1', 'sparks1', 'sparkl1',
+  // Legacy format
+  'sp1', 'tsp1', 'sprt1',
+]);
+
 /**
- * Truncate an address for display
- * Shows first 10 and last 8 characters with ellipsis
- * @param {string} address - The full address
- * @param {number} startChars - Characters to show at start (default: 10)
- * @param {number} endChars - Characters to show at end (default: 8)
- * @returns {string} Truncated address or empty string if invalid
+ * Arkade (Ark L2) address prefixes. Bech32m, case-insensitive.
+ *   - `ark1`  — mainnet
+ *   - `tark1` — testnet / regtest
+ * See https://docs.arkadeos.com/wallets/getting-started/arkade-addresses
+ * @readonly
+ */
+export const ARKADE_PREFIXES = Object.freeze([
+  'ark1',   // mainnet
+  'tark1',  // testnet / regtest
+]);
+
+/** @readonly */
+export const LIGHTNING_INVOICE_HRPS = Object.freeze([
+  'lnbc',    // mainnet
+  'lntb',    // testnet
+  'lntbs',   // signet
+  'lnbcrt',  // regtest
+]);
+
+/** BOLT12 offers use the Bech32m HRP `lno`. @readonly */
+export const BOLT12_OFFER_HRP = BOLT12_OFFER_HRP_VALUE;
+
+/** @readonly */
+export const LNURL_PREFIXES = Object.freeze([
+  'lnurl1',       // bech32 LUD-01
+  'lnurlp://',    // LUD-17 pay
+  'lnurlw://',    // LUD-17 withdraw
+  'lnurlc://',    // LUD-17 channel
+  'keyauth://',   // LUD-17 auth
+]);
+
+// Bitcoin address regexes. Kept as plain RegExps (not a prefix list) because
+// length + character-set validation matters: a bare "1" or "3" byte must not
+// be misread as a P2PKH/P2SH address. Bech32 arms are case-insensitive; the
+// base58 arms explicitly exclude `0`, `O`, `l`, `I` per spec.
+const BITCOIN_BECH32_MAINNET = /^bc1[a-zA-HJ-NP-Z0-9]{39,62}$/i;
+const BITCOIN_BECH32_TESTNET = /^tb1[a-zA-HJ-NP-Z0-9]{39,62}$/i;
+const BITCOIN_BASE58_MAINNET = /^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/;
+const BITCOIN_BASE58_TESTNET = /^[mn2][a-km-zA-HJ-NP-Z1-9]{25,34}$/;
+
+// ----------------------------------------------------------------------------
+// Predicates
+// ----------------------------------------------------------------------------
+
+/**
+ * Defensive normalization used by case-insensitive predicates.
+ * Returns an empty string for non-string inputs so callers don't have to
+ * sprinkle `typeof` guards.
+ */
+function norm(value) {
+  return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+/**
+ * Strip a leading wrapper URI scheme (`lightning:` / `lnurl:`) down to the bare
+ * payload, case-insensitively. Real-world tags, QR codes and deep links carry
+ * the bech32 LNURL (or BOLT11) wrapped in one of these schemes; classification
+ * and bech32 decoding both need it gone first. Inputs without a wrapper are
+ * returned trimmed and otherwise untouched; non-strings yield an empty string.
+ *
+ * Payload casing is preserved: bech32 LNURL / BOLT11 are case-insensitive per
+ * spec, but base58 and some decoders are not, so we only remove the wrapper.
+ *
+ * Two deliberate exclusions keep this from clipping a real payload:
+ *   - LUD-17 schemes (`lnurlp://`, `lnurlw://`, `lnurlc://`, `keyauth://`) — the
+ *     scheme *is* the type. They diverge from `lnurl:` at the character after
+ *     `lnurl`, so the `lnurl:` check never matches them.
+ *   - the authority-style `lnurl://host` alias — stripping `lnurl:` there would
+ *     leave a dangling `//host`, so we only unwrap `lnurl:` when no `//` follows.
+ *
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function stripWrapperScheme(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  const lower = trimmed.toLowerCase();
+
+  // `lightning:` is always opaque (no `lightning://` form exists) — unwrap it.
+  if (lower.startsWith('lightning:')) {
+    return trimmed.slice('lightning:'.length).trim();
+  }
+
+  // `lnurl:` wraps a bare bech32 LNURL (`lnurl:LNURL1…`); skip `lnurl://…`.
+  if (lower.startsWith('lnurl:') && !lower.startsWith('lnurl://')) {
+    return trimmed.slice('lnurl:'.length).trim();
+  }
+
+  return trimmed;
+}
+
+/**
+ * True if the input is a BIP-352 Silent Payment address.
+ *
+ * These share Spark's legacy `sp1` / `tsp1` prefixes (both are bech32m
+ * with the `sp` / `tsp` HRP), so the prefix alone cannot tell them
+ * apart - the payload can. A silent payment address carries a version
+ * word plus a 66-byte payload (33-byte scan key + 33-byte spend key;
+ * future versions may only grow it), while a legacy Spark address is a
+ * bare 33-byte public key. We decode and check, so a checksum-valid
+ * silent payment address is recognized and a Spark address never is.
+ *
+ * Recognition only: no rail in the app can pay these yet (deriving the
+ * one-time output needs BIP-352 sender support the SDKs don't offer),
+ * but naming the format beats a misleading "cannot be read" error.
+ *
+ * @param {unknown} address
+ * @returns {boolean}
+ */
+export function isSilentPaymentAddress(address) {
+  const lower = norm(address);
+  if (!lower.startsWith('sp1') && !lower.startsWith('tsp1')) return false;
+  try {
+    const { prefix, words } = bech32m.decode(lower, 1023);
+    if (prefix !== 'sp' && prefix !== 'tsp') return false;
+    const version = words[0];
+    if (version === 31) return false; // forbidden by the BIP
+    const payload = bech32m.fromWords(words.slice(1));
+    if (version === 0) return payload.length === 66;
+    return version >= 1 && version <= 30 && payload.length >= 66;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * True if the input looks like a Spark address (any supported prefix).
+ * A valid Silent Payment address is excluded despite sharing the legacy
+ * `sp1`/`tsp1` prefixes - see isSilentPaymentAddress.
+ * @param {unknown} address
+ * @returns {boolean}
+ */
+export function isSparkAddress(address) {
+  const lower = norm(address);
+  if (!lower) return false;
+  if (!SPARK_PREFIXES.some(prefix => lower.startsWith(prefix))) return false;
+  return !isSilentPaymentAddress(lower);
+}
+
+/**
+ * True if the input looks like an Arkade address (`ark1…` / `tark1…`).
+ * Mirrors {@link isSparkAddress}: case-insensitive prefix match, the
+ * single source of truth for the Arkade fast-path branch in the factory
+ * and the address-type classification across the app.
+ * @param {unknown} address
+ * @returns {boolean}
+ */
+export function isArkadeAddress(address) {
+  const lower = norm(address);
+  if (!lower) return false;
+  return ARKADE_PREFIXES.some(prefix => lower.startsWith(prefix));
+}
+
+/**
+ * Extract the native-rail destinations a unified BIP21 URI offers.
+ *
+ * A unified receive QR can carry a `spark=` and/or `ark=` param next to the
+ * on-chain address and `lightning=` invoice (see composeUnifiedBip21 in
+ * bip21.js). A payer whose wallet speaks one of those rails natively can
+ * settle over it at zero / near-zero fee instead of paying the Lightning
+ * route. Values that do not look like an address of the right family are
+ * dropped — a stray param must never hijack the destination, only offer a
+ * cheaper road to it.
+ *
+ * Lives here (not bip21.js) because the address validators are this
+ * module's single source of truth, and bip21.js must stay import-free of
+ * us — addressUtils already imports extractLnFallbackParam from there.
+ *
+ * @param {{ params?: Record<string, string> } | null} parsed - parseBip21() result
+ * @returns {{ spark: string|null, ark: string|null }}
+ */
+export function nativeRailsFromBip21(parsed) {
+  const params = parsed?.params || {};
+  const spark = typeof params.spark === 'string' ? params.spark.trim() : '';
+  const ark = typeof params.ark === 'string' ? params.ark.trim() : '';
+  return {
+    spark: spark && isSparkAddress(spark) ? spark : null,
+    ark: ark && isArkadeAddress(ark) ? ark : null,
+  };
+}
+
+/**
+ * True if the input looks like a BOLT11 Lightning invoice.
+ * Accepts a leading `lightning:` URI prefix since real-world inputs often
+ * carry it (QR scans, deep links).
+ * @param {unknown} invoice
+ * @returns {boolean}
+ */
+export function isLightningInvoice(invoice) {
+  const lower = stripWrapperScheme(invoice).toLowerCase();
+  if (!lower) return false;
+  return LIGHTNING_INVOICE_HRPS.some(hrp => lower.startsWith(hrp));
+}
+
+/** Millisatoshis per unit of each BOLT11 amount multiplier (1 BTC = 1e11 msat). */
+const BOLT11_MULTIPLIER_MSAT = Object.freeze({ '': 100_000_000_000, m: 100_000_000, u: 100_000, n: 100, p: 0.1 });
+
+/**
+ * The amount a BOLT11 invoice asks for, in millisatoshis, read from its
+ * human-readable part (`lnbc10u1…` is 1,000 sats). No signature check: this
+ * answers "how much will this charge", not "is this invoice genuine".
+ *
+ * @param {unknown} invoice
+ * @returns {number|null} msat, or null for an amountless or unreadable invoice
+ */
+export function invoiceAmountMsat(invoice) {
+  const lower = stripWrapperScheme(invoice).toLowerCase();
+  const separator = lower.lastIndexOf('1');
+  if (separator < 0) return null;
+  const match = /^ln(?:bcrt|bc|tbs|tb)(\d+)([munp]?)$/.exec(lower.slice(0, separator));
+  if (!match) return null;
+  const [, digits, multiplier] = match;
+  if (multiplier === 'p' && !digits.endsWith('0')) return null; // not a whole msat
+  const msat = Number(digits) * BOLT11_MULTIPLIER_MSAT[multiplier];
+  return Number.isSafeInteger(Math.round(msat)) && msat > 0 ? Math.round(msat) : null;
+}
+
+/**
+ * True if the input looks like a BOLT12 offer. BOLT12 offers are not payable
+ * by BuhoGO yet, but recognizing them at every entry point lets the UI explain
+ * that safely before it tries to create a payment.
+ *
+ * Accepts the common `lightning:` wrapper used by QR codes and deep links.
+ * @param {unknown} offer
+ * @returns {boolean}
+ */
+export function isBolt12Offer(offer) {
+  return isValidBolt12Offer(stripWrapperScheme(offer));
+}
+
+/**
+ * True if the input looks like an LNURL (bech32 or LUD-17 scheme).
+ * A leading `lightning:` or `lnurl:` wrapper is tolerated.
+ * @param {unknown} lnurl
+ * @returns {boolean}
+ */
+export function isLnurl(lnurl) {
+  const lower = stripWrapperScheme(lnurl).toLowerCase();
+  if (!lower) return false;
+  return LNURL_PREFIXES.some(prefix => lower.startsWith(prefix));
+}
+
+/** LNURL bech32 strings are long; the library's default limit is for addresses. */
+const LNURL_BECH32_LIMIT = 16384;
+const ONION_HOST_RE = /^(?:[a-z2-7]{16}|[a-z2-7]{56})\.onion$/i;
+
+/**
+ * Decode any LNURL carrier to the service URL it names, or null.
+ *
+ * Accepts a bech32 `lnurl1…` (any case), a `lightning:` or `lnurl:` wrapper
+ * around one, a LUD-17 `lnurlp://` / `lnurlw://` / `lnurlc://` / `keyauth://`
+ * link, and a plain https URL (http only for a .onion host). The bech32
+ * checksum is verified. Credentials, fragments and any other scheme fail.
+ *
+ * @param {unknown} input
+ * @returns {string|null}
+ */
+export function lnurlToUrl(input) {
+  const clean = stripWrapperScheme(input);
+  if (!clean) return null;
+  const lower = clean.toLowerCase();
+  let url = null;
+
+  if (/^https?:\/\//i.test(clean)) {
+    url = clean;
+  } else if (LNURL_PREFIXES.some(prefix => prefix.endsWith('://') && lower.startsWith(prefix))) {
+    // LUD-17: the scheme names the tag; the transport is https, or http for Tor.
+    const rest = clean.slice(clean.indexOf('://') + 3);
+    const host = rest.split(/[/?#]/)[0];
+    url = `${ONION_HOST_RE.test(host) ? 'http' : 'https'}://${rest}`;
+  } else if (lower.startsWith('lnurl1')) {
+    try {
+      const { prefix, words } = bech32.decode(lower, LNURL_BECH32_LIMIT);
+      if (prefix !== 'lnurl') return null;
+      url = new TextDecoder().decode(new Uint8Array(bech32.fromWords(words)));
+    } catch {
+      return null;
+    }
+  } else {
+    return null;
+  }
+
+  try {
+    const parsed = new URL(url);
+    if (parsed.username || parsed.password || parsed.hash) return null;
+    const onion = ONION_HOST_RE.test(parsed.hostname);
+    if (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && onion)) return null;
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The one form an LNURL is stored in: lowercase LUD-01 bech32 of the service
+ * URL. Every carrier of the same link canonicalizes to the same string, so
+ * the address book's case-folding lookups match it, and a LUD-17 link's
+ * case-sensitive path survives (bech32 is case-insensitive by design).
+ * Idempotent. Null for anything that does not decode.
+ *
+ * @param {unknown} input
+ * @returns {string|null}
+ */
+export function canonicalLnurl(input) {
+  const url = lnurlToUrl(input);
+  if (!url) return null;
+  try {
+    return bech32.encode('lnurl', bech32.toWords(new TextEncoder().encode(url)), LNURL_BECH32_LIMIT);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The host an LNURL points at, for showing a service instead of a bech32
+ * blob. '' when the input does not decode.
+ * @param {unknown} input
+ * @returns {string}
+ */
+export function lnurlDomain(input) {
+  const url = lnurlToUrl(input);
+  if (!url) return '';
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * True if the input is a syntactically valid Bitcoin on-chain address
+ * (mainnet or testnet, bech32/bech32m or base58).
+ *
+ * NOTE: this is format validation only — it does not verify the bech32/base58
+ * checksum. Use a full decoder when you need cryptographic certainty.
+ *
+ * @param {unknown} address
+ * @returns {boolean}
+ */
+export function isBitcoinAddress(address) {
+  if (typeof address !== 'string') return false;
+  const trimmed = address.trim();
+  if (!trimmed) return false;
+  return (
+    BITCOIN_BECH32_MAINNET.test(trimmed) ||
+    BITCOIN_BECH32_TESTNET.test(trimmed) ||
+    BITCOIN_BASE58_MAINNET.test(trimmed) ||
+    BITCOIN_BASE58_TESTNET.test(trimmed)
+  );
+}
+
+/**
+ * True if the input looks like a Lightning address (user@domain.tld).
+ * Allows the full RFC-ish character set real wallets use in local parts.
+ * @param {unknown} address
+ * @returns {boolean}
+ */
+export function isLightningAddress(address) {
+  if (typeof address !== 'string') return false;
+  // Local part chars match what LUD-16 implementations use in the wild; the
+  // RFC 5321 grammar is stricter but every wallet we interop with is lax.
+  const pattern = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
+  return pattern.test(address.trim());
+}
+
+// ----------------------------------------------------------------------------
+// Back-compat aliases
+// ----------------------------------------------------------------------------
+// Pre-existing callers imported `isValidLightningAddress`, `isValidSparkAddress`,
+// `isValidBitcoinAddress`. Re-export the canonical predicates under those names
+// so the rename can happen opportunistically without a flag-day refactor.
+
+export const isValidLightningAddress = isLightningAddress;
+export const isValidSparkAddress = isSparkAddress;
+export const isValidArkadeAddress = isArkadeAddress;
+export const isValidBitcoinAddress = isBitcoinAddress;
+
+// ----------------------------------------------------------------------------
+// URI unwrapping
+// ----------------------------------------------------------------------------
+
+/**
+ * Unwrap the URI conventions wallets emit in QR codes (and the occasional
+ * deep link) down to the bare payment identifier, so the predicates above can
+ * classify it. Real-world QR scans rarely carry a naked address:
+ *
+ *   - BIP21        — `bitcoin:<address>?amount=…&label=…&lightning=…`
+ *                    Returns just `<address>` (the on-chain destination).
+ *                    A unified `bitcoin:?lightning=…` QR has no on-chain
+ *                    address, so this returns '' and the caller falls through
+ *                    to "not a saveable address".
+ *   - `lightning:` / `lnurl:` — deep-link wrapper schemes. Stripped so the
+ *                    LNURL / invoice / Lightning-address predicates see the
+ *                    bare payload. (See stripWrapperScheme for the exact rules.)
+ *
+ * Anything without a recognized scheme (a bare address, an `npub`, a
+ * `nostr:` URI) is returned trimmed and otherwise untouched — this function
+ * never tries to validate, only to unwrap.
+ *
+ * @param {unknown} raw
+ * @returns {string} the unwrapped identifier, or '' for non-strings / empties
+ */
+export function normalizePaymentAddress(raw) {
+  if (typeof raw !== 'string') return '';
+  const value = raw.trim();
+  if (!value) return '';
+
+  // BIP21: the on-chain address is everything between `bitcoin:` and the
+  // query string. Case-insensitive scheme; the address itself is left as-is
+  // (bech32 is case-insensitive, base58 is case-sensitive — don't touch it).
+  const bip21 = /^bitcoin:([^?]*)/i.exec(value);
+  if (bip21) {
+    let address = bip21[1].trim();
+    try {
+      address = decodeURIComponent(address);
+    } catch {
+      /* malformed %-escapes — keep the raw slice */
+    }
+    return address.trim();
+  }
+
+  // http(s) "fallback URL" carrying the LNURL in a `lightning=` query param
+  // (LNbits / Fossa ATMs, Phoenix, WoS, …). Extract the bare LNURL/invoice so
+  // the predicates can classify it; otherwise fall through to passthrough.
+  const lnFallback = extractLnFallbackParam(value);
+  if (lnFallback) return lnFallback;
+
+  // `lightning:` / `lnurl:` wrap a BOLT11 invoice or an LNURL. The predicates
+  // already tolerate these, but stripping here keeps the returned value
+  // canonical for any downstream consumer. (See stripWrapperScheme for the
+  // exact rules.)
+  return stripWrapperScheme(value);
+}
+
+// ----------------------------------------------------------------------------
+// Display helpers
+// ----------------------------------------------------------------------------
+
+/**
+ * Truncate an address for display.
+ * Shows the first `startChars` and last `endChars` with an ellipsis in
+ * between, or the original string if it is already short enough.
+ *
+ * @param {string} address
+ * @param {number} [startChars=10]
+ * @param {number} [endChars=8]
+ * @returns {string}
  */
 export function truncateAddress(address, startChars = 10, endChars = 8) {
   if (!address) return '';
@@ -19,37 +498,33 @@ export function truncateAddress(address, startChars = 10, endChars = 8) {
 }
 
 /**
- * Validate if a string looks like a valid Lightning address
- * @param {string} address - The address to validate
- * @returns {boolean}
+ * Split an address-like string into a part that may be shortened and a part
+ * that has to survive, so a list row can middle-truncate it in CSS instead of
+ * cutting the identifying end off.
+ *
+ * A Lightning address keeps its domain (that is what says *which* wallet paid
+ * out); an opaque token — npub, invoice, on-chain or Spark address — keeps its
+ * last characters, which is the part people compare against.
+ *
+ * Returns null for anything that reads as prose (a contact name, a memo).
+ * Those tail-truncate like any other label, the beginning being the part that
+ * identifies them.
+ *
+ * @param {string} value
+ * @returns {{ head: string, tail: string } | null}
  */
-export function isValidLightningAddress(address) {
-  if (!address || typeof address !== 'string') return false;
-  // Lightning address format: user@domain.com
-  const lightningAddressRegex = /^[a-zA-Z0-9._-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
-  return lightningAddressRegex.test(address);
-}
+export function splitAddressForDisplay(value) {
+  const text = String(value || '').trim();
+  if (!text || /\s/.test(text)) return null;
 
-/**
- * Validate if a string looks like a Spark address
- * @param {string} address - The address to validate
- * @returns {boolean}
- */
-export function isValidSparkAddress(address) {
-  if (!address || typeof address !== 'string') return false;
-  // Spark addresses start with 'sp1'
-  return address.startsWith('sp1') && address.length > 10;
-}
+  const at = text.lastIndexOf('@');
+  if (at > 0 && at < text.length - 1) {
+    return { head: text.slice(0, at), tail: text.slice(at) };
+  }
 
-/**
- * Validate if a string looks like a Bitcoin address
- * @param {string} address - The address to validate
- * @returns {boolean}
- */
-export function isValidBitcoinAddress(address) {
-  if (!address || typeof address !== 'string') return false;
-  // Basic validation for common Bitcoin address formats
-  // P2PKH (starts with 1), P2SH (starts with 3), Bech32 (starts with bc1)
-  const btcAddressRegex = /^(1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{39,59})$/;
-  return btcAddressRegex.test(address);
+  if (text.length > 24 && /^[a-z0-9]+$/i.test(text)) {
+    return { head: text.slice(0, -8), tail: text.slice(-8) };
+  }
+
+  return null;
 }

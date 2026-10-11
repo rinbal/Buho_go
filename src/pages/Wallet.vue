@@ -1,11 +1,38 @@
 <template>
   <q-page :class="$q.dark.isActive ? 'wallet-page-dark' : 'wallet-page-light'">
     <!-- Header -->
-    <q-toolbar>
+    <q-toolbar class="wallet-toolbar">
 
-      <q-avatar square size="30px">
-        <img src="buho_logo.svg" alt="Logo" class="app-logo">
-      </q-avatar>
+      <button
+        type="button"
+        class="app-logo-button"
+        :aria-label="updateStore.hasUpdate ? $t('Update available. Open update details.') : $t('About BuhoGO')"
+        @click="onAppLogoClick"
+      >
+        <q-avatar square size="30px">
+          <img src="buho_logo.svg" alt="" class="app-logo">
+        </q-avatar>
+        <transition name="update-pill">
+          <span v-if="updateStore.showLogoBadge" class="app-logo-update-pill" aria-hidden="true">+1</span>
+        </transition>
+      </button>
+
+      <BackupShortcut />
+
+      <!-- NFC-ready badge. Only shown on a device where NFC is actually
+           available + enabled, so it honestly signals "tap a Bolt Card / NFC
+           tag here". Tap it for a one-line explainer. -->
+      <button
+        v-if="nfcReady"
+        type="button"
+        class="nfc-badge wallet-toolbar-status"
+        :class="$q.dark.isActive ? 'nfc-badge-dark' : 'nfc-badge-light'"
+        @click="onNfcBadge"
+        aria-label="NFC ready"
+      >
+        <Icon icon="tabler:nfc" width="14" height="14" />
+        <span>NFC</span>
+      </button>
 
       <!-- Pending Bitcoin Deposits Chip (in header) -->
       <transition name="btc-banner-fade">
@@ -14,49 +41,90 @@
           clickable
           dense
           :ripple="false"
-          class="btc-chip"
+          class="btc-chip wallet-toolbar-status"
           :class="$q.dark.isActive ? 'btc-chip-dark' : 'btc-chip-light'"
           @click="openReceiveModalBitcoin"
         >
           <Icon icon="tabler:currency-bitcoin" width="20" height="20" class="q-mr-xs" />
-          {{ pendingBitcoinDeposits.some(d => d.confirmed) ? $t('Ready to claim') : $t('Incoming') }}
+          {{ $t(bitcoinDepositStatus) }}
         </q-chip>
       </transition>
 
       <q-space/>
+      <!-- The map keeps its own toolbar spot; everything else lives behind
+           the menu trigger as doors (settings, security, profile, spend,
+           address book, about). The bucket pill rides the trigger so new money
+           stays visible from home. -->
       <q-btn
         flat
-        round
         dense
-        class="float-right q-mr-sm"
+        class="float-right q-mr-xs"
         :class="$q.dark.isActive ? 'modern-menu-btn-dark' : 'modern-menu-btn-light'"
-        @click="$router.push('/settings')"
-        aria-label="Settings"
+        @click="$router.push('/map')"
+        aria-label="Bitcoin Map"
       >
-        <Icon icon="tabler:settings" width="18" height="18" />
+        <Icon icon="tabler:map" width="21" height="21" class="header-icon" />
       </q-btn>
       <q-btn
         flat
-        round
+        dense
         class="float-right"
-        :class="$q.dark.isActive ? 'dark-mode-btn-dark' : 'dark-mode-btn-light'"
-        @click="showAddressBookQuick = true"
-        padding="sm sm"
-        style="border-radius: 12px"
-        aria-label="Address Book"
+        :class="$q.dark.isActive ? 'modern-menu-btn-dark' : 'modern-menu-btn-light'"
+        :aria-label="menuButtonLabel"
+        :aria-expanded="showMenu ? 'true' : 'false'"
+        @click="showMenu = true"
       >
-        <Icon icon="tabler:address-book" width="18" height="18" />
+        <svg
+          width="22"
+          height="22"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.6"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M10 6h10M10 12h10M10 18h10M7 9l-3 3 3 3" />
+        </svg>
+        <span
+          v-if="socialBucketStore.hasUnseenPayments"
+          class="profile-money-pill"
+          aria-hidden="true"
+        >{{ bucketPaymentBadge }}</span>
       </q-btn>
     </q-toolbar>
 
+    <!-- Android offers a copied destination once until the clipboard changes.
+         Send opens the same confirmation flow as an explicit paste. -->
+    <ClipboardSuggestion :busy="clipboardResolving" @use="useClipboardDestination" />
+
+    <!-- The emergency exit door: shown only after Spark has been unreachable
+         for hours, never on a happy path. Dismissal lasts a day. -->
+    <ExitBanner
+      :visible="showExitBanner"
+      :outage="exitBannerOutage"
+      @open="openEmergencyExit"
+      @dismiss="dismissExitBanner"
+    />
+
     <!-- Backup Reminder Banner -->
+    <!-- Paused: the persistent keyring is the home backup entry point.
     <BackupBanner
-      :visible="walletStore.shouldPromptBackup && walletStore.isActiveWalletSpark"
+      :visible="walletStore.shouldPromptBackup && (walletStore.isActiveWalletSpark || walletStore.isActiveWalletArkade)"
       @backup="goToBackup"
       @dismiss="walletStore.dismissBackupPrompt()"
     />
+    -->
 
-    <!-- Skeleton Loading State -->
+    <!--
+      Loading state. One language across the app: a skeleton where content
+      will land, never a word standing in for it. It holds until the balance
+      is authoritative, for a returning user as much as a fresh install — a
+      figure carried over from the last session is a claim about someone's
+      money, and a cached zero would read as an empty wallet rather than as
+      "not fetched yet". A skeleton claims nothing.
+    -->
     <div v-if="showLoadingScreen" class="main-content">
       <!-- Wallet Chip skeleton -->
       <q-skeleton type="QChip" width="90px" height="28px" animation="wave" style="margin-bottom: 1rem; border-radius: 20px;" />
@@ -73,15 +141,26 @@
         </div>
       </div>
 
-      <!-- Transaction History Button skeleton -->
-      <div class="transaction-icon-section">
-        <q-skeleton type="circle" size="48px" animation="wave" />
+      <!-- Last transaction preview skeleton -->
+      <div class="last-tx-section">
+        <div class="last-tx-card-skeleton" :class="$q.dark.isActive ? 'last-tx-skeleton-dark' : 'last-tx-skeleton-light'">
+          <q-skeleton type="circle" size="36px" animation="wave" />
+          <div class="last-tx-card-skeleton-text">
+            <q-skeleton type="text" width="60%" height="14px" animation="wave" />
+            <q-skeleton type="text" width="40%" height="12px" animation="wave" />
+          </div>
+          <div class="last-tx-card-skeleton-amount">
+            <q-skeleton type="text" width="80px" height="14px" animation="wave" />
+            <q-skeleton type="text" width="56px" height="12px" animation="wave" />
+          </div>
+        </div>
+        <q-skeleton type="text" width="72px" height="14px" animation="wave" class="history-link-skeleton" />
       </div>
     </div>
 
     <!-- Main Content -->
     <div v-else class="main-content">
-      <!-- Wallet Name Badge -->
+      <!-- The active wallet's name, for every wallet type; opens the switcher. -->
       <q-chip
         v-if="activeWallet"
         clickable
@@ -89,67 +168,238 @@
         :ripple="false"
         class="wallet-chip"
         :class="$q.dark.isActive ? 'wallet-chip-dark' : 'wallet-chip-light'"
+        data-audit="wallet-switcher"
+        aria-haspopup="dialog"
+        :aria-label="`${$t('Switch Wallet')}, ${walletDisplayName}`"
         @click="openWalletManagement"
       >
-        <!-- Spark Logo -->
-        <svg v-if="activeWallet.type === 'spark'" width="12" height="11" viewBox="0 0 135 128" fill="none" xmlns="http://www.w3.org/2000/svg" class="wallet-chip-icon">
-          <path fill-rule="evenodd" clip-rule="evenodd" d="M79.4319 49.3554L81.7454 0H52.8438L55.1573 49.356L8.9311 31.9035L0 59.3906L47.6565 72.4425L16.7743 111.012L40.1562 128L67.2966 86.7083L94.4358 127.998L117.818 111.01L86.9359 72.4412L134.587 59.3907L125.656 31.9036L79.4319 49.3554Z" fill="currentColor"/>
-        </svg>
+        <!-- Spark mark -->
+        <WalletBrandMark v-if="activeWallet.type === 'spark'" type="spark" :size="12" color="currentColor" class="wallet-chip-icon" />
         <!-- NWC Logo -->
         <svg v-else-if="activeWallet.type === 'nwc'" width="12" height="12" viewBox="0 0 257 256" fill="none" xmlns="http://www.w3.org/2000/svg" class="wallet-chip-icon">
           <path d="M110.938 31.0639C100.704 20.8691 84.0846 20.9782 73.8873 31.2091L7.91341 97.4141C-2.28517 107.646 -2.15541 123.974 8.07554 134.17L116.246 242.34C126.479 252.534 143.066 252.449 153.263 242.218L185.415 210.066C176.038 219.443 168.322 212.701 159.178 203.595L141.244 185.662C127.63 191.051 111.718 188.374 100.688 177.365L87.0221 163.699C86.5623 163.243 86.2075 162.767 85.9582 162.17C85.7089 161.572 85.5803 160.931 85.5797 160.284C85.5792 159.637 85.7067 158.995 85.955 158.398C86.2033 157.8 86.5923 157.293 87.0513 156.837L94.7848 149.103L77.9497 132.268C75.3144 129.638 74.8841 125.391 77.2407 122.522C79.9345 119.228 84.8188 119.053 87.7741 122.002L104.837 139.051L116.394 127.494L99.5187 110.661C96.8822 108.03 96.4531 103.784 98.8298 100.895C99.4602 100.128 100.244 99.5006 101.131 99.0542C102.019 98.6077 102.989 98.3518 103.981 98.3028C104.973 98.2538 105.964 98.4129 106.891 98.7697C107.818 99.1266 108.66 99.6733 109.363 100.375L126.495 117.393L133.755 110.132C134.211 109.673 134.66 109.259 135.258 109.01C135.855 108.761 136.496 108.632 137.144 108.632C137.791 108.631 138.432 108.758 139.03 109.006C139.628 109.254 140.171 109.618 140.628 110.077L154.316 123.738C165.208 134.609 168.056 150.431 162.964 163.943L180.901 181.88C190.045 190.985 197.696 197.785 207.074 188.408L247.645 147.836C237.893 157.588 229.881 150.075 220.244 140.446L110.938 31.0639Z" fill="currentColor"/>
           <path d="M187.641 13.0273L153.153 47.4873L229.781 124.116C237.116 131.419 243.491 137.239 250.565 134.417C254.654 132.787 257.461 128.351 255.894 124.238C219.227 28.0253 219.212 28.0238 214.348 17.507C209.484 6.99014 195.804 4.76016 187.641 13.0273Z" fill="currentColor"/>
         </svg>
-        <!-- LNBits Logo -->
+        <!-- LNbits Logo -->
         <svg v-else-if="activeWallet.type === 'lnbits'" width="10" height="12" viewBox="0 0 502 902" fill="none" xmlns="http://www.w3.org/2000/svg" class="wallet-chip-icon">
           <path d="M158.566 493.857L1 901L450.49 355.202H264.831L501.791 1H187.881L36.4218 493.857H158.566Z" fill="currentColor"/>
         </svg>
+        <!-- Arkade brand mark -->
+        <ArkadeLogo v-else-if="activeWallet.type === 'arkade'" variant="mark" :size="14" class="wallet-chip-icon" />
         <!-- Default wallet icon -->
         <Icon v-else icon="tabler:wallet" width="12" height="12" class="wallet-chip-icon" />
         {{ walletDisplayName }}
         <Icon v-if="isAutoTransferActive" icon="tabler:send" width="10" height="10" class="aw-indicator-icon" />
+        <Icon icon="tabler:chevron-down" width="10" height="10" class="wallet-chip-disclosure" :aria-hidden="true" />
       </q-chip>
+
+      <!-- Subtle background-maintenance indicator (Arkade VTXO renew/recover) -->
+      <div
+        v-if="walletStore.arkadeMaintaining && walletStore.isActiveWalletArkade"
+        class="arkade-maintenance"
+      >
+        <q-spinner-dots size="14px" />
+        <span>{{ $t('Updating your wallet...') }}</span>
+      </div>
 
       <!-- Balance Display -->
       <div class="balance-section">
-        <div class="balance-container" @click="toggleCurrency" :class="{ 'switching': isSwitchingCurrency }">
+        <!--
+          Tap-to-cycle: Bitcoin → Fiat → Hidden → Bitcoin. One-thumb
+          UX that lets the user roll between the two unit views
+          they actually toggle AND a privacy peek without ever
+          opening Settings. The Hide Balance Quick Toggle and this
+          tap path share the same `walletStore.balanceHidden`
+          field, so flipping it from either surface keeps them in
+          sync.
+        -->
+        <div
+          v-balance-updating="balanceUpdating"
+          class="balance-container"
+          :class="{ 'switching': isSwitchingCurrency }"
+          @click="cycleBalanceDisplay"
+        >
           <div class="balance-amount">
-            <transition name="balance-fade" mode="out-in">
-              <div :key="currentDisplayMode" class="amount-display">
-                <span class="amount-number" :class="$q.dark.isActive ? 'amount-number-dark' : 'amount-number-light'">{{
-                    formatMainBalance(walletState.balance)
-                  }}</span>
-                <!-- Fiat icon on the right -->
-                <span v-if="currentDisplayMode === 'fiat'" class="currency-icon-right">
-                  <Icon :icon="getFiatCurrencyIcon()" width="28" height="28" :class="$q.dark.isActive ? 'amount-unit-dark' : 'amount-unit-light'" />
-                </span>
-              </div>
-            </transition>
+            <div class="amount-display">
+              <span
+                v-if="walletStore.balanceHidden"
+                class="amount-number amount-number-hidden"
+                :class="$q.dark.isActive ? 'amount-number-dark' : 'amount-number-light'"
+                :aria-label="$t('Balance hidden')"
+              >••••</span>
+              <!-- Nothing known for this wallet yet: a placeholder, never a
+                   0 that reads as an empty wallet (#293). -->
+              <span
+                v-else-if="activeBalanceState && !activeBalanceState.known"
+                class="amount-number"
+                :class="$q.dark.isActive ? 'amount-number-dark' : 'amount-number-light'"
+                :aria-label="$t('Balance not loaded yet')"
+              ><span class="balance-placeholder" aria-hidden="true" /></span>
+              <!-- No rate for the chosen currency: never a 0,00 that reads
+                   as an empty wallet. -->
+              <span
+                v-else-if="fiatRateMissing"
+                class="amount-number"
+                :class="$q.dark.isActive ? 'amount-number-dark' : 'amount-number-light'"
+                :title="$t('Fiat rates unavailable')"
+                :aria-label="$t('Fiat rates unavailable')"
+              >{{ balancePrefix }}--</span>
+              <NumberFlow
+                v-else
+                :key="walletStore.activeWalletId"
+                :value="balanceNumericValue"
+                :format="balanceNumberFormat"
+                :prefix="balancePrefix"
+                :suffix="balanceSuffix"
+                class="amount-number"
+                :class="[$q.dark.isActive ? 'amount-number-dark' : 'amount-number-light', { 'balance-stale': activeBalanceOutdated }]"
+                :title="activeBalanceOutdated ? $t('Last known balance — not current') : null"
+                :spin-timing="{ duration: 750, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' }"
+                :transform-timing="{ duration: 750, easing: 'cubic-bezier(0.16, 1, 0.3, 1)' }"
+              />
+            </div>
           </div>
           <transition name="secondary-fade" mode="out-in">
             <div :key="currentDisplayMode" class="balance-secondary"
                  :class="$q.dark.isActive ? 'balance-secondary-dark' : 'balance-secondary-light'">
-              <span v-if="secondaryValue" class="secondary-amount-display">
+              <span v-if="walletStore.balanceHidden" class="secondary-amount-display">
+                <span class="secondary-value">••••</span>
+              </span>
+              <span v-else-if="secondaryValue" class="secondary-amount-display">
                 <span class="secondary-value">{{ secondaryValue }}</span>
               </span>
               <span v-else class="loading-secondary">&nbsp;</span>
             </div>
           </transition>
         </div>
+
+        <!--
+          Funds the wallet holds but cannot spend yet. Without this line a
+          send that leaves change below the dust threshold makes the balance
+          read as empty, and the remainder looks lost until a recovery pass
+          reclaims it. Only rendered when there is something to explain.
+        -->
+        <div
+          v-if="unspendableSats > 0 && !walletStore.balanceHidden"
+          class="balance-unspendable"
+          :class="$q.dark.isActive ? 'balance-secondary-dark' : 'balance-secondary-light'"
+        >
+          <Icon icon="tabler:progress-check" width="13" height="13" />
+          <span>{{ unspendableLabel }}</span>
+        </div>
       </div>
 
-      <!-- Transaction History Icon -->
-      <div class="transaction-icon-section">
-        <q-btn
-          flat
-          round
-          size="md"
-          @click="$router.push('/transactions')"
-          :class="[$q.dark.isActive ? 'transaction-history-btn-dark' : 'transaction-history-btn-light', { 'pulse': shouldPulse }]"
-          aria-label="Transaction History"
+      <!--
+        Last-transaction preview + History link.
+
+        When a last transaction is available we show it as a tappable
+        card above the History link. When it's loading we show a
+        skeleton card. When there is no transaction we render only the
+        History link (no placeholder / empty-state copy here — the
+        /transactions page handles empty state itself).
+
+        Everything routes to /transactions; the card is just a richer,
+        more informative entry point than the old round icon button.
+      -->
+      <div class="last-tx-section">
+        <!-- Loading: skeleton -->
+        <div
+          v-if="isLoadingLastTransaction"
+          class="last-tx-card-skeleton"
+          :class="$q.dark.isActive ? 'last-tx-skeleton-dark' : 'last-tx-skeleton-light'"
         >
-          <Icon icon="tabler:history" width="20" height="20" />
-        </q-btn>
+          <q-skeleton type="circle" size="36px" animation="wave" />
+          <div class="last-tx-card-skeleton-text">
+            <q-skeleton type="text" width="60%" height="14px" animation="wave" />
+            <q-skeleton type="text" width="40%" height="12px" animation="wave" />
+          </div>
+          <div class="last-tx-card-skeleton-amount">
+            <q-skeleton type="text" width="80px" height="14px" animation="wave" />
+            <q-skeleton type="text" width="56px" height="12px" animation="wave" />
+          </div>
+        </div>
+
+        <!-- Loaded: the most recent transaction -->
+        <button
+          v-else-if="lastTransaction"
+          type="button"
+          class="last-tx-card"
+          :class="$q.dark.isActive ? 'last-tx-card-dark' : 'last-tx-card-light'"
+          @click="openTransactionHistory"
+          :aria-label="$t('Open transaction history')"
+        >
+          <!-- Avatar-first preview, same anatomy as the history list:
+               contact photo / counterparty picture (incl. a zapper's
+               relay profile) / silhouette, with the movement-type badge
+               riding the corner. -->
+          <span class="last-tx-avatar-wrap">
+            <ContactAvatar
+              v-if="lastTxContact"
+              class="last-tx-avatar"
+              :entry="lastTxContact"
+            />
+            <ContactAvatar
+              v-else-if="lastTxAvatarPicture"
+              class="last-tx-avatar"
+              :picture="lastTxAvatarPicture"
+              :entry="{ address: lastTxAvatarAddress }"
+              :name="lastTxHeading.kind === 'message' ? '' : lastTxHeading.text"
+            />
+            <ContactAvatar
+              v-else
+              class="last-tx-avatar"
+              :entry="{ address: lastTxAvatarAddress }"
+            />
+            <span
+              v-if="lastTxBadge"
+              class="last-tx-type-badge"
+              :class="lastTxBadge.cls"
+            >
+              <Icon :icon="lastTxBadge.icon" width="9" height="9" />
+            </span>
+          </span>
+          <span class="last-tx-info">
+            <!-- A message is quoted and unbolded so it reads as something
+                 someone wrote, never as a contact the user saved. -->
+            <span
+              class="last-tx-title"
+              :class="[
+                $q.dark.isActive ? 'last-tx-title-dark' : 'last-tx-title-light',
+                { 'last-tx-title-message': lastTxHeading.kind === 'message' }
+              ]"
+            >
+              <template v-if="lastTxHeading.kind === 'message'">&#8220;{{ lastTxHeading.text }}&#8221;</template>
+              <template v-else>{{ lastTxHeading.text }}</template>
+            </span>
+            <span class="last-tx-time" :class="$q.dark.isActive ? 'last-tx-muted-dark' : 'last-tx-muted-light'">
+              {{ lastTxTimeAgo }}
+            </span>
+          </span>
+          <span class="last-tx-amount-wrap">
+            <span class="last-tx-amount" :class="$q.dark.isActive ? 'last-tx-title-dark' : 'last-tx-title-light'">
+              <HiddenAmount>{{ lastTxAmountDisplay }}</HiddenAmount>
+            </span>
+            <span
+              v-if="lastTxFiatDisplay"
+              class="last-tx-fiat"
+              :class="$q.dark.isActive ? 'last-tx-muted-dark' : 'last-tx-muted-light'"
+            >
+              <HiddenAmount>{{ lastTxFiatDisplay }}</HiddenAmount>
+            </span>
+          </span>
+        </button>
+
+        <!-- Always: the History link row -->
+        <button
+          type="button"
+          class="history-link"
+          data-audit="history-link"
+          :class="$q.dark.isActive ? 'history-link-dark' : 'history-link-light'"
+          @click="openTransactionHistory"
+        >
+          <Icon icon="tabler:list" width="16" height="16" />
+          <span>{{ $t('History') }}</span>
+        </button>
       </div>
     </div>
 
@@ -157,24 +407,29 @@
     <div class="bottom-actions">
       <div class="action-buttons">
         <q-btn
-          :class="$q.dark.isActive ? 'action-btn receive-btn-dark' : 'action-btn receive-btn-light'"
-          @click="showReceiveModal = true"
+          class="action-btn action-btn-receive"
+          data-audit="fab-receive"
+          @click="openReceive"
           no-caps
           unelevated
-          aria-label="Receive payment"
+          :aria-label="withdrawVouchersStore.active.length ? $t('Receive payment, vouchers saved') : $t('Receive payment')"
         >
-          <Icon icon="tabler:arrow-down" width="24" height="24" />
-          <div class="btn-text">{{ $t('Receive') }}</div>
+          <Icon icon="tabler:qrcode" width="20" height="20" />
+          <!-- LUD-14: a saved voucher still holds money. A dot, no number:
+               it says "there is something here", never how much. -->
+          <span v-if="withdrawVouchersStore.active.length" class="action-dot" aria-hidden="true"></span>
+          <span class="btn-text">{{ $t('Receive') }}</span>
         </q-btn>
         <q-btn
-          :class="$q.dark.isActive ? 'action-btn send-btn-dark' : 'action-btn send-btn-light'"
-          @click="showSendModal = true"
+          class="action-btn action-btn-send"
+          data-audit="fab-send"
+          @click="openSend"
           no-caps
           unelevated
-          aria-label="Send payment"
+          :aria-label="$t('Send payment')"
         >
-          <Icon icon="tabler:arrow-up" width="24" height="24" />
-          <div class="btn-text">{{ $t('Send') }}</div>
+          <Icon icon="tabler:scan" width="20" height="20" />
+          <span class="btn-text">{{ $t('Send') }}</span>
         </q-btn>
       </div>
     </div>
@@ -183,159 +438,88 @@
     <ReceiveModal
       ref="receiveModal"
       v-model="showReceiveModal"
-      @invoice-created="onInvoiceCreated"
+      :vouchers="withdrawVouchersStore.active"
+      :total-voucher-sats="withdrawVouchersStore.activeTotalSats"
       @bitcoin-deposits-updated="handleBitcoinDepositsUpdated"
       @scan-withdraw="handleScanWithdraw"
+      :voucher-checking="withdrawVouchersStore.checking"
+      :voucher-display-sats="withdrawVouchersStore.displaySats"
+      @open-vouchers="openVouchers"
+      @redeem-voucher="redeemVoucher"
+      @remove-voucher="removeVoucher"
     />
 
     <!-- Send Modal -->
     <SendModal
+      ref="sendModal"
       v-model="showSendModal"
+      :resolving="sendResolving"
+      :resolve-error="sendResolveError"
+      @update:resolve-error="sendResolveError = $event"
       @payment-detected="onPaymentDetected"
+      @open-batch-send="showBatchSend = true"
     />
 
-    <!-- PIN Entry Dialog for Spark Wallet -->
-    <PinEntryDialog
-      v-model="showPinDialog"
-      :title="$t('Unlock Wallet')"
-      :subtitle="$t('Enter your PIN to unlock your Spark wallet')"
-      :error-message="pinError"
-      :loading="pinUnlocking"
-      @pin-complete="handlePinComplete"
-      @cancel="handlePinCancel"
+    <!-- Redeem scanner — the Receive modal's "Redeem" button opens the
+         scan surface directly (never a screen titled "Send"). Headline-free
+         per design direction; the bottom prompt carries the redeem context.
+         The decoded code routes through the canonical dispatcher, which
+         lands LNURL-withdraw on the redeem sheet. -->
+    <QrScanSheet
+      v-model="showRedeemScanner"
+      :prompt="$t('Scan the withdraw QR code')"
+      @scanned="onRedeemScanned"
     />
 
-    <!-- Wallet Switcher Dialog -->
-    <q-dialog v-model="showWalletSwitcher" :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'">
-      <q-card class="wallet-switcher-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section class="switcher-header">
-          <div class="switcher-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-            {{ $t('Switch Wallet') }}
-          </div>
-          <q-btn flat round dense v-close-popup
-                 :class="$q.dark.isActive ? 'close_btn_dark' : 'close_btn_light'">
-            <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 20 20" fill="none">
-              <path d="M15 5L5 15M5 5L15 15" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
-          </q-btn>
-        </q-card-section>
-
-        <q-card-section class="switcher-content">
-          <div class="wallet-switch-list">
-            <template
-              v-for="wallet in storeWallets"
-              :key="wallet.id"
-            >
-            <div
-              class="wallet-switch-card"
-              :class="{
-                'wallet-switch-card-active': wallet.id === storeActiveWalletId,
-                'wallet-switch-card-dark': $q.dark.isActive,
-                'wallet-switch-card-light': !$q.dark.isActive
-              }"
-              @click="switchToWallet(wallet.id)"
-            >
-              <!-- Avatar -->
-              <div class="switch-avatar">
-                <div class="switch-avatar-circle switch-avatar-black">
-                  <!-- Spark Logo -->
-                  <svg v-if="wallet.type === 'spark'" width="20" height="19" viewBox="0 0 135 128" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path fill-rule="evenodd" clip-rule="evenodd" d="M79.4319 49.3554L81.7454 0H52.8438L55.1573 49.356L8.9311 31.9035L0 59.3906L47.6565 72.4425L16.7743 111.012L40.1562 128L67.2966 86.7083L94.4358 127.998L117.818 111.01L86.9359 72.4412L134.587 59.3907L125.656 31.9036L79.4319 49.3554Z" fill="white"/>
-                  </svg>
-                  <!-- NWC Logo -->
-                  <svg v-else-if="wallet.type === 'nwc'" width="20" height="20" viewBox="0 0 257 256" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M110.938 31.0639C100.704 20.8691 84.0846 20.9782 73.8873 31.2091L7.91341 97.4141C-2.28517 107.646 -2.15541 123.974 8.07554 134.17L116.246 242.34C126.479 252.534 143.066 252.449 153.263 242.218L185.415 210.066C176.038 219.443 168.322 212.701 159.178 203.595L141.244 185.662C127.63 191.051 111.718 188.374 100.688 177.365L87.0221 163.699C86.5623 163.243 86.2075 162.767 85.9582 162.17C85.7089 161.572 85.5803 160.931 85.5797 160.284C85.5792 159.637 85.7067 158.995 85.955 158.398C86.2033 157.8 86.5923 157.293 87.0513 156.837L94.7848 149.103L77.9497 132.268C75.3144 129.638 74.8841 125.391 77.2407 122.522C79.9345 119.228 84.8188 119.053 87.7741 122.002L104.837 139.051L116.394 127.494L99.5187 110.661C96.8822 108.03 96.4531 103.784 98.8298 100.895C99.4602 100.128 100.244 99.5006 101.131 99.0542C102.019 98.6077 102.989 98.3518 103.981 98.3028C104.973 98.2538 105.964 98.4129 106.891 98.7697C107.818 99.1266 108.66 99.6733 109.363 100.375L126.495 117.393L133.755 110.132C134.211 109.673 134.66 109.259 135.258 109.01C135.855 108.761 136.496 108.632 137.144 108.632C137.791 108.631 138.432 108.758 139.03 109.006C139.628 109.254 140.171 109.618 140.628 110.077L154.316 123.738C165.208 134.609 168.056 150.431 162.964 163.943L180.901 181.88C190.045 190.985 197.696 197.785 207.074 188.408L247.645 147.836C237.893 157.588 229.881 150.075 220.244 140.446L110.938 31.0639Z" fill="url(#nwc_switch_grad)"/>
-                    <path d="M187.641 13.0273L153.153 47.4873L229.781 124.116C237.116 131.419 243.491 137.239 250.565 134.417C254.654 132.787 257.461 128.351 255.894 124.238C219.227 28.0253 219.212 28.0238 214.348 17.507C209.484 6.99014 195.804 4.76016 187.641 13.0273Z" fill="#897FFF"/>
-                    <defs>
-                      <linearGradient id="nwc_switch_grad" x1="123.989" y1="10.4384" x2="123.989" y2="249.939" gradientUnits="userSpaceOnUse">
-                        <stop stop-color="#FFCA4A"/>
-                        <stop offset="1" stop-color="#F7931A"/>
-                      </linearGradient>
-                    </defs>
-                  </svg>
-                  <!-- LNBits Logo -->
-                  <svg v-else-if="wallet.type === 'lnbits'" width="18" height="20" viewBox="0 0 502 902" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M158.566 493.857L1 901L450.49 355.202H264.831L501.791 1H187.881L36.4218 493.857H158.566Z" fill="#FF1FE1"/>
-                  </svg>
-                  <!-- Default wallet icon -->
-                  <Icon v-else icon="tabler:wallet" width="20" height="20" />
-                </div>
-                <div
-                  class="switch-status-dot"
-                  :class="storeConnectionStates[wallet.id]?.connected ? 'status-connected' : 'status-disconnected'"
-                ></div>
-              </div>
-
-              <!-- Details -->
-              <div class="switch-details">
-                <div class="switch-name" :class="$q.dark.isActive ? 'switch-name-dark' : 'switch-name-light'">
-                  {{ wallet.name }}
-                </div>
-                <div class="switch-meta-row">
-                  <div class="switch-type-badge" :class="getWalletTypeBadgeClass(wallet.type)">
-                    <!-- Spark mini logo -->
-                    <svg v-if="wallet.type === 'spark'" width="9" height="9" viewBox="0 0 135 128" fill="none" xmlns="http://www.w3.org/2000/svg">
-                      <path fill-rule="evenodd" clip-rule="evenodd" d="M79.4319 49.3554L81.7454 0H52.8438L55.1573 49.356L8.9311 31.9035L0 59.3906L47.6565 72.4425L16.7743 111.012L40.1562 128L67.2966 86.7083L94.4358 127.998L117.818 111.01L86.9359 72.4412L134.587 59.3907L125.656 31.9036L79.4319 49.3554Z" fill="currentColor"/>
-                    </svg>
-                    <!-- NWC mini logo -->
-                    <svg v-else-if="wallet.type === 'nwc'" width="9" height="9" viewBox="0 0 257 256" fill="none" xmlns="http://www.w3.org/2000/svg">
-                      <path d="M110.938 31.0639C100.704 20.8691 84.0846 20.9782 73.8873 31.2091L7.91341 97.4141C-2.28517 107.646 -2.15541 123.974 8.07554 134.17L116.246 242.34C126.479 252.534 143.066 252.449 153.263 242.218L185.415 210.066C176.038 219.443 168.322 212.701 159.178 203.595L141.244 185.662C127.63 191.051 111.718 188.374 100.688 177.365L87.0221 163.699C86.5623 163.243 86.2075 162.767 85.9582 162.17C85.7089 161.572 85.5803 160.931 85.5797 160.284C85.5792 159.637 85.7067 158.995 85.955 158.398C86.2033 157.8 86.5923 157.293 87.0513 156.837L94.7848 149.103L77.9497 132.268C75.3144 129.638 74.8841 125.391 77.2407 122.522C79.9345 119.228 84.8188 119.053 87.7741 122.002L104.837 139.051L116.394 127.494L99.5187 110.661C96.8822 108.03 96.4531 103.784 98.8298 100.895C99.4602 100.128 100.244 99.5006 101.131 99.0542C102.019 98.6077 102.989 98.3518 103.981 98.3028C104.973 98.2538 105.964 98.4129 106.891 98.7697C107.818 99.1266 108.66 99.6733 109.363 100.375L126.495 117.393L133.755 110.132C134.211 109.673 134.66 109.259 135.258 109.01C135.855 108.761 136.496 108.632 137.144 108.632C137.791 108.631 138.432 108.758 139.03 109.006C139.628 109.254 140.171 109.618 140.628 110.077L154.316 123.738C165.208 134.609 168.056 150.431 162.964 163.943L180.901 181.88C190.045 190.985 197.696 197.785 207.074 188.408L247.645 147.836C237.893 157.588 229.881 150.075 220.244 140.446L110.938 31.0639Z" fill="currentColor"/>
-                      <path d="M187.641 13.0273L153.153 47.4873L229.781 124.116C237.116 131.419 243.491 137.239 250.565 134.417C254.654 132.787 257.461 128.351 255.894 124.238C219.227 28.0253 219.212 28.0238 214.348 17.507C209.484 6.99014 195.804 4.76016 187.641 13.0273Z" fill="currentColor"/>
-                    </svg>
-                    <!-- LNBits mini logo -->
-                    <svg v-else-if="wallet.type === 'lnbits'" width="8" height="9" viewBox="0 0 502 902" fill="none" xmlns="http://www.w3.org/2000/svg">
-                      <path d="M158.566 493.857L1 901L450.49 355.202H264.831L501.791 1H187.881L36.4218 493.857H158.566Z" fill="currentColor"/>
-                    </svg>
-                    <Icon v-else icon="tabler:wallet" width="9" height="9" />
-                    <span>{{ getWalletTypeLabel(wallet.type) }}</span>
-                  </div>
-                  <div v-if="wallet.id === storeActiveWalletId" class="switch-tag tag-active">{{ $t('Active') }}</div>
-                </div>
-                <div class="switch-balance" :class="$q.dark.isActive ? 'switch-balance-dark' : 'switch-balance-light'">
-                  {{ formatBalance(storeBalances[wallet.id] || 0) }}
-                </div>
-              </div>
-
-              <!-- Check Icon -->
-              <Icon
-                v-if="wallet.id === storeActiveWalletId"
-                icon="tabler:circle-check"
-                width="20"
-                height="20"
-                class="switch-check-icon"
-              />
-            </div>
-
-            </template>
+    <!-- One-time PIN Migration Dialog (for existing users updating from PIN to device key) -->
+    <q-dialog v-model="showMigrationDialog" persistent :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'">
+      <q-card class="dialog-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'" style="max-width: 400px;">
+        <q-card-section>
+          <div class="dialog-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
+            {{ $t('Security Upgrade') }}
           </div>
         </q-card-section>
-
-        <q-card-section class="switcher-footer" :class="$q.dark.isActive ? 'switcher-footer-dark' : 'switcher-footer-light'">
-          <!-- Transfer Funds Button (only show if 2+ wallets) -->
-          <q-btn
-            v-if="storeWallets.length >= 2"
-            flat
-            no-caps
-            class="transfer-funds-btn"
-            :class="$q.dark.isActive ? 'transfer-btn-dark' : 'transfer-btn-light'"
-            @click="openTransferModal"
-          >
-            <Icon icon="tabler:arrows-exchange" width="20" height="20" class="q-mr-sm" />
-            {{ $t('Transfer Funds') }}
-          </q-btn>
+        <q-card-section>
+          <p :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'" style="font-size: 14px; margin-bottom: 16px;">
+            {{ $t('We\'ve replaced the in-app PIN with biometric security. Enter your PIN one last time to complete the upgrade.') }}
+          </p>
+          <q-input
+            v-model="migrationPin"
+            type="password"
+            :placeholder="$t('Your 6-digit PIN')"
+            maxlength="6"
+            mask="######"
+            :class="$q.dark.isActive ? 'search_bg' : 'search_light'"
+            borderless
+            input-class="q-px-md text-center"
+            dense
+            autofocus
+            :error="!!migrationError"
+            :error-message="migrationError"
+            @keyup.enter="handleMigration"
+          />
+        </q-card-section>
+        <q-card-actions align="right">
           <q-btn
             flat
             no-caps
-            class="manage-wallets-btn"
-            :class="$q.dark.isActive ? 'manage-btn-dark' : 'manage-btn-light'"
-            @click="goToSettings"
-          >
-            <Icon icon="tabler:settings" width="20" height="20" class="q-mr-sm" />
-            {{ $t('Manage Wallets') }}
-          </q-btn>
-        </q-card-section>
+            :label="$t('Unlock')"
+            :loading="isMigrating"
+            :disable="!migrationPin || migrationPin.length < 6"
+            @click="handleMigration"
+            class="dialog_add_btn_dark"
+          />
+        </q-card-actions>
       </q-card>
     </q-dialog>
+
+    <!-- Wallet Switcher Dialog -->
+    <WalletSwitcherSheet
+      v-model="showWalletSwitcher"
+      @switch="switchToWallet"
+      @transfer="openTransferModal"
+      @manage="goToSettings"
+    />
 
     <!-- Internal Transfer Modal -->
     <InternalTransferModal
@@ -343,12 +527,8 @@
       @transfer-complete="onTransferComplete"
     />
 
-    <!-- Address Book Quick Modal -->
-    <AddressBookQuickModal
-      v-model="showAddressBookQuick"
-      @pay-contact="handlePayContact"
-      @open-batch-send="showBatchSend = true"
-    />
+    <!-- Full-screen menu: settings / profile / spend / address book / about -->
+    <MenuOverlay v-model="showMenu" />
 
     <!-- Batch Send Modal -->
     <BatchSendModal
@@ -356,258 +536,105 @@
       @batch-completed="handleBatchCompleted"
     />
 
-    <!-- Contact Payment Modal -->
-    <PaymentModal
-      v-model="showContactPayment"
-      :contact="selectedPayContact"
-      @payment-sent="handleContactPaymentSent"
-      @bitcoin-payment-requested="handleBitcoinPaymentFromContact"
-    />
+    <!-- Shared confirmation sheet — used for both send (Lightning Address /
+         LNURL-Pay / invoice / Spark) and redeem (LNURL-Withdraw) flows.
+         Same component, different verb. Bitcoin on-chain still uses the
+         dialog below pending its own pass. -->
+    <PaymentConfirmSheet
+      ref="sendSheetRef"
+      v-model="showSendSheet"
+      :payment="paymentSheetProps"
+      :wallet-can-pay="paymentSheetWalletCanPay"
+      :wallet-hint="paymentSheetWalletHint"
+      :paying-wallets="payingWalletEntries"
+      :sending-wallet-id="sendingWalletId"
+      :paying-destination-type="pendingDestinationType"
+      :is-sending="isSendingPayment"
+      :is-complete="sendDidSucceed"
+      :commit-gate="sendSheetCommitGate"
+      @amount-changed="sendSheetAmountSats = $event"
+      @update:sending-wallet-id="onSendingWalletChange"
+      @confirm="onSendSheetConfirm"
+      @cancel="onSendSheetCancel"
+    >
+      <!-- Spark on-chain rides the shared sheet with the L1 fee machinery
+           in the extras slot: balance + Use all, per-speed SDK fee quote,
+           and the breakdown. The panel's gate blocks the slide until a
+           quote is selected and the total fits the balance. Balance and
+           quote belong to the wallet that pays, not necessarily the active one. -->
+      <template v-if="isSparkL1Payment" #extras>
+        <OnchainFeePanel
+          :amount-sats="sendSheetAmountSats"
+          :address="l1DestinationAddress"
+          :available-balance="sendingWalletBalance ?? 0"
+          :wallet-id="payerWalletId"
+          :disabled="isSendingPayment"
+          @update:fee="l1Fee = $event"
+          @use-max="$refs.sendSheetRef?.setAmountSats($event)"
+        />
+      </template>
+    </PaymentConfirmSheet>
 
-    <!-- Payment Confirmation Dialog -->
-    <q-dialog v-model="showPaymentConfirmation" :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'">
-      <q-card :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'" style="width: 500px; max-width: 95vw;">
-        <q-card-section :class="$q.dark.isActive ? 'dialog_header_dark' : 'dialog_header_light'">
-          <div :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-            {{ pendingPayment?.type === 'lnurl_withdraw' ? $t('Redeem Sats') : pendingPayment?.bitcoinAddress ? $t('Send Bitcoin') : $t('Confirm Payment') }}
-          </div>
-          <q-btn flat round dense v-close-popup
-                 :class="$q.dark.isActive ? 'close_btn_dark' : 'close_btn_light'">
-            <Icon icon="tabler:x" width="20" height="20" />
-          </q-btn>
-        </q-card-section>
-
-        <!-- Bitcoin Withdrawal UI -->
-        <q-card-section v-if="pendingPayment?.bitcoinAddress" class="bitcoin-withdraw-section">
-          <L1BitcoinWithdraw
-            :destination-address="pendingPayment.bitcoinAddress"
-            :available-balance="walletState.balance"
-            @withdrawal-complete="handleBitcoinWithdrawalComplete"
-            @withdrawal-error="handleBitcoinWithdrawalError"
-          />
-        </q-card-section>
-
-        <!-- LNURL-Withdraw UI -->
-        <q-card-section v-else-if="pendingPayment?.type === 'lnurl_withdraw'" class="payment-content">
-          <div class="payment-info">
-            <div class="payment-amount">
-              <div class="amount-display" :class="$q.dark.isActive ? 'amount_display_dark' : 'amount_display_light'">
-                {{ withdrawAmountDisplay }}
-              </div>
-              <div class="amount-fiat" :class="$q.dark.isActive ? 'amount_fiat_dark' : 'amount_fiat_light'"
-                   style="cursor: pointer;" @click="toggleWithdrawDenomination">
-                <span v-if="withdrawSecondaryDisplay">{{ withdrawSecondaryDisplay }} <Icon icon="tabler:refresh" width="12" height="12" :class="{ 'denomination-spin': denominationSpinning }" /></span>
-              </div>
-            </div>
-
-            <div class="payment-details" :class="$q.dark.isActive ? 'payment_details_dark' : 'payment_details_light'">
-              <div class="detail-item" v-if="pendingPayment.defaultDescription">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{ $t('Description') }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{ pendingPayment.defaultDescription }}</span>
-              </div>
-              <div class="detail-item">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{ $t('Type') }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{ $t('Withdrawal') }}</span>
-              </div>
-              <div class="detail-item" v-if="!pendingPayment.isFixedAmount">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{ $t('Redeemable') }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'" style="cursor: pointer;" @click="toggleWithdrawDenomination">
-                  {{ withdrawRedeemableRange }} <Icon icon="tabler:refresh" width="12" height="12" :class="{ 'denomination-spin': denominationSpinning }" />
-                </span>
-              </div>
-            </div>
-
-            <!-- Amount input for variable-amount withdraw -->
-            <div v-if="needsWithdrawAmountInput" class="amount-input-section">
-              <q-input
-                v-model="paymentAmount"
-                outlined
-                :label="withdrawDenomination === 'fiat' ? withdrawFiatCurrency : $t('Amount')"
-                type="number"
-                :class="$q.dark.isActive ? 'amount_input_dark' : 'amount_input_light'"
-                :rules="[val => validateWithdrawAmount(val)]"
-                :disable="lnurlWithdrawStatus !== 'idle'"
-              >
-                <template v-slot:append>
-                  <Icon icon="tabler:refresh" width="18" height="18"
-                    :class="{ 'denomination-spin': denominationSpinning }"
-                    class="denomination-toggle-icon"
-                    @click="toggleWithdrawDenomination"
-                  />
-                </template>
-              </q-input>
-            </div>
-
-            <!-- Status display during processing -->
-            <div v-if="lnurlWithdrawStatus !== 'idle'" class="withdraw-status-section q-mt-md" style="text-align: center;">
-              <q-spinner-dots v-if="lnurlWithdrawStatus !== 'error' && lnurlWithdrawStatus !== 'confirmed'" size="24px" class="q-mr-sm" />
-              <Icon v-else-if="lnurlWithdrawStatus === 'error'" icon="tabler:alert-circle" width="24" height="24" style="color: var(--q-negative);" class="q-mr-sm" />
-              <span :class="lnurlWithdrawStatus === 'error' ? 'text-negative' : ($q.dark.isActive ? 'text-grey-4' : 'text-grey-7')">
-                {{ withdrawStatusMessage }}
-              </span>
-            </div>
-          </div>
-        </q-card-section>
-
-        <!-- Regular Payment Confirmation -->
-        <q-card-section class="payment-content" v-else-if="pendingPayment">
-          <div class="payment-info">
-            <!-- SA Retailer Merchant Info -->
-            <div v-if="pendingPayment.merchant" class="merchant-info">
-              <div class="merchant-info-left">
-                <img :src="pendingPayment.merchant.logo" :alt="pendingPayment.merchant.displayName" class="merchant-logo" />
-                <div class="merchant-text">
-                  <div class="merchant-name">{{ pendingPayment.merchant.displayName }}</div>
-                  <div v-if="pendingPayment.zarAmount" class="merchant-zar">R{{ pendingPayment.zarAmount }}</div>
-                </div>
-              </div>
-              <div v-if="merchantCountdown > 0" class="merchant-countdown" :class="merchantCountdown <= 20 ? 'countdown-urgent' : ''">
-                <Icon icon="tabler:clock" width="14" height="14" />
-                {{ Math.floor(merchantCountdown / 60) }}:{{ String(merchantCountdown % 60).padStart(2, '0') }}
-              </div>
-            </div>
-
-            <div class="payment-amount">
-              <div class="amount-display" :class="$q.dark.isActive ? 'amount_display_dark' : 'amount_display_light'">
-                {{ formatPaymentAmount() }}
-              </div>
-              <div class="amount-fiat" :class="$q.dark.isActive ? 'amount_fiat_dark' : 'amount_fiat_light'"
-                   :style="needsAmountInput ? 'cursor: pointer;' : ''" @click="needsAmountInput ? toggleSendDenomination() : null">
-                <span v-if="paymentFiatValue">{{ paymentFiatValue }} <q-icon v-if="needsAmountInput" name="las la-sync" size="12px" :class="{ 'denomination-spin': denominationSpinning }" /></span>
-                <span v-else-if="pendingPayment && (pendingPayment.amount > 0 || paymentAmount)"
-                      class="loading-fiat">{{ $t('Loading...') }}</span>
-              </div>
-              <!-- Show ZAR equivalent if user's preferred currency is not ZAR -->
-              <div v-if="pendingPayment.zarAmount && walletState.preferredFiatCurrency !== 'ZAR'"
-                   class="amount-zar-secondary" :class="$q.dark.isActive ? 'amount_fiat_dark' : 'amount_fiat_light'">
-                R{{ pendingPayment.zarAmount }} ZAR
-              </div>
-            </div>
-
-            <!-- Rate staleness warning -->
-            <div v-if="pendingPayment.merchant && ratesStale" class="rate-warning">
-              <Icon icon="tabler:alert-triangle" width="14" height="14" />
-              {{ $t('Exchange rates may be outdated') }}
-            </div>
-
-            <div class="payment-details" :class="$q.dark.isActive ? 'payment_details_dark' : 'payment_details_light'">
-              <!-- Recipient (Lightning Address or Spark Address) - hide raw address for merchant payments -->
-              <div class="detail-item" v-if="(pendingPayment.lightningAddress || pendingPayment.sparkAddress) && !pendingPayment.merchant">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{
-                    $t('To')
-                  }}:</span>
-                <span class="detail-value recipient-address" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{
-                    pendingPayment.lightningAddress || pendingPayment.sparkAddress
-                  }}</span>
-              </div>
-              <!-- Show merchant name as recipient for SA retail payments -->
-              <div class="detail-item" v-else-if="pendingPayment.merchant">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{
-                    $t('To')
-                  }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{
-                    pendingPayment.merchant.displayName
-                  }}</span>
-              </div>
-              <div class="detail-item" v-if="pendingPayment.description">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{
-                    $t('Description')
-                  }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{
-                    pendingPayment.description
-                  }}</span>
-              </div>
-              <div class="detail-item">
-                <span class="detail-label"
-                      :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{ $t('Type') }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{
-                    getPaymentTypeLabel()
-                  }}</span>
-              </div>
-              <!-- Fee estimate for Spark Lightning payments -->
-              <div class="detail-item" v-if="showFeeEstimate">
-                <span class="detail-label"
-                      :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{ $t('Est. Fee') }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">
-                  <span v-if="isEstimatingFee" class="fee-loading">{{ $t('Estimating...') }}</span>
-                  <span v-else-if="estimatedFee !== null">{{ formatAmountInline(estimatedFee) }}</span>
-                  <span v-else-if="pendingPayment.sparkAddress" class="fee-free">{{ $t('Free (Spark transfer)') }}</span>
-                </span>
-              </div>
-              <!-- Amount range for variable-amount payments -->
-              <div class="detail-item" v-if="payAmountRange">
-                <span class="detail-label" :class="$q.dark.isActive ? 'detail_label_dark' : 'detail_label_light'">{{ $t('Amount range') }}:</span>
-                <span class="detail-value" :class="$q.dark.isActive ? 'detail_value_dark' : 'detail_value_light'">{{ payAmountRange }}</span>
-              </div>
-            </div>
-
-            <!-- Amount input for LNURL/Lightning Address -->
-            <div v-if="needsAmountInput" class="amount-input-section">
-              <q-input
-                v-model="paymentAmount"
-                outlined
-                :label="sendDenomination === 'fiat' ? preferredFiatCurrency : $t('Amount')"
-                type="number"
-                :class="$q.dark.isActive ? 'amount_input_dark' : 'amount_input_light'"
-                :rules="[validatePaymentAmount]"
-              >
-                <template v-slot:append>
-                  <Icon icon="tabler:refresh" width="18" height="18"
-                    :class="{ 'denomination-spin': denominationSpinning }"
-                    class="denomination-toggle-icon"
-                    @click="toggleSendDenomination"
-                  />
-                </template>
-              </q-input>
-
-              <q-input
-                v-if="pendingPayment.commentAllowed > 0"
-                v-model="paymentComment"
-                outlined
-                :label="$t('Comment (optional)')"
-                :maxlength="pendingPayment.commentAllowed"
-                :class="$q.dark.isActive ? 'comment_input_dark' : 'comment_input_light'"
-              />
-            </div>
-          </div>
-        </q-card-section>
-
-        <q-card-actions v-if="pendingPayment?.type !== 'lnurl_withdraw' || lnurlWithdrawStatus === 'idle'" align="right" class="payment-actions"
-                        :class="$q.dark.isActive ? 'payment_actions_dark' : 'payment_actions_light'">
-          <q-btn flat :label="$t('Cancel')" v-close-popup no-caps
-                 :class="$q.dark.isActive ? 'cancel_btn_dark' : 'cancel_btn_light'"
-                 @click="pendingPayment?.type === 'lnurl_withdraw' ? resetWithdrawState() : null"/>
-          <q-btn
-            v-if="pendingPayment?.type === 'lnurl_withdraw'"
-            flat
-            :label="$t('Redeem')"
-            no-caps
-            @click="executeWithdraw"
-            :disable="!canConfirmWithdraw"
-            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
-          />
-          <q-btn
-            v-else
-            flat
-            :label="$t('Send Payment')"
-            no-caps
-            @click="confirmPayment"
-            :loading="isSendingPayment"
-            :disable="!canConfirmPayment"
-            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
-          />
-        </q-card-actions>
-      </q-card>
-    </q-dialog>
+    <PaymentConfirmSheet
+      ref="withdrawSheetRef"
+      v-model="showWithdrawSheet"
+      :payment="withdrawSheetProps"
+      verb="redeem"
+      :is-sending="withdrawSheetIsBusy"
+      :status-message="withdrawSheetStatus"
+      :commit-gate="!withdrawUnavailableMessage"
+      @confirm="onWithdrawSheetConfirm"
+      @cancel="onWithdrawSheetCancel"
+    >
+      <template #extras>
+        <p v-if="walletDisplayName" class="withdraw-review-context">
+          {{ $t('Receiving wallet: {wallet}', { wallet: walletDisplayName }) }}
+        </p>
+        <p v-if="withdrawUnavailableMessage" class="withdraw-review-context" role="status">
+          {{ withdrawUnavailableMessage }}
+        </p>
+      </template>
+    </PaymentConfirmSheet>
 
     <!-- LNURL-Withdraw Success Screen -->
     <PaymentConfirmation
       v-model="showWithdrawSuccess"
       :amount="withdrawConfirmedAmount"
       :fiat-amount="withdrawConfirmedFiat"
+      :description="withdrawSuccessNote"
       label="Sats Received"
-      :auto-close-delay="5"
       @closed="onWithdrawSuccessClosed"
+    />
+
+    <WithdrawAuthorization ref="withdrawAuthorization" />
+
+    <!--
+      Send Success Screen.
+      Separate v-model from the withdraw success so the two surfaces
+      stay independent — a send completing and a withdraw landing
+      should never share lifecycle. The Save Contact button only
+      shows for new recipients (savable address not already in the
+      address book); tapping it opens the save-contact dialog.
+    -->
+    <PaymentConfirmation
+      v-model="showSendSuccess"
+      :amount="sendSuccessAmount"
+      :fiat-amount="sendSuccessFiat"
+      :recipient="sendSuccessRecipient"
+      :label="sendSuccessLabel"
+      :show-save-contact="sendSuccessShowSaveContact"
+      :success-action="sendSuccessAction"
+      :delivery-status="sendDeliveryStatus"
+      @closed="onSendSuccessClosed"
+      @save-contact-clicked="onSendSaveContactClicked"
+    />
+
+    <!-- LUD-04 (LNURL-auth) identity dialog. Mounted at the wallet page
+         level so deep-link, QR scan, and pasted-input flows all funnel
+         into the same confirm → sign → submit → record pipeline. -->
+    <IdentityAuthDialog
+      v-model="showIdentityAuthDialog"
+      :challenge="identityAuthChallenge"
     />
 
     <!-- Save Contact Dialog -->
@@ -629,14 +656,38 @@
         </q-card-section>
 
         <q-card-section class="save-contact-content">
+          <!-- Preserve the identity the user just confirmed. Nostr recipients
+               keep their fetched avatar (or the contact silhouette); fiat
+               payout recipients keep the provider mark. -->
+          <div
+            v-if="saveContactData.nostrIdentity || saveContactData.service || saveContactServiceLogo"
+            class="save-contact-avatar-wrap"
+          >
+            <!-- A service shows its LUD-06 logo (local registry, by address)
+                 or the storefront glyph; the entry is passed so the avatar
+                 resolves both the same way the address book will. -->
+            <ContactAvatar
+              v-if="saveContactData.nostrIdentity || saveContactData.service"
+              class="save-contact-avatar"
+              :entry="saveContactData"
+              :picture="saveContactNostrPicture"
+              :name="saveContactData.name"
+            />
+            <img
+              v-else
+              :src="saveContactServiceLogo"
+              class="save-contact-avatar"
+              alt=""
+            />
+          </div>
           <div class="save-contact-address" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
             <Icon
-              :icon="saveContactData.addressType === 'spark' ? 'tabler:flame' : 'tabler:bolt'"
+              :icon="saveContactData.service ? 'tabler:storefront' : (saveContactData.addressType === 'spark' ? 'tabler:flame' : 'tabler:bolt')"
               width="16" height="16"
-              :style="{ color: saveContactData.addressType === 'spark' ? '#4caf50' : '#ffc107' }"
+              :style="saveContactData.service ? null : { color: saveContactData.addressType === 'spark' ? '#4caf50' : '#ffc107' }"
               class="q-mr-xs"
             />
-            <span class="address-preview">{{ truncateAddress(saveContactData.address) }}</span>
+            <span class="address-preview">{{ saveContactData.service ? saveContactData.service.domain : truncateAddress(saveContactData.address) }}</span>
           </div>
 
           <q-input
@@ -683,123 +734,283 @@
 </template>
 
 <script>
+import { offerAddressRequest } from '../services/addressRequestIntake.js';
+import { assertPaymentInput } from '../utils/lud23.js';
+import { withdrawInfo, withdrawRecipient } from '../utils/lnurlWithdraw.js';
+import { fetchLnurlRequest, safeWithdrawError } from '../services/lnurlWithdraw.js';
 import { NostrWebLNProvider } from "@getalby/sdk";
 import {LightningPaymentService, resolveLUD17URL} from '../utils/lightning.js';
+import {parseSuccessAction, resolveSuccessAction} from '../utils/successAction.js';
+import {validateVerifyUrl, pollVerify} from '../utils/lnurlVerify.js';
+import {lnurlFetch, lnurlGetJson} from '../utils/lnurlHttp.js';
+import {classifyTransportFailure} from '../utils/userErrors.js';
+import {buildLnurlPayCallbackUrl, isStoreablePayLink} from '../utils/lnurlPay.js';
+import {parsePayRequestMetadata, serviceTitle, normalizeServiceImage, serviceIdentity} from '../utils/lnurlMetadata.js';
+import {isLightningInvoice as isLightningInvoiceShared, isLightningAddress as isLightningAddressShared, stripWrapperScheme, nativeRailsFromBip21, canonicalLnurl, lnurlDomain} from '../utils/addressUtils.js';
+// One rule for "what is this string", shared with the Send field and the
+// home clipboard strip, so resolving from Home can't disagree with the sheet.
+import {classifyDestination, normalizeDestination} from '../utils/clipboardSuggestion.js';
+import {classifyIdentifier} from '../utils/nostrLookup.js';
+import {canWalletPay, walletSwitchHint} from '../utils/walletCapabilities.js';
+import {
+  PAYING_REASON,
+  listPayingWallets,
+  pickDefaultPayingWallet,
+  knownFeeReserveSats,
+  payingWalletHint,
+} from '../utils/payingWallets.js';
+import {
+  decodeSparkDestination,
+  sparkInvoiceProblem,
+  identityPublicKeyFromSparkAddress,
+} from '../utils/sparkPayment.js';
+import {zapInfoFromTx} from '../utils/zaps.js';
+import {getTxMessage} from '../utils/txMessage.js';
+import {zapperDisplayName, zapperPicture} from '../services/zapperProfiles.js';
+import {NOSTRICH_HEAD_ICON} from '../utils/nostrIcon.js';
+import { Capacitor } from '@capacitor/core';
+import {matchLnAddressService, formatPhoneHandle, recognizePhoneNumber} from '../services/lnAddressServices';
+import {matchWalletBrand} from '../services/walletBrands';
+import {npubFromLightningAddress, shortenNpub, profileDisplayName, sanitizeImageUrl} from '../services/nostrRecipient';
+import {fetchProfile, parseProfileContent, DEFAULT_FETCH_TIMEOUT_MS} from '../utils/nostrFetch.js';
+import {resolveNostrLightningTarget} from '../services/nostrPaymentTarget';
 import {Invoice} from '@getalby/lightning-tools';
+import {parseLightningInvoice} from '../utils/lightningInvoice.js';
 import {fiatRatesService} from '../utils/fiatRates.js';
+import {fiatSymbol} from '../utils/fiatCurrencies.js';
 import {formatMainBalance as formatMainBalanceUtil, formatAmount} from '../utils/amountFormatting.js';
+import {haptics} from '../utils/haptics.js';
+import {isNfcAvailable} from '../utils/nfc.js';
+import NumberFlow from '@number-flow/vue';
+import HiddenAmount from '../components/HiddenAmount.vue';
+import balanceUpdating from '../directives/balanceUpdating.js';
 import {createPaymentMonitor, PaymentStatus, checkNWCPaymentStatus} from '../utils/paymentMonitor.js';
 import PaymentConfirmation from '../components/PaymentConfirmation.vue';
+import WithdrawAuthorization from '../components/WithdrawAuthorization.vue';
 import {useWalletStore} from '../stores/wallet';
+import {useUpdateStore} from '../stores/update';
 import {useAddressBookStore} from '../stores/addressBook';
+import {useTransactionMetadataStore} from '../stores/transactionMetadata';
+import {normalizeTx} from '../services/txNormalizer.js';
 import ReceiveModal from '../components/ReceiveModal.vue';
 import SendModal from '../components/SendModal.vue';
-import PinEntryDialog from '../components/PinEntryDialog.vue';
-import L1BitcoinWithdraw from '../components/L1BitcoinWithdraw.vue';
+import QrScanSheet from '../components/QrScanSheet.vue';
+import {parsePaymentDestination} from '../providers/WalletFactory';
+import OnchainFeePanel from '../components/OnchainFeePanel.vue';
+import {describeL1WithdrawError} from '../utils/l1WithdrawErrors.js';
+import {parseBip21, bip21AmountToSats} from '../utils/bip21.js';
 import InternalTransferModal from '../components/InternalTransferModal.vue';
-import AddressBookQuickModal from '../components/AddressBookQuickModal.vue';
-import PaymentModal from '../components/PaymentModal.vue';
+import MenuOverlay from '../components/MenuOverlay.vue';
+import ArkadeLogo from '../components/ArkadeLogo.vue';
+import WalletBrandMark from '../components/WalletBrandMark.vue';
+import WalletSwitcherSheet from '../components/wallets/WalletSwitcherSheet.vue';
+import PaymentConfirmSheet from '../components/PaymentConfirmSheet.vue';
+import ContactAvatar from '../components/AddressBook/ContactAvatar.vue';
 import BatchSendModal from '../components/BatchSendModal.vue';
 import BackupBanner from '../components/BackupBanner.vue';
+import BackupShortcut from '../components/BackupShortcut.vue';
+import ExitBanner from '../components/exit/ExitBanner.vue';
+import { sparkHealth } from '../utils/sparkHealth.js';
+import { durationText as exitDurationText } from '../composables/useExitFormat.js';
+import ClipboardSuggestion from '../components/ClipboardSuggestion.vue';
+import IdentityAuthDialog from '../components/IdentityAuthDialog.vue';
 import {useAutoWithdrawStore} from '../stores/autoWithdraw';
+import {useWithdrawVouchersStore} from '../stores/withdrawVouchers';
+import {useServiceImagesStore} from '../stores/serviceImages';
+import {useIdentityStore} from '../stores/identity';
+import {useSocialBucketStore} from '../stores/socialBucket';
+import {LUD04_ERROR, parseLud04Input, looksLikeLud04} from '../utils/lud4.js';
+import {fingerprintToGradient as identityFingerprintToGradient} from '../utils/identityCrypto.js';
+import {
+  useBitcoinPreferencesStore,
+  BITCOIN_DEPOSIT_POLL_MS
+} from '../stores/bitcoinPreferences';
+import { useBitcoinDepositsStore } from '../stores/bitcoinDeposits';
 import {SA_RETAIL_SOURCE, parseZARFromMetadata} from '../utils/merchantQR.js';
+import {lookupBrantaVerification, BRANTA_LOOKUP_TIMEOUT_MS} from '../utils/branta.js';
+import { readCachedTransactions, mergeCachedTransactions } from '../utils/txCache.js';
+import { EventBus } from '../utils/eventBus.js';
+
+function emptySaveContactData() {
+  return {
+    address: '',
+    addressType: 'lightning',
+    name: '',
+    notes: '',
+    amountSats: 0,
+    // Present only when the payment carried a verified Nostr profile.
+    // Keeping it nested makes the manual-contact fallback explicit.
+    nostrIdentity: null,
+    // Present only for a LUD-11 storeable service (name, identifier, domain).
+    service: null,
+    // The wallet that sent the payment this contact follows, so the pending
+    // link is stamped on that wallet's history (not whichever is active when
+    // the user finally taps Save).
+    walletId: null,
+  };
+}
 
 export default {
   name: 'WalletPage',
   components: {
+    WalletBrandMark,
+    WalletSwitcherSheet,
     ReceiveModal,
     SendModal,
-    PinEntryDialog,
-    L1BitcoinWithdraw,
+    QrScanSheet,
+    ArkadeLogo,
+    OnchainFeePanel,
     InternalTransferModal,
-    AddressBookQuickModal,
-    PaymentModal,
+    MenuOverlay,
+    PaymentConfirmSheet,
     BatchSendModal,
     PaymentConfirmation,
-    BackupBanner
+    NumberFlow,
+    HiddenAmount,
+    BackupBanner,
+    BackupShortcut,
+    ExitBanner,
+    ClipboardSuggestion,
+    IdentityAuthDialog,
+    ContactAvatar,
+    WithdrawAuthorization,
   },
+  directives: { balanceUpdating },
   setup() {
     const walletStore = useWalletStore();
     const addressBookStore = useAddressBookStore();
-    return { walletStore, addressBookStore };
+    const transactionMetadataStore = useTransactionMetadataStore();
+    const bitcoinPrefsStore = useBitcoinPreferencesStore();
+    const identityStore = useIdentityStore();
+    const updateStore = useUpdateStore();
+    const socialBucketStore = useSocialBucketStore();
+    const withdrawVouchersStore = useWithdrawVouchersStore();
+    const serviceImagesStore = useServiceImagesStore();
+    return {
+      bitcoinDepositsStore: useBitcoinDepositsStore(),
+      serviceImagesStore,
+      walletStore,
+      addressBookStore,
+      transactionMetadataStore,
+      bitcoinPrefsStore,
+      identityStore,
+      socialBucketStore,
+      updateStore,
+      withdrawVouchersStore,
+    };
   },
   data() {
     return {
-      walletState: {
-        balance: 312,
-        connectedWallets: [],
-        activeWalletId: null,
-        currency: 'sats',
-        currencies: ['sats', 'btc', 'usd'],
-        exchangeRates: {},
-        lastRateUpdate: null,
-        preferredFiatCurrency: 'USD',
-        denominationCurrency: 'bitcoin',
-        displayMode: 'bitcoin'
-      },
-      recentTransactions: [],
+      // Emergency exit door state: re-evaluated on each balance tick.
+      exitHealthTick: 0,
+      exitBannerDismissedUntil: Number(localStorage.getItem('buhoGO_exit_banner_dismissed_until') || 0),
+      // True only on a device where NFC is available + enabled — drives the
+      // small "NFC ready" badge next to the logo.
+      nfcReady: false,
+
+      // Spark tab switching
+
+      // Wallet switcher: per-wallet refresh start time (ms), 0 when idle
+
+      // PIN migration (one-time, for existing users)
+      showMigrationDialog: false,
+      migrationPin: '',
+      migrationError: '',
+      isMigrating: false,
+
+      // Last transaction preview shown above the History link.
+      // `null` before the first fetch completes (we render a skeleton
+      // instead while `isLoadingLastTransaction` is true). Populated
+      // with the raw provider tx object; formatting happens in
+      // computed properties.
+      lastTransaction: null,
+      isLoadingLastTransaction: true,
+
       showReceiveModal: false,
       showSendModal: false,
-      showPaymentConfirmation: false,
+      showRedeemScanner: false,
+      // Drives the Send sheet's loading CTA + inline error while we fetch and
+      // validate a destination it emitted (before the confirm sheet opens).
+      sendResolving: false,
+      sendResolveError: '',
+      // True while a destination taken from the home clipboard strip is
+      // resolving with no sheet up: the strip itself shows the wait, and
+      // the confirm sheet is the next surface the user sees.
+      clipboardResolving: false,
+      // Prevent a late voucher check from overwriting a newer receipt.
+      withdrawReceiptVersion: 0,
+      // One line on the withdraw success screen when the sweep came from a
+      // saved voucher: what is left, and where to find it.
+      withdrawSuccessNote: '',
+      // PaymentConfirmSheet flags. Both paths use the same shared sheet
+      // component — the only difference is the `verb` prop (send vs
+      // redeem) which switches all the labels, and the payload shape
+      // built by the corresponding `*SheetProps` computed below.
+      showSendSheet: false,
+      showWithdrawSheet: false,
+      // Set when a withdraw is initiated from the Receive modal's "Redeem"
+      // button, which closes the modal before the scan happens. Carried into
+      // the redeem sheet by onPaymentDetected (then cleared), so the amount
+      // the user already entered survives the modal handoff.
+      pendingWithdrawTargetSats: null,
+      // Spark on-chain state: the sheet's live amount (drives the fee
+      // panel's per-amount quote) and the panel's selected quote (the
+      // commit gate + the withdrawToL1 parameters).
+      sendSheetAmountSats: 0,
+      l1Fee: null,
+      // "Pay with": the wallet that pays the payment on screen. null means no
+      // choice was made, which is the active wallet - the pipeline's behaviour
+      // before the field existed. Set when a payment is detected (a caller's
+      // pick, else the default pick) and changed only by the field; it never
+      // changes which wallet is active.
+      sendingWalletId: null,
       pendingPayment: null,
       merchantCountdown: 0,
       merchantCountdownTimer: null,
       paymentAmount: '',
       paymentComment: '',
-      sendDenomination: 'sats', // 'sats' or 'fiat' — for LNURL/Lightning Address send flow
-      slidePosition: 0,
-      slideConfirmed: false,
-      isSliding: false,
-      slideStartX: 0,
-      maxSlideDistance: 0,
-      parsedInvoice: null,
-      lightningAddress: '',
-      generatedInvoice: null,
+      // Currency mode for the user-entered amount when bridging into
+      // confirmPayment / executeWithdraw. PaymentConfirmSheet always
+      // emits in sats and the bridge handlers leave this at 'sats',
+      // but the field stays so the legacy validation paths
+      // (validatePaymentAmount, sendAmountSats) keep their fiat branch
+      // available in case future callers feed in fiat values directly.
+      sendDenomination: 'sats',
+      // LUD-21 currency extension: when the sender denominated in the
+      // recipient's local currency, the { code, amount } to request via Option A
+      // (recipient gets the exact local amount). null for ordinary sats sends.
+      sendPayout: null,
       refreshInterval: null,
-      pulseInterval: null,
-      currentInvoicePaymentHash: null,
-      invoiceCheckInterval: null,
-      waitingForPayment: false,
       showLoadingScreen: true,
-      currentDisplayMode: 'bitcoin',
+      currentDisplayMode: null, // set from store in created()
       isSwitchingCurrency: false,
-      shouldPulse: false,
-      paymentData: null,
-      invoicePaid: false,
       isSendingPayment: false,
+      // True for the brief completion beat after a send succeeds — drives the
+      // CTA's fill-to-100% + checkmark before the success screen appears.
+      sendDidSucceed: false,
       fiatRatesLoaded: false,
       secondaryValue: '',
-      paymentFiatValue: '',
       showWalletSwitcher: false,
-      showPinDialog: false,
-      pinError: '',
-      pinUnlocking: false,
       // Fee estimation for Spark Lightning payments
       estimatedFee: null,
       isEstimatingFee: false,
       // Save-to-contacts after payment
       showSaveContactDialog: false,
-      saveContactData: {
-        address: '',
-        addressType: 'lightning',
-        name: '',
-        notes: ''
-      },
+      // amountSats lets the post-save handler link the freshly created
+      // contact to the outgoing transaction on the next list refresh.
+      saveContactData: emptySaveContactData(),
       // L1 Bitcoin pending deposits
       pendingBitcoinDeposits: [],
+      bitcoinDepositRead: 0,
       bitcoinDepositPollingInterval: null,
       // Internal transfer modal
       showTransferModal: false,
       // Address Book Quick Modal
-      showAddressBookQuick: false,
+      showMenu: false,
       // Batch Send Modal
       showBatchSend: false,
       // Contact Payment Modal
-      showContactPayment: false,
-      selectedPayContact: null,
       // LNURL-Withdraw state
-      withdrawDenomination: 'sats', // 'sats' or 'fiat'
-      denominationSpinning: false,
       lnurlWithdrawStatus: 'idle',
       lnurlWithdrawError: null,
       lnurlWithdrawInvoice: null,
@@ -807,14 +1018,353 @@ export default {
       withdrawSparkUnsubscribe: null,
       showWithdrawSuccess: false,
       withdrawConfirmedAmount: 0,
-      withdrawConfirmedFiat: ''
+      withdrawConfirmedFiat: '',
+      // Send-success state. Mirrors the withdraw-success shape so the
+      // two surfaces feel like the same pattern. `showSaveContact` is
+      // computed once at send time (savable address && not already a
+      // contact); flipping it later would be a UX gotcha, so we lock
+      // it before opening the modal.
+      showSendSuccess: false,
+      sendSuccessAmount: 0,
+      sendSuccessFiat: '',
+      sendSuccessRecipient: '',
+      sendSuccessLabel: '',
+      sendSuccessShowSaveContact: false,
+      // LUD-09 message from the recipient, shown on the send-success screen.
+      sendSuccessAction: null,
+      // LUD-21 delivery/verify status shown on the send-success screen — the
+      // live result of polling the provider's verify URL (e.g. M-Pesa delivery).
+      sendDeliveryStatus: null,
+      // LUD-04 (LNURL-auth) — the dialog re-renders the same parsed
+      // challenge across steps, so we hold it here rather than passing
+      // through emit chains.
+      showIdentityAuthDialog: false,
+      identityAuthChallenge: null,
     };
   },
   computed: {
+    showExitBanner() {
+      void this.exitHealthTick;
+      if (!this.walletStore.isActiveWalletSpark || this.walletStore.isKioskRestricted) return false;
+      if (Date.now() < this.exitBannerDismissedUntil) return false;
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+      return sparkHealth().isSustainedOutage(this.walletStore.activeWalletId);
+    },
+    exitBannerOutage() {
+      void this.exitHealthTick;
+      const ms = sparkHealth().unreachableFor(this.walletStore.activeWalletId);
+      return ms ? exitDurationText(ms, (key, params) => this.$t(key, params)) : '';
+    },
+    menuButtonLabel() {
+      if (!this.socialBucketStore.hasUnseenPayments) return this.$t('Menu');
+      const count = this.socialBucketStore.paymentCount;
+      return `${this.$t('Menu')}, ${this.$t('{n} payments waiting', { n: count })}`;
+    },
+
+    bucketPaymentBadge() {
+      const count = this.socialBucketStore.paymentCount;
+      return count > 99 ? '99+' : `+${count}`;
+    },
+
     activeWallet() {
-      return this.walletState.connectedWallets.find(
-        w => w.id === this.walletState.activeWalletId
-      ) || null;
+      const wallet = this.walletStore.activeWallet;
+      return wallet ? { ...wallet, nwcString: wallet.nwcUrl } : null;
+    },
+
+    /**
+     * Inline gradient for the small Profile avatar in the header. Derived
+     * from the identity fingerprint so the icon visually matches the big
+     * avatar on the Profile page itself — same identity, same colour.
+     * Before bootstrap, the helper returns a tasteful default so the
+     * button never renders flat or empty.
+     */
+    profileAvatarStyle() {
+      const { from, to } = identityFingerprintToGradient(
+        this.identityStore?.fingerprint,
+      );
+      return { background: `linear-gradient(135deg, ${from} 0%, ${to} 100%)` };
+    },
+
+    /**
+     * Funds the active wallet holds but cannot spend right now: boarding
+     * deposits still confirming, plus change that landed below the dust
+     * threshold and needs a recovery pass before it is spendable again.
+     * Zero for every backend that reports no such split.
+     */
+    unspendableSats() {
+      const details = this.walletStore.balanceDetails?.[this.activeWallet?.id];
+      if (!details) return 0;
+      return Math.max(0, Number(details.pending || 0) + Number(details.recoverable || 0));
+    },
+
+    unspendableLabel() {
+      const amount = formatAmount(this.unspendableSats, this.walletStore.useBip177Format);
+      return `${amount} ${this.$t('becoming available')}`;
+    },
+
+    /**
+     * Whether the last transaction represents an incoming payment.
+     * Handles the provider's direct types ('receive' / 'send') and the
+     * legacy 'incoming' / 'outgoing' shape that the rest of the app
+     * also recognises, plus a defensive amount-sign fallback for any
+     * future provider that forgets to set `type`.
+     */
+    lastTxIsIncoming() {
+      const tx = this.lastTransaction;
+      if (!tx) return false;
+      const t = (tx.type || '').toLowerCase();
+      if (t === 'receive' || t === 'received' || t === 'incoming') return true;
+      if (t === 'send' || t === 'sent' || t === 'outgoing') return false;
+      // Last-resort fallback — some providers encode direction in the sign.
+      return Number(tx.amount) > 0;
+    },
+
+    lastTxIcon() {
+      return this.lastTxIsIncoming ? 'tabler:arrow-down-left' : 'tabler:arrow-up-right';
+    },
+
+    /**
+     * NIP-57 zap info for the previewed transaction. The home preview
+     * keeps the provider's raw direction vocabulary ('receive' /
+     * 'incoming' / sign-of-amount), so normalize just the type before
+     * asking the shared recognizer.
+     */
+    lastTxZap() {
+      const tx = this.lastTransaction;
+      if (!tx || !this.lastTxIsIncoming) return null;
+      return zapInfoFromTx({
+        type: 'incoming',
+        description: tx.description || tx.memo || '',
+      });
+    },
+
+    /**
+     * Movement-type badge for the preview — the same vocabulary as the
+     * transaction list (received / sent / POS / batch / transfer / zap),
+     * so the home row and the history read identically.
+     */
+    lastTxBadge() {
+      const tx = this.lastTransaction;
+      if (!tx) return null;
+      if ((tx.status ?? 'completed') !== 'completed') return null;
+      if (this.lastTxZap) return { icon: NOSTRICH_HEAD_ICON, cls: 'tx-badge-zap' };
+      try {
+        const source = this.transactionMetadataStore?.getSourceForTransaction(tx.id, this.activeWallet?.id);
+        if (source === 'kiosk') return { icon: 'tabler:building-store', cls: 'tx-badge-pos' };
+        if (source === 'batch') return { icon: 'tabler:stack-2', cls: 'tx-badge-aux' };
+        if (source === 'internal-transfer') return { icon: 'tabler:arrows-exchange', cls: 'tx-badge-aux' };
+        if (source === 'social-bucket') return { icon: 'tabler:user-dollar', cls: 'tx-badge-aux' };
+      } catch { /* metadata store not ready — direction still applies */ }
+      return this.lastTxIsIncoming
+        ? { icon: 'tabler:arrow-down-left', cls: 'tx-badge-in' }
+        : { icon: 'tabler:arrow-up-right', cls: 'tx-badge-out' };
+    },
+
+    /**
+     * Address-book contact linked to the most recent transaction, if
+     * any. Drives the preview widget's avatar + title so the user
+     * sees "DrShift  ←  picture" instead of the generic
+     * "Payment Sent ← up-arrow" once a contact is associated. The
+     * association is written at send time by confirmPayment.
+     */
+    lastTxContact() {
+      const tx = this.lastTransaction;
+      if (!tx || !tx.id || !this.transactionMetadataStore) {
+        return null;
+      }
+      try {
+        // Same live resolution as the history list: explicit contactId,
+        // then manual removal, then the durable recipient address. This
+        // is why the home-screen preview now matches the list instead of
+        // only reacting to an explicit contactId.
+        return this.transactionMetadataStore.getContactForTransaction(tx.id, this.activeWallet?.id) || null;
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * Picture URL for the last-tx preview when there's no linked contact
+     * but we still know who this was: a resolved Nostr counterparty's
+     * profile picture (stamped at send time), or, for the phone-number
+     * payout rail, the provider's bundled logo. null when neither applies
+     * — the preview then falls back to the plain direction icon.
+     */
+    lastTxAvatarPicture() {
+      const tx = this.lastTransaction;
+      if (!tx || !tx.id || !this.transactionMetadataStore) return null;
+      try {
+        const avatar = this.transactionMetadataStore.getCounterpartyAvatarForTransaction(tx.id, this.activeWallet?.id);
+        if (avatar?.picture) return avatar.picture;
+        // Zap: the zapper's relay profile picture, reactive through the
+        // shared cache — the preview upgrades in place when it lands.
+        if (this.lastTxZap) {
+          const picture = zapperPicture(this.lastTxZap);
+          if (picture) return picture;
+        }
+        if (this.transactionMetadataStore.getSourceForTransaction(tx.id, this.activeWallet?.id) === 'phone') {
+          const meta = this.transactionMetadataStore.getMetadataForTransaction(tx.id, this.activeWallet?.id);
+          if (meta?.recipientAddress) {
+            const svc = matchLnAddressService(meta.recipientAddress);
+            return svc?.logo || svc?.flag || null;
+          }
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * The stamped recipient address backing lastTxAvatarPicture, carried
+     * alongside it as ContactAvatar's `entry.address` — its own bundled
+     * provider-logo lookup, not the explicit `picture` URL gate (which
+     * only accepts https/data URLs and would reject a bundled asset path).
+     */
+    lastTxAvatarAddress() {
+      const tx = this.lastTransaction;
+      if (!tx || !tx.id || !this.transactionMetadataStore) return '';
+      try {
+        const meta = this.transactionMetadataStore.getMetadataForTransaction(tx.id, this.activeWallet?.id);
+        return meta?.recipientAddress || '';
+      } catch {
+        return '';
+      }
+    },
+
+    /**
+     * The preview's top line, and what kind of thing it is. Same
+     * priority chain as the history list's resolveTxTitle(), so the two
+     * surfaces never disagree about the same payment: contact → zap
+     * sender → auxiliary label → recipient address (sends) → the
+     * payment's own message → a generic direction label.
+     *
+     * `kind: 'message'` is counterparty-written text, which the template
+     * renders quoted and unbolded so it can never pass for a contact.
+     *
+     * @returns {{ text: string, kind: 'name'|'address'|'message'|'generic' }}
+     */
+    lastTxHeading() {
+      // Prefer the linked contact's name so the home-screen preview
+      // reads as "DrShift" instead of the generic direction label.
+      if (this.lastTxContact?.name) return { text: this.lastTxContact.name, kind: 'name' };
+      // A zap is about WHO zapped — resolved profile name, shortened
+      // npub until the relays answer. Same rule as the history list.
+      if (this.lastTxZap) {
+        return { text: zapperDisplayName(this.lastTxZap) || this.$t('Zap received'), kind: 'name' };
+      }
+      // Auxiliary payment paths provide a human label (for example a payout
+      // from this profile's Social Bucket). Keep it above the raw invoice memo
+      // so the home preview agrees with history and transaction details.
+      const tx = this.lastTransaction;
+      if (tx?.id && this.transactionMetadataStore) {
+        const label = this.transactionMetadataStore.getLabelForTransaction(tx.id, this.activeWallet?.id);
+        if (label) return { text: label, kind: 'name' };
+      }
+      // Next best identity: the recipient address stamped at send time.
+      if (tx?.type === 'outgoing' && tx.id && this.transactionMetadataStore) {
+        const meta = this.transactionMetadataStore.getMetadataForTransaction(tx.id, this.activeWallet?.id);
+        if (meta?.recipientAddress) return { text: meta.recipientAddress, kind: 'address' };
+      }
+      // Nothing identifies the counterparty, which is the normal case on
+      // a receive: let what they wrote speak instead of a placeholder.
+      const message = this.lastTxMessage;
+      if (message) return { text: message, kind: 'message' };
+
+      // Nothing identified this payment. Direction already rides the
+      // signed amount and the badge, so the line says what it is, not
+      // which way it went. Same wording as the transaction list.
+      return { text: this.$t('Bitcoin payment'), kind: 'generic' };
+    },
+
+    /**
+     * The human message on the previewed transaction: a zap's note, else
+     * the payer's comment, else the invoice description — never one of
+     * the placeholder memos BuhoGO writes on the user's behalf. '' when
+     * the payment carries no text at all.
+     */
+    lastTxMessage() {
+      if (this.lastTxZap) return this.lastTxZap.note || '';
+      return getTxMessage(this.lastTransaction);
+    },
+
+    lastTxTimeAgo() {
+      if (!this.lastTransaction) return '';
+      // Providers variously expose timestamp / settled_at / createdTime
+      // depending on the underlying SDK. Try each in order.
+      const ts =
+        this.lastTransaction.timestamp ??
+        this.lastTransaction.settled_at ??
+        this.lastTransaction.createdTime ??
+        null;
+      const time = this.formatRelativeTime(ts);
+      // Same rule as the history list: the message rides here in quotes,
+      // unless the top line is already carrying it — the same text must
+      // never appear twice in one preview.
+      if (this.lastTxHeading.kind === 'message') return time;
+      const message = this.lastTxMessage;
+      return message ? `“${message}” · ${time}` : time;
+    },
+
+    /**
+     * The "user-meaningful" amount in sats for the home-page
+     * preview widget. Same derivation as TransactionDetails and
+     * TransactionHistory:
+     *   - Outgoing with a fee → recipient amount (gross − fee)
+     *   - Otherwise → gross
+     *
+     * Keeps the three surfaces telling the same story so a user who
+     * sees "−₿ 5" on the home widget, taps through to the history
+     * row showing "−₿ 5", and opens the detail page showing "−₿ 5"
+     * never has to reconcile three different headline numbers.
+     */
+    lastTxDisplayAmountSats() {
+      if (!this.lastTransaction) return 0;
+      // The normalizer computed the recipient amount with the correct
+      // per-provider fee semantics — trust it when present.
+      const recipient = Number(this.lastTransaction.recipientSats);
+      if (Number.isFinite(recipient)) return Math.abs(recipient);
+      const gross = Math.abs(Number(this.lastTransaction.amount) || 0);
+      const fee = Number(this.lastTransaction.fee) || 0;
+      if (!this.lastTxIsIncoming && fee > 0) {
+        return Math.max(0, gross - fee);
+      }
+      return gross;
+    },
+
+    lastTxAmountDisplay() {
+      if (!this.lastTransaction) return '';
+      const sign = this.lastTxIsIncoming ? '+' : '-';
+      // Use the same formatter the rest of the app uses so unit
+      // (sats / BTC) and BIP-177 formatting match.
+      const formatted = formatAmount(this.lastTxDisplayAmountSats, this.walletStore.useBip177Format);
+      return `${sign}${formatted}`;
+    },
+
+    lastTxFiatDisplay() {
+      if (!this.lastTransaction) return '';
+      const sats = this.lastTxDisplayAmountSats;
+      if (sats === 0) return '';
+      const currency = this.walletStore.preferredFiatCurrency || 'USD';
+      const fiat = fiatRatesService.convertSatsToFiatSync(sats, currency);
+      if (fiat === null || fiat === undefined) return '';
+      // "about $0.02" matches the reference mock's softer tone vs an
+      // exact value, which is appropriate for a preview.
+      const fiatPart = `${this.$t('about')} ${fiatRatesService.formatFiatAmount(fiat, currency)}`;
+      // Append a compact fee note when there's a fee to surface, so
+      // the home widget visibly reconciles "I sent X, the network
+      // took Y" without needing a new row. Parens (not a "+"
+      // prefix) so the fee can't be misread as positive income on
+      // a small surface. Matches TransactionHistory's badge shape
+      // for consistency.
+      // feeSats is null (not 0) when the provider doesn't report a fee
+      // (Arkade) — suppress the note rather than claim a free payment.
+      const fee = Number(this.lastTransaction.feeSats ?? this.lastTransaction.fee) || 0;
+      if (!this.lastTxIsIncoming && fee > 0) {
+        const feeFormatted = formatAmount(fee, this.walletStore.useBip177Format);
+        return `${fiatPart} (${feeFormatted} ${this.$t('fee')})`;
+      }
+      return fiatPart;
     },
     walletDisplayName() {
       if (!this.activeWallet) return '';
@@ -842,9 +1392,17 @@ export default {
       // LNURL-withdraw has its own amount handling
       if (this.pendingPayment.type === 'lnurl_withdraw') return false;
 
-      // Spark addresses always need amount input (no embedded amount)
-      if (this.pendingPayment.type === 'spark_address' || this.pendingPayment.sparkAddress) {
-        return true;
+      // Spark / Arkade addresses need amount input — except a Spark invoice
+      // that carries its own amount, which locks the sheet.
+      if (this.pendingPayment.type === 'spark_address' || this.pendingPayment.sparkAddress ||
+          this.pendingPayment.type === 'arkade_address' || this.pendingPayment.arkadeAddress) {
+        return !(this.pendingPayment.fixedAmountSats > 0);
+      }
+
+      // Bitcoin on-chain (Arkade offboard via the send sheet): a bare bc1
+      // address carries no amount; a BIP21 one may. Ask unless we already have it.
+      if (this.pendingPayment.bitcoinAddress) {
+        return !(this.pendingPayment.amount > 0);
       }
 
       // Lightning Address always needs amount input (no embedded amount in address)
@@ -884,15 +1442,530 @@ export default {
     },
     canConfirmPayment() {
       if (!this.pendingPayment) return false;
+      // The sheet disables the slide for a wallet that cannot pay; the
+      // pipeline refuses it too, so no stray event can send from one.
+      if (this.sendingWalletBlock) return false;
       if (this.needsAmountInput) {
         const sats = this.sendAmountSats;
-        return sats > 0 && this.validatePaymentAmount(this.paymentAmount) === true;
+        if (sats <= 0) return false;
+        // Local-currency (LUD-21 #207) send: the sheet already validated the
+        // amount against the provider's own local min/max. `sats` here is a
+        // fee-less estimate, so re-checking it against the sat bounds would
+        // wrongly reject valid amounts (e.g. the provider's advertised minimum,
+        // whose estimate can floor just below minSats). Trust the sheet.
+        if (this.sendPayout) return true;
+        return this.validatePaymentAmount(this.paymentAmount) === true;
       }
       return true;
     },
+
+    /**
+     * Adapter from the legacy `pendingPayment` shape to the
+     * PaymentConfirmSheet `payment` prop shape. Centralizing the mapping
+     * here keeps Wallet.vue's send-pipeline state untouched while the
+     * sheet stays decoupled from any wallet/legacy specifics.
+     */
+    // Provider logo for the save-contact dialog preview (Bitzed for Zambia,
+    // …). Null for any non-payout address, so the avatar simply doesn't show.
+    saveContactServiceLogo() {
+      return matchLnAddressService(this.saveContactData.address)?.logo || null;
+    },
+
+    saveContactNostrPicture() {
+      return sanitizeImageUrl(this.saveContactData.nostrIdentity?.profile?.picture);
+    },
+
+    paymentSheetProps() {
+      const p = this.pendingPayment;
+      if (!p) return null;
+
+      // Consumer-wallet identity (Wallet of Satoshi, Phoenix, Blink, …),
+      // recognized locally by the address domain. Applied as a backfall below.
+      const walletBrand = this.resolveWalletBrand(p);
+
+      // Nostr-native address (npub.cash & co.): the address local part is an
+      // npub, i.e. a real person. Decoded here so the recipient can become
+      // their name + avatar instead of a 63-char key. null for every normal
+      // address. Works off the resolved address for both entry shapes.
+      const npubIds = npubFromLightningAddress(p.lightningAddress || walletBrand?.address);
+
+      // The Nostr person to show, from EITHER the npub-handle above OR a bare
+      // npub/nprofile/NIP-05 we resolved at send time (pubkey + profile carried
+      // on the payment). Either way the recipient becomes the real person.
+      const nostrPubkey = npubIds?.pubkey || p.nostrPubkey || null;
+      const nostrNpub = npubIds?.npub || p.nostrNpub || null;
+
+      // ── Recipient ─────────────────────────────────────────────
+      // Merchant payments (SA retail QR) get the merchant logo + name as
+      // hero. Otherwise we use the address itself as the display name —
+      // for Lightning addresses that already reads cleanly ("alice@…"),
+      // and for Spark/invoice we surface a generic "Lightning Invoice"
+      // label so the user knows what they're paying.
+      let recipient;
+      if (p.merchant) {
+        recipient = {
+          name: p.merchant.displayName,
+          logoUrl: p.merchant.logo,
+          color: '#3B82F6',
+          addressType: 'lightning',
+          address: ''
+        };
+      } else if (p.lightningAddress) {
+        // If the destination matches a saved contact, surface their
+        // local name + color (and Nostr avatar when present) instead
+        // of the raw address. Works for every entry path — picker,
+        // typed address, or pasted link — because the lookup is on
+        // the resolved address, not on how it arrived.
+        const contact = this.addressBookStore.findContactByAddress(p.lightningAddress);
+        recipient = this.recipientFromContact(contact, {
+          fallbackName: p.lightningAddress,
+          fallbackColor: '#F59E0B',
+          addressType: 'lightning',
+          address: p.lightningAddress,
+        });
+
+        // Fiat-payout services (Tando, Bitzed, …): recognized locally by
+        // the address domain and branded by destination country, not by
+        // provider. Synchronous, no network lookup. A saved contact always
+        // wins, mirroring the Branta guard below.
+        const lnService = matchLnAddressService(p.lightningAddress);
+        if (lnService && !recipient.matchedContact) {
+          // Prefer the partner logo (Tando / Bitzed / ChapSmart) over the plain
+          // country flag; fall back to the flag if a provider has no logo.
+          recipient.logoUrl = lnService.logo || lnService.flag;
+          // Show the number in readable international form (+260 777 491 011)
+          // rather than the raw handle (0777491011 / 260777491011).
+          recipient.name = formatPhoneHandle(lnService.code, lnService.handle);
+          recipient.lnService = {
+            hint: this.$t(lnService.hint),
+          };
+        }
+
+        // Identity backfall — a saved contact or a payout service (both above)
+        // always wins. A resolved Nostr person beats plain wallet branding.
+        if (!recipient.matchedContact && !recipient.lnService) {
+          if (nostrPubkey) {
+            // Nostr person — npub.cash address, or a bare npub/NIP-05 we resolved.
+            recipient = this.buildNostrPersonRecipient(
+              p, nostrPubkey, nostrNpub, p.lightningAddress, walletBrand ? walletBrand.brand : null
+            );
+          } else if (walletBrand) {
+            // Consumer-wallet branding: the hosting wallet's logo + username
+            // read far friendlier than a raw address.
+            recipient.logoUrl = walletBrand.brand.logo;
+            recipient.logoContain = walletBrand.brand.logoContain === true;
+            recipient.logoInset = walletBrand.brand.logoInset || '';
+            recipient.logoBg = walletBrand.brand.logoBg || '';
+            recipient.name = walletBrand.handle || walletBrand.brand.name;
+            recipient.walletBrand = walletBrand.brand.name;
+          }
+        }
+      } else if (p.sparkAddress) {
+        const contact = this.addressBookStore.findContactByAddress(p.sparkAddress);
+        recipient = this.recipientFromContact(contact, {
+          // Payment-language unification: an anonymous destination is just
+          // "Bitcoin payment" with the ₿ identity — the rail never leaks.
+          // The full string stays one tap away under "Show details".
+          fallbackName: this.$t('Bitcoin payment'),
+          fallbackColor: '#F7931A',
+          fallbackInitial: '₿',
+          addressType: 'spark',
+          address: p.sparkAddress,
+        });
+      } else if (p.arkadeAddress) {
+        const contact = this.addressBookStore.findContactByAddress(p.arkadeAddress);
+        recipient = this.recipientFromContact(contact, {
+          fallbackName: this.$t('Bitcoin payment'),
+          fallbackColor: '#F7931A',
+          fallbackInitial: '₿',
+          addressType: 'arkade',
+          address: p.arkadeAddress,
+        });
+      } else if (p.bitcoinAddress) {
+        const contact = this.addressBookStore.findContactByAddress(p.bitcoinAddress);
+        recipient = this.recipientFromContact(contact, {
+          // Contact-pay and deep-link entries carry the name even when the
+          // address isn't in the local book — show it over the generic label.
+          fallbackName: p.contactName || this.$t('Bitcoin payment'),
+          fallbackColor: '#F7931A',
+          fallbackInitial: p.contactName ? undefined : '₿',
+          addressType: 'bitcoin',
+          address: p.bitcoinAddress,
+        });
+      } else if (p.type === 'lnurl' || p.type === 'lnurl_pay') {
+        const address = p.lnurl || (typeof p.data === 'string' ? p.data : '');
+        const contact = this.addressBookStore.findContactByAddress(address);
+        if (contact) {
+          recipient = this.recipientFromContact(contact, {
+            fallbackName: lnurlDomain(address),
+            fallbackColor: '#F7931A',
+            addressType: 'lnurl',
+            address,
+          });
+        } else if (nostrPubkey) {
+          // Nostr person reached via a raw LNURL (npub.cash, or a resolved
+          // bare npub whose profile carried a lud06 LNURL). Reveal the npub /
+          // address rather than the opaque bech32.
+          recipient = this.buildNostrPersonRecipient(
+            p, nostrPubkey, nostrNpub,
+            walletBrand?.address || nostrNpub || (typeof p.data === 'string' ? p.data : ''),
+            walletBrand ? walletBrand.brand : null
+          );
+        } else if (walletBrand) {
+          recipient = {
+            name: walletBrand.handle || walletBrand.brand.name,
+            color: '#3B82F6',
+            addressType: 'lightning',
+            logoUrl: walletBrand.brand.logo,
+            logoContain: walletBrand.brand.logoContain === true,
+            logoInset: walletBrand.brand.logoInset || '',
+            logoBg: walletBrand.brand.logoBg || '',
+            walletBrand: walletBrand.brand.name,
+            address: walletBrand.address || (typeof p.data === 'string' ? p.data : '')
+          };
+        } else {
+          recipient = {
+            name: serviceTitle(p.serviceMeta, lnurlDomain(address)) || this.$t('Bitcoin payment'),
+            color: '#F7931A',
+            service: true,
+            addressType: 'lnurl',
+            address,
+            addressLabel: lnurlDomain(address),
+          };
+        }
+      } else {
+        // BOLT11 invoice or unknown — the unified "Bitcoin payment"
+        // identity with the ₿ mark, never a stray letter. The memo (when
+        // the invoice carries one) shows exactly once, in the payment-
+        // indicator row below the hero; the raw BOLT11 stays one tap away.
+        recipient = {
+          name: this.$t('Bitcoin payment'),
+          color: '#F7931A',
+          initial: '₿',
+          addressType: 'invoice',
+          // The raw destination for invoices is the BOLT11 itself, surfaced
+          // (folded) under the payment indicator for manual verification.
+          address: p.invoice || p.data || ''
+        };
+      }
+
+      // ── Branta merchant verification ──────────────────────────
+      // Attached asynchronously by runBrantaVerification on a positive
+      // lookup. We surface the verified business name + logo as the hero
+      // identity (overriding the generic "Lightning invoice" label and
+      // colored initial), but never relabel a contact the user saved
+      // themselves, and never override an SA-retail merchant. The tappable
+      // "verified by Branta" badge is attached whenever a match exists.
+      const bv = p.brantaVerification;
+      if (bv && !p.merchant) {
+        const verifiedLogo = this.$q.dark.isActive
+          ? (bv.logoUrl || bv.logoLightUrl)
+          : (bv.logoLightUrl || bv.logoUrl);
+        if (!recipient.matchedContact) {
+          if (bv.name) recipient.name = bv.name;
+          if (verifiedLogo) {
+            recipient.logoUrl = verifiedLogo;
+            // Branta-delivered brand marks render best contained (not cropped).
+            // Any avatar styling tuned for the wallet logo we're replacing
+            // (inset, backdrop) goes with it — the merchant art is unknown, so
+            // it falls back to the safe default inset on the white plate.
+            recipient.logoContain = true;
+            recipient.logoInset = '';
+            recipient.logoBg = '';
+          }
+        }
+        recipient.verification = { verifyUrl: bv.verifyUrl };
+      }
+
+      // ── Amount mode ───────────────────────────────────────────
+      // Source of truth precedence:
+      //   1. Invoice with baked amount → fixed
+      //   2. LNURL/Lightning Address with min===max (or isFixedAmount) → fixed
+      //   3. LNURL/Lightning Address with bounded min/max → range
+      //   4. Anything else (Spark, zero-amount invoice) → free
+      let amount;
+      if (p.amount > 0 && !p.lightningAddress && !this.needsAmountInput) {
+        amount = { mode: 'fixed', fixedSats: p.amount };
+      } else if (p.fixedAmountSats) {
+        amount = { mode: 'fixed', fixedSats: p.fixedAmountSats };
+      } else if (p.isFixedAmount && p.minSendable) {
+        amount = { mode: 'fixed', fixedSats: Math.floor(p.minSendable / 1000) };
+      } else if (p.minSendable && p.maxSendable && p.minSendable !== p.maxSendable) {
+        amount = {
+          mode: 'range',
+          minSats: Math.ceil(p.minSendable / 1000),
+          maxSats: Math.floor(p.maxSendable / 1000)
+        };
+        // A payment made for a request arrives with its amount (the sender
+        // still confirms it); outside the range it would only mislead.
+        const wanted = p.prefill?.amountSats;
+        if (wanted >= amount.minSats && wanted <= amount.maxSats) amount.defaultAmount = wanted;
+      } else {
+        amount = { mode: 'free' };
+        if (p.prefill?.amountSats > 0) amount.defaultAmount = p.prefill.amountSats;
+      }
+
+      // ── Payout currency (LUD-21 currency extension #207) ──────
+      // When the provider advertises a local payout currency, hand it to the
+      // sheet so the sender can denominate in the recipient's currency (TZS/
+      // KES/ZMW). `multiplier` is millisats per 1 unit — the sheet derives the
+      // sat estimate from it, so we need no external rate for TZS.
+      let payoutCurrency = null;
+      const cur = p.currency;
+      if (cur && cur.code && Number(cur.multiplier) > 0) {
+        payoutCurrency = {
+          code: cur.code,
+          symbol: cur.symbol || cur.code,
+          decimals: Number.isInteger(cur.decimals) ? cur.decimals : 0,
+          minSendable: Number(cur.minSendable) || 0,
+          maxSendable: Number(cur.maxSendable) || 0,
+          multiplier: Number(cur.multiplier)
+        };
+      }
+
+      // ── Fee estimate ──────────────────────────────────────────
+      // Only Spark wallets expose pre-call fee data. NWC/LNbits omit the
+      // object entirely so the sheet renders nothing — better than
+      // showing an empty "—" row that implies missing information.
+      // The fee is the paying wallet's: "Pay with" can differ from the
+      // active wallet.
+      let feeEstimate = null;
+      const payerType = this.getSendingWalletType();
+      if (payerType === 'spark') {
+        if (p.sparkAddress) {
+          // Instant internal transfer — free. Named by outcome, not rail.
+          feeEstimate = { sats: 0, isEstimating: false, label: this.$t('Free · instant') };
+        } else if (this.isEstimatingFee) {
+          feeEstimate = { sats: null, isEstimating: true };
+        } else if (this.estimatedFee !== null && this.estimatedFee !== undefined) {
+          feeEstimate = { sats: this.estimatedFee, isEstimating: false };
+        }
+      } else if (payerType === 'arkade') {
+        if (p.arkadeAddress) {
+          // Instant internal transfer — free. Named by outcome, not rail.
+          feeEstimate = { sats: 0, isEstimating: false, label: this.$t('Free · instant') };
+        } else if (p.bitcoinAddress) {
+          // On-chain offboard pays a Bitcoin network fee, deducted from the
+          // amount. Plain-language note (no pre-call number is exposed).
+          feeEstimate = { sats: null, isEstimating: false, label: this.$t('Includes a network fee') };
+        } else {
+          // The swap layer charges a small fee, deducted automatically (no
+          // pre-call estimate). Plain-language note, no rail name, no number.
+          feeEstimate = { sats: null, isEstimating: false, label: this.$t('Includes a small network fee') };
+        }
+      }
+
+      return {
+        recipient,
+        amount,
+        // On-chain sends always take the deliberate slide gesture — every
+        // L1 transaction is irreversible, regardless of amount.
+        forceSlide: !!p.bitcoinAddress,
+        // Description precedence is deliberate: the invoice / LNURL memo
+        // (what the user is actually paying for) wins; Branta's
+        // platform-level description is only a fallback when no memo exists.
+        // The verified identity (name + logo + badge) is surfaced above.
+        // For a recognized consumer wallet (or a resolved Nostr person) the
+        // "memo" is just boilerplate metadata ("Pay to Wallet of Satoshi user:
+        // …"), already conveyed by the logo + name + brand hint, so we drop it
+        // rather than repeat it.
+        description: (walletBrand || nostrPubkey || p.description === recipient.name) ? '' : (p.description || p.defaultDescription || (bv && bv.description) || ''),
+        commentAllowed: !!p.commentAllowed,
+        commentMaxLength: p.commentAllowed || 100,
+        ...(p.prefill?.note ? { defaultComment: p.prefill.note } : {}),
+        // Merchant-driven extras — countdown, ZAR fallback, stale rates.
+        // The sheet hides each of these when the corresponding field is
+        // absent, so we can wire them unconditionally here.
+        countdown: this.merchantCountdown > 0
+          ? { seconds: this.merchantCountdown, urgentBelow: 20 }
+          : null,
+        zarAmount: p.zarAmount || null,
+        ratesStale: !!(p.merchant && this.ratesStale),
+        feeEstimate,
+        payoutCurrency
+      };
+    },
+
+    // The pending payment's rail, in the vocabulary walletCapabilities
+    // accepts — from the payload key when present, the payment type
+    // otherwise. One derivation feeds both the gate and the hint.
+    pendingDestinationType() {
+      const p = this.pendingPayment;
+      if (!p) return 'lightning';
+      if (p.sparkAddress) return 'spark';
+      if (p.arkadeAddress) return 'arkade';
+      if (p.bitcoinAddress) return 'bitcoin';
+      return p.type || 'lightning';
+    },
+
+    // ───── "Pay with" ─────
+    // The wallet that pays is `sendingWalletId` (the active wallet until a
+    // choice is made). Everything below reads that one id, so capability,
+    // balance, fee estimate and the actual send can never disagree about who
+    // is paying.
+
+    /** Id of the wallet that pays the payment on screen. */
+    payerWalletId() {
+      return this.getSendingWallet()?.id || null;
+    },
+
+    /** The paying wallet's known balance in sats; null while unknown. */
+    sendingWalletBalance() {
+      return this.walletBalanceOf(this.payerWalletId);
+    },
+
+    /**
+     * Sats the payment moves, as far as they are known: the amount live in
+     * the sheet, else the fixed amount the payment carries. 0 before the user
+     * has typed one (an amountless invoice) - the list then skips its balance
+     * check instead of calling every wallet empty.
+     */
+    payingAmountSats() {
+      const live = Number(this.sendSheetAmountSats) || 0;
+      return live > 0 ? live : this.getFixedPaymentSats();
+    },
+
+    /**
+     * Every wallet ranked for the payment on screen (active first), the
+     * entries the sheet's "Pay with" field renders. The fee reserve is what is
+     * KNOWN to be charged (see knownFeeReserveSats), so the list never refuses
+     * a wallet the provider would accept. Empty when there is nothing to pay
+     * (a redeem is a receive: no wallet "pays" it).
+     */
+    payingWalletEntries() {
+      const p = this.pendingPayment;
+      if (!p || p.type === 'lnurl_withdraw') return [];
+      return this.rankPayingWallets(this.pendingDestinationType, this.payingAmountSats, this.estimatedFee);
+    },
+
+    /**
+     * Why the wallet that pays cannot pay this payment - its list entry
+     * ({ name, reason, ... }) - or null when nothing stands in the way.
+     * Both the commit gate and the warning banner read this one verdict.
+     */
+    sendingWalletBlock() {
+      if (!this.pendingPayment) return null;
+      const wallet = this.getSendingWallet();
+      // The rail check every surface shares, now asked of the wallet that pays.
+      if (!canWalletPay(this.getSendingWalletType(), this.pendingDestinationType)) {
+        return { name: wallet?.name || '', reason: PAYING_REASON.UNSUPPORTED_DESTINATION };
+      }
+      // Balance and availability only matter when there is a choice to make.
+      // With a single wallet nothing could be offered instead, so the provider
+      // keeps reporting a real shortfall the way it always has.
+      const entries = this.payingWalletEntries;
+      if (entries.length < 2) return null;
+      const entry = entries.find((w) => w.id === wallet?.id);
+      return entry && !entry.usable ? entry : null;
+    },
+
+    paymentSheetWalletCanPay() {
+      if (!this.pendingPayment) return true;
+      return !this.sendingWalletBlock;
+    },
+
+    // Spark on-chain send: mounts the L1 fee panel in the sheet's extras
+    // slot and reroutes confirm to the withdrawal executor. It is the
+    // paying wallet that must be Spark, not necessarily the active one.
+    isSparkL1Payment() {
+      return this.getSendingWalletType() === 'spark' && !!this.pendingPayment?.bitcoinAddress;
+    },
+
+    // Bare on-chain destination for the fee quote + withdrawal. The send
+    // pipeline already unwraps BIP21 before building the payload; this
+    // re-parse is a cheap defensive net for any future path that doesn't.
+    l1DestinationAddress() {
+      const raw = (this.pendingPayment?.bitcoinAddress || '').trim();
+      const bip21 = parseBip21(raw);
+      return bip21 ? bip21.address : raw;
+    },
+
+    // Extra commit condition for the sheet: Spark on-chain must hold a
+    // settled, affordable fee quote before the slide can complete. Every
+    // other payment leaves the gate open.
+    sendSheetCommitGate() {
+      if (!this.isSparkL1Payment) return true;
+      return !!(this.l1Fee?.ready && !this.l1Fee.insufficient);
+    },
+
+    // A rail problem keeps the shared switch-wallet words; a balance or
+    // availability problem names the wallet (payingWalletHint).
+    paymentSheetWalletHint() {
+      const block = this.sendingWalletBlock;
+      if (!block) return '';
+      return payingWalletHint(block, this.pendingDestinationType, this.$t.bind(this));
+    },
+
+    /**
+     * Adapter from a `pendingPayment` of type 'lnurl_withdraw' to the
+     * sheet's normalized payload. Mirrors `paymentSheetProps` in shape
+     * but tuned for the redeem verb: the recipient is the withdrawal
+     * source (using its description as the display name), the via line
+     * reads "Lightning · Withdrawal", and amount mode is fixed when the
+     * source pre-committed an amount, range otherwise.
+     */
+    withdrawSheetProps() {
+      const p = this.pendingPayment;
+      if (!p || p.type !== 'lnurl_withdraw') return null;
+
+      const recipient = withdrawRecipient(p, this.$t.bind(this));
+
+      let amount;
+      if (p.isFixedAmount) {
+        amount = { mode: 'fixed', fixedSats: p.fixedAmountSats };
+      } else if (p.minSats && p.maxSats && p.minSats !== p.maxSats) {
+        const defaultAmount = (p.receiveAmount
+          && p.receiveAmount >= p.minSats
+          && p.receiveAmount <= p.maxSats)
+          ? p.receiveAmount
+          : null;
+        amount = {
+          mode: 'range',
+          minSats: p.minSats,
+          maxSats: p.maxSats,
+          ...(defaultAmount ? { defaultAmount } : {})
+        };
+      } else {
+        // Defensive — every spec-compliant withdraw QR carries a range
+        // or a fixed amount, but if metadata is missing fall back to a
+        // free input so the user isn't stuck.
+        amount = { mode: 'free' };
+      }
+
+      return {
+        recipient,
+        amount,
+        // Description already lives in the recipient name; surfacing it
+        // again in the description row would be redundant.
+        description: '',
+        commentAllowed: false
+      };
+    },
+
+    /**
+     * The sheet's `isSending` is true for any non-terminal status. The
+     * status copy itself comes from `withdrawStatusMessage` so the user
+     * sees "Generating invoice…" → "Awaiting confirmation…" rather than
+     * a bare spinner.
+     */
+    withdrawSheetIsBusy() {
+      const s = this.lnurlWithdrawStatus;
+      return s !== 'idle' && s !== 'confirmed' && s !== 'error';
+    },
+
+    withdrawSheetStatus() {
+      return this.withdrawSheetIsBusy ? this.withdrawStatusMessage : '';
+    },
+    withdrawUnavailableMessage() {
+      const p = this.pendingPayment;
+      if (!p || p.type !== 'lnurl_withdraw') return '';
+      if (p.maxWithdrawable === 0) return this.$t('There are no funds to redeem from this request.');
+      if (p.minSats > p.maxSats) return this.$t('This request cannot be redeemed in whole sats. Ask the service for a new one.');
+      return '';
+    },
     // Show fee estimate row only when we have actual fee data to display
     // - Spark wallet: Show when we have an estimate OR it's a free Spark transfer
-    // - NWC/LNBits: Never show (no fee estimation available)
+    // - NWC/LNbits: Never show (no fee estimation available)
     showFeeEstimate() {
       if (!this.pendingPayment) return false;
       if (!this.walletStore.isActiveWalletSpark) return false;
@@ -904,97 +1977,111 @@ export default {
       // Don't show empty row when fee is null (e.g., LNURL before invoice is fetched)
       return this.isEstimatingFee || this.estimatedFee !== null;
     },
-    // Computed properties from Pinia store for wallet switcher
-    storeWallets() {
-      return this.walletStore.wallets || [];
-    },
     storeActiveWalletId() {
       return this.walletStore.activeWalletId;
     },
+    bitcoinDepositStatus() {
+      return this.pendingBitcoinDeposits.some(deposit => this.bitcoinDepositsStore.needsManual(deposit))
+        ? 'Ready to claim' : 'Incoming';
+    },
+
     storeBalances() {
       return this.walletStore.balances || {};
     },
-    storeConnectionStates() {
-      return this.walletStore.connectionStates || {};
+
+    /**
+     * The home balance pulses only while nothing is known for the active
+     * wallet yet (the placeholder). A figure already on screen (saved last
+     * time, read locally, or verified) is refreshed in place, without a
+     * pulse or dimming: the balance reads as there at once, and a newer
+     * figure rolls in when the refresh lands.
+     */
+    balanceUpdating() {
+      return !!this.activeBalanceState && !this.activeBalanceState.known;
     },
-    needsWithdrawAmountInput() {
-      if (!this.pendingPayment || this.pendingPayment.type !== 'lnurl_withdraw') return false;
-      return !this.pendingPayment.isFixedAmount;
+
+    /**
+     * Dim the figure only when it is known to be out of date: the last
+     * refresh failed. A value that is still being re-verified reads as
+     * current.
+     */
+    activeBalanceOutdated() {
+      const state = this.activeBalanceState;
+      return !!(state?.stale && state.error && !state.refreshing);
+    },
+
+    balanceNumericValue() {
+      const balance = this.activeCanonicalBalance || 0;
+      if (this.currentDisplayMode === 'fiat') {
+        const btcAmount = balance / 100000000;
+        const rate = this.walletStore.exchangeRates?.[this.walletStore.preferredFiatCurrency?.toLowerCase()];
+        if (!rate) return 0;
+        return btcAmount * rate;
+      }
+      // BIP-177: display sats as whole integers (1 bitcoin = 1 sat)
+      return balance;
+    },
+
+    fiatRateMissing() {
+      if (this.currentDisplayMode !== 'fiat') return false;
+      const rate = this.walletStore.exchangeRates?.[this.walletStore.preferredFiatCurrency?.toLowerCase()];
+      return !(rate > 0);
+    },
+
+    balanceNumberFormat() {
+      if (this.currentDisplayMode === 'fiat') {
+        return { minimumFractionDigits: 2, maximumFractionDigits: 2 };
+      }
+      // Both BIP-177 and legacy: whole integers with thousands grouping
+      return { useGrouping: true, maximumFractionDigits: 0 };
+    },
+
+    balancePrefix() {
+      if (this.currentDisplayMode === 'fiat') {
+        return fiatSymbol(this.preferredFiatCurrency);
+      }
+      if (this.walletStore.useBip177Format) return '₿';
+      return '';
+    },
+
+    balanceSuffix() {
+      if (this.currentDisplayMode === 'fiat') return '';
+      if (this.walletStore.useBip177Format) return '';
+      return ' sats';
     },
     preferredFiatCurrency() {
-      return (this.walletState.preferredFiatCurrency || 'USD').toUpperCase();
+      return (this.walletStore.preferredFiatCurrency || 'USD').toUpperCase();
     },
-    withdrawFiatCurrency() {
-      return this.preferredFiatCurrency;
+    /** Canonical state of the active wallet (known/stale/…), or null. */
+    activeBalanceState() {
+      const id = this.walletStore.activeWalletId;
+      return id && this.walletStore.balanceStateFor ? this.walletStore.balanceStateFor(id) : null;
     },
+    /** The active wallet's canonical balance value (null when unknown). */
+    activeCanonicalBalance() {
+      const id = this.walletStore.activeWalletId;
+      return id ? (this.walletStore.balanceStates?.[id]?.value ?? null) : null;
+    },
+    /**
+     * Sats amount to withdraw. Two read paths feed into this:
+     *   - Fixed-amount withdraws → use the LNURL-quoted `fixedAmountSats`
+     *     directly (paymentAmount isn't bound for these)
+     *   - Variable-amount withdraws → the PaymentConfirmSheet writes the
+     *     user-entered sats into `paymentAmount` via the bridge handler,
+     *     so we just parse it here.
+     */
     withdrawAmountSats() {
       if (!this.pendingPayment || this.pendingPayment.type !== 'lnurl_withdraw') return 0;
       if (this.pendingPayment.isFixedAmount) return this.pendingPayment.fixedAmountSats;
       const val = parseFloat(this.paymentAmount);
-      if (!val || val <= 0) return 0;
-      if (this.withdrawDenomination === 'fiat') {
-        return fiatRatesService.convertFiatToSatsSync(val, this.withdrawFiatCurrency) || 0;
-      }
-      return Math.floor(val);
-    },
-    withdrawAmountDisplay() {
-      if (!this.pendingPayment) return '';
-      if (this.pendingPayment.isFixedAmount) {
-        if (this.withdrawDenomination === 'fiat') {
-          const fiat = fiatRatesService.convertSatsToFiatSync(this.pendingPayment.fixedAmountSats, this.withdrawFiatCurrency);
-          return fiat !== null ? fiatRatesService.formatFiatAmount(fiat, this.withdrawFiatCurrency) : this.formatAmountInline(this.pendingPayment.fixedAmountSats);
-        }
-        return this.formatAmountInline(this.pendingPayment.fixedAmountSats);
-      }
-      if (!this.paymentAmount) return this.$t('Enter amount');
-      if (this.withdrawDenomination === 'fiat') {
-        const val = parseFloat(this.paymentAmount);
-        return val > 0 ? fiatRatesService.formatFiatAmount(val, this.withdrawFiatCurrency) : this.$t('Enter amount');
-      }
-      return this.formatAmountInline(parseInt(this.paymentAmount));
-    },
-    withdrawSecondaryDisplay() {
-      const sats = this.withdrawAmountSats;
-      if (!sats) return '';
-      if (this.withdrawDenomination === 'fiat') {
-        return '≈ ' + this.formatAmountInline(sats);
-      }
-      const fiat = fiatRatesService.convertSatsToFiatSync(sats, this.withdrawFiatCurrency);
-      if (fiat === null) return '';
-      return '≈ ' + fiatRatesService.formatFiatAmount(fiat, this.withdrawFiatCurrency);
-    },
-    withdrawRedeemableRange() {
-      if (!this.pendingPayment) return '';
-      if (this.withdrawDenomination === 'fiat') {
-        const minFiat = fiatRatesService.convertSatsToFiatSync(this.pendingPayment.minSats, this.withdrawFiatCurrency);
-        const maxFiat = fiatRatesService.convertSatsToFiatSync(this.pendingPayment.maxSats, this.withdrawFiatCurrency);
-        if (minFiat !== null && maxFiat !== null) {
-          return `${fiatRatesService.formatFiatAmount(minFiat, this.withdrawFiatCurrency)} - ${fiatRatesService.formatFiatAmount(maxFiat, this.withdrawFiatCurrency)}`;
-        }
-      }
-      return `${this.pendingPayment.minSats} - ${this.pendingPayment.maxSats} sats`;
-    },
-    payAmountRange() {
-      if (!this.pendingPayment || !this.needsAmountInput) return '';
-      const minSats = this.pendingPayment.minSats || (this.pendingPayment.minSendable ? Math.ceil(this.pendingPayment.minSendable / 1000) : 0);
-      const maxSats = this.pendingPayment.maxSats || (this.pendingPayment.maxSendable ? Math.floor(this.pendingPayment.maxSendable / 1000) : 0);
-      if (!minSats || !maxSats || minSats === maxSats) return '';
-      if (this.sendDenomination === 'fiat') {
-        const currency = this.preferredFiatCurrency;
-        const minFiat = fiatRatesService.convertSatsToFiatSync(minSats, currency);
-        const maxFiat = fiatRatesService.convertSatsToFiatSync(maxSats, currency);
-        if (minFiat !== null && maxFiat !== null) {
-          return `${fiatRatesService.formatFiatAmount(minFiat, currency)} - ${fiatRatesService.formatFiatAmount(maxFiat, currency)}`;
-        }
-      }
-      return `${minSats} - ${maxSats} sats`;
+      return val > 0 ? Math.floor(val) : 0;
     },
     canConfirmWithdraw() {
       if (!this.pendingPayment || this.pendingPayment.type !== 'lnurl_withdraw') return false;
       if (this.lnurlWithdrawStatus !== 'idle') return false;
-      if (this.pendingPayment.isFixedAmount) return true;
       const sats = this.withdrawAmountSats;
-      return sats >= this.pendingPayment.minSats && sats <= this.pendingPayment.maxSats;
+      return Number.isSafeInteger(sats) && sats > 0
+        && sats >= this.pendingPayment.minSats && sats <= this.pendingPayment.maxSats;
     },
     withdrawStatusMessage() {
       const messages = {
@@ -1013,19 +2100,61 @@ export default {
     setTimeout(() => {
       this.showLoadingScreen = false;
     }, 15000);
-    this.initializeWallet();
-    // Check for Bitcoin withdrawal from contacts
-    this.handleBitcoinWithdrawalFromQuery();
+    // Restore display currency from user preference
+    this.currentDisplayMode = this.walletStore.defaultDisplayCurrency || 'bitcoin';
+    this.addressBookStore.initialize();
+    // LUD-14 vouchers: load what is saved so the Receive sheet can offer a
+    // half-spent withdraw link the moment it opens. Cheap and idempotent.
+    this.withdrawVouchersStore.initialize().catch(() => {});
+    // Hydrate the Identity store so the header avatar paints with the
+    // right gradient (and the backup-pip with the right state) on first
+    // mount. Idempotent and cheap.
+    await this.identityStore.hydrate();
+    // A bucket balance is one actionable item, regardless of how many quotes
+    // made it up. Refresh it on the actual home screen so the small +1 cue is
+    // current before the user visits Identity or Get paid.
+    this.socialBucketStore.hydrate({ pubkey: this.identityStore.nostrPubkeyHex }).then(() => (
+      this.socialBucketStore.sync({ identityStore: this.identityStore })
+    )).catch(() => {});
+
+    // NFC capability for the "NFC ready" badge. Fire-and-forget — never blocks
+    // the wallet load, and stays false on web/PWA (no NFC there).
+    isNfcAvailable().then((ok) => { this.nfcReady = ok; }).catch(() => {});
+    // Keep the init promise so cross-page payment handoffs (route query)
+    // can dispatch exactly when the wallet layer is ready instead of
+    // guessing with a fixed delay.
+    this._walletInitPromise = this.initializeWallet();
+    // Check for a payment handed over from the Address Book page
+    this.handlePaymentFromQuery();
+    // Check if existing Spark wallets need one-time PIN migration
+    this.$watch(() => this.walletStore.needsPinMigration, (needs) => {
+      if (needs) this.showMigrationDialog = true;
+    }, { immediate: true });
+    // Drain any buffered deep-link / NFC payment intent. Boot files write to
+    // walletStore.pendingDeepLink instead of using a transient event so that
+    // intents arriving before this component mounts are never lost. The
+    // watcher fires immediately with the current value, then reactively on
+    // any subsequent write while we are mounted. We clear the buffer before
+    // processing so a remount does not double-process.
+    this.$watch(
+      () => this.walletStore.pendingDeepLink,
+      (paymentData) => {
+        if (!paymentData || paymentData.target === 'kiosk') return;
+        this.walletStore.pendingDeepLink = null;
+        // Dispatch once wallet initialization settles — a cold-start intent
+        // can arrive before providers are connected, and the NWC/LNbits
+        // resolution paths need the active wallet in place. Same readiness
+        // gate the route-query handoff uses.
+        Promise.resolve(this._walletInitPromise)
+          .catch(() => {})
+          .then(() => this.onPaymentDetected(paymentData));
+      },
+      { immediate: true }
+    );
   },
   beforeUnmount() {
     if (this.refreshInterval) {
       clearInterval(this.refreshInterval);
-    }
-    if (this.pulseInterval) {
-      clearInterval(this.pulseInterval);
-    }
-    if (this.invoiceCheckInterval) {
-      clearInterval(this.invoiceCheckInterval);
     }
     if (this.qrScanner) {
       this.qrScanner.destroy();
@@ -1036,11 +2165,79 @@ export default {
     this.stopWithdrawMonitor();
     // Stop merchant countdown if active
     this.stopMerchantCountdown();
+    // Abort any in-flight Branta lookup
+    this.cancelBrantaLookup();
   },
   watch: {
-    'walletState.balance': {
+    activeCanonicalBalance: {
       handler: 'updateSecondaryValue',
       immediate: true
+    },
+    'walletStore.preferredFiatCurrency': 'updateSecondaryValue',
+    'walletStore.exchangeRates': 'updateSecondaryValue',
+
+    /**
+     * The Receive modal's "Redeem" button stashes the user's intended amount
+     * in `pendingWithdrawTargetSats` and opens the redeem scanner so the
+     * redeem sheet can pre-fill it once the withdraw QR is scanned. If the
+     * scanner is dismissed without a scan, drop the stash so it can't
+     * pre-fill a later, unrelated withdraw. (Ordering is safe on a real
+     * scan: the scanned-emit chain reads and clears the stash synchronously
+     * in onPaymentDetected before this queued watcher runs.)
+     */
+    showRedeemScanner(open) {
+      if (!open) this.pendingWithdrawTargetSats = null;
+    },
+
+    /**
+     * When any deposit-claim flow finishes (auto-claim here, or the
+     * manual sheet inside L1BitcoinReceive) the wallet store bumps
+     * `depositsRefreshSignal`. Re-fetch immediately so the home-screen
+     * "Ready to claim" banner clears in step with the receive sheet,
+     * not 30s later on the next poll tick.
+     */
+    'walletStore.depositsRefreshSignal'() {
+      if (this.walletStore.lastDepositsRefreshWalletId !== this.walletStore.activeWalletId) return;
+      this.pendingBitcoinDeposits = this.pendingBitcoinDeposits.filter(d => !this.walletStore.isDepositClaimed(d.txId, d.outputIndex));
+      this.checkPendingBitcoinDeposits();
+      this.updateWalletBalance();
+    },
+
+    /**
+     * Refresh the last-transaction card whenever the active wallet
+     * changes (the switcher sheet, a removal, a newly added wallet).
+     * Flip the skeleton back on briefly so the card feels responsive
+     * to the switch rather than silently swapping its contents.
+     */
+    /** A restore found more of the phrase's wallets in the background: say so once. */
+    'walletStore.sparkDiscoveryFound'(found) {
+      if (found?.count) {
+        this.$q.notify({
+          type: 'positive',
+          message: found.count === 1
+            ? this.$t('Found 1 more wallet from your recovery phrase')
+            : this.$t('Found {count} more wallets from your recovery phrase', { count: found.count }),
+        });
+      }
+      if (found?.unchecked) {
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('Some wallets from your recovery phrase could not be checked'),
+          caption: this.$t('Adding a Spark wallet in Settings looks for them again.'),
+          timeout: 7000,
+        });
+      }
+    },
+
+    'walletStore.activeWalletId'(next, prev) {
+      this.bitcoinDepositRead++;
+      this.pendingBitcoinDeposits = [];
+      this.checkPendingBitcoinDeposits();
+      if (next === prev) return;
+      // The new wallet's last known transaction paints at once; the read
+      // below replaces it.
+      this.showCachedLastTransaction(next);
+      this.loadLastTransaction();
     },
 
     currentDisplayMode: {
@@ -1048,7 +2245,13 @@ export default {
       immediate: true
     },
 
-    showPaymentConfirmation(open) {
+    /**
+     * Merchant countdown bookkeeping — starts when a merchant payment is
+     * about to be confirmed, stops on close. We watch `showSendSheet`
+     * because merchant payments (SA retail QR) now route through the
+     * shared confirm sheet rather than the legacy dialog.
+     */
+    showSendSheet(open) {
       if (open && this.pendingPayment?.merchant) {
         this.startMerchantCountdown();
       } else {
@@ -1059,16 +2262,29 @@ export default {
       }
     },
 
+
+    /**
+     * Re-estimate fees whenever the payment payload or the entered amount
+     * changes. PaymentConfirmSheet reads `estimatedFee` / `isEstimatingFee`
+     * via `paymentSheetProps.feeEstimate` and renders the row from there.
+     */
     pendingPayment: {
-      handler: 'updatePaymentFiatValue',
+      handler: 'updateFeeEstimate',
       immediate: true,
       deep: true
     },
 
     paymentAmount: {
-      handler: 'updatePaymentFiatValue',
+      handler: 'updateFeeEstimate',
       immediate: true
     },
+
+    /**
+     * "Pay with": another paying wallet has its own fee story (only Spark
+     * wallets can estimate), so the estimate is redone for it. Capability and
+     * balance need no watcher - they are computed from the same id.
+     */
+    sendingWalletId: 'updateFeeEstimate',
 
     autoWithdrawResult(result) {
       if (!result) return
@@ -1082,104 +2298,468 @@ export default {
           timeout: 4000
         })
       } else if (result.type === 'error') {
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Auto-transfer failed'),
-          caption: result.message,
-          icon: 'error',
-          timeout: 5000
+        // Background flows funnel through the same dialog as
+        // user-initiated payments so the failure UI is consistent
+        // app-wide. The wallet name is woven into the route label
+        // so a copied report still says which wallet auto-fired.
+        this.walletStore.showPaymentError(result.error, {
+          context: 'withdraw',
+          walletType: result.walletType,
+          route: `Auto-transfer (${result.walletName})`,
+          amountSats: typeof result.amountSats === 'number' ? result.amountSats : undefined,
+          t: this.$t.bind(this),
         })
       }
       awStore.lastResult = null
     }
   },
   methods: {
-    goToBackup() {
-      this.$router.push('/settings?section=backup');
+    openEmergencyExit() {
+      this.$router.push(`/security/exit/${this.walletStore.activeWalletId}`);
     },
-
-    async openWalletManagement() {
-      // Initialize the store to ensure we have the latest wallet data
-      await this.walletStore.initialize();
-      this.showWalletSwitcher = true;
+    dismissExitBanner() {
+      const until = Date.now() + 24 * 60 * 60 * 1000;
+      this.exitBannerDismissedUntil = until;
+      localStorage.setItem('buhoGO_exit_banner_dismissed_until', String(until));
+    },
+    onAppLogoClick() {
+      if (this.updateStore.hasUpdate) {
+        this.updateStore.openSheet();
+        return;
+      }
+      this.$router.push('/about');
     },
 
     /**
-     * Handle pay contact from AddressBookQuickModal
+     * Recognize the consumer wallet behind a Lightning Address / LNURL so the
+     * confirm sheet can show its real logo + the username instead of a generic
+     * "LNURL payment" placeholder. Backfall only — the caller applies it after
+     * a saved contact and a payout-service match, never over them.
+     *
+     * Handles both entry shapes the send pipeline produces:
+     *   - a typed/scanned Lightning Address -> domain + handle split on "@"
+     *   - a raw LNURL (incl. an address already resolved to one) -> decode to
+     *     the lnurlp endpoint, then read the host (+ the handle from the
+     *     .../lnurlp/<handle> path segment).
+     *
+     * @returns {{ brand: {name, logo}, handle: string|null, address: string|null } | null}
      */
-    handlePayContact(contact) {
-      this.showAddressBookQuick = false;
+    resolveWalletBrand(p) {
+      if (!p) return null;
 
-      // Bitcoin contacts need L1 withdrawal flow
-      if (contact.addressType === 'bitcoin') {
-        const address = contact.address || contact.lightningAddress;
-        this.pendingPayment = {
-          bitcoinAddress: address,
-          contactName: contact.name
+      // Lightning Address: cleanest source — both parts are in the string.
+      if (typeof p.lightningAddress === 'string' && p.lightningAddress.includes('@')) {
+        const at = p.lightningAddress.lastIndexOf('@');
+        const brand = matchWalletBrand(p.lightningAddress.slice(at + 1));
+        return brand
+          ? { brand, handle: p.lightningAddress.slice(0, at), address: p.lightningAddress }
+          : null;
+      }
+
+      // Raw LNURL (e.g. a scanned QR): decode to the lnurlp URL and read its
+      // host. A Lightning Address resolved upstream lands here too, so the
+      // .well-known/lnurlp/<handle> path still yields the username.
+      if (p.type === 'lnurl' || p.type === 'lnurl_pay') {
+        const encoded = p.lnurl || (typeof p.data === 'string' ? p.data : '');
+        if (!encoded) return null;
+        let host;
+        let handle = null;
+        try {
+          const url = new URL(this.decodeLNURL(encoded));
+          host = url.hostname;
+          const segs = url.pathname.split('/').filter(Boolean);
+          const i = segs.lastIndexOf('lnurlp');
+          if (i >= 0 && segs[i + 1]) handle = decodeURIComponent(segs[i + 1]);
+        } catch {
+          return null;
+        }
+        const brand = matchWalletBrand(host);
+        if (!brand) return null;
+        // Reconstruct the clean address for the tap-to-reveal row; fall back to
+        // the raw encoded string when the endpoint carried no handle.
+        const address = handle ? `${handle}@${host.toLowerCase()}` : null;
+        return { brand, handle, address };
+      }
+
+      return null;
+    },
+
+    /**
+     * Build the recipient identity for a Nostr-native address (npub.cash & co.,
+     * behind an address. Two sources feed it:
+     *   - the address local part is itself an npub (npub.cash), or
+     *   - we paid a bare npub/nprofile and carried the pubkey + profile here.
+     * Precedence, most-personal first:
+     *   1. a saved contact matched by pubkey — their name + avatar
+     *   2. the resolved Nostr profile — name + avatar (from p.nostrProfile,
+     *      set by the send-time resolve or runNostrRecipientEnrichment)
+     *   3. a tidy truncated npub over the provider logo — the instant baseline.
+     *
+     * @param {object} p        the pending payment (carries p.nostrProfile)
+     * @param {string} pubkey   the person's hex pubkey
+     * @param {string} npub     their npub (for the truncated baseline)
+     * @param {string} address  what the reveal row shows (lud16 / npub / lnurl)
+     * @param {{name: string, logo: string}|null} brand  provider brand, or null
+     */
+    buildNostrPersonRecipient(p, pubkey, npub, address, brand) {
+      // A Nostr friend the user already saved wins — matched by pubkey, not by
+      // this address (their saved address is usually a different lud16).
+      const contact = this.addressBookStore.findContactByPubkey(pubkey);
+      if (contact) {
+        return this.recipientFromContact(contact, {
+          fallbackName: shortenNpub(npub),
+          fallbackColor: '#3B82F6',
+          addressType: 'lightning',
+          address,
+        });
+      }
+      // Otherwise: the live profile avatar, else the provider brand logo, else
+      // the Nostr ostrich — so a profile-less npub still reads as a Nostr
+      // identity rather than a bare 'N' initial.
+      const prof = p.nostrProfile;
+      const picture = (prof && prof.picture) || '';
+      const usingBrandLogo = !picture && !!brand;
+      return {
+        name: profileDisplayName(prof) || shortenNpub(npub),
+        color: '#3B82F6',
+        addressType: 'lightning',
+        logoUrl: picture || (brand ? brand.logo : '/nostr/nostr.png'),
+        logoContain: usingBrandLogo && brand.logoContain === true,
+        logoInset: usingBrandLogo ? (brand.logoInset || '') : '',
+        logoBg: usingBrandLogo ? (brand.logoBg || '') : '',
+        walletBrand: brand ? brand.name : '',
+        address,
+      };
+    },
+
+    /**
+     * Thin wrapper around the Nostr resolver used by the NIP-05 fallback:
+     * returns the resolved {kind, address, pubkey, npub, profile} or null on any
+     * failure, so a miss simply leaves the original Lightning-address path
+     * untouched (no error surfaced — the address genuinely just didn't resolve).
+     */
+    async resolveNostrTarget(input) {
+      try {
+        // Bounded so the NIP-05 fallback (nostr.json + kind:0 fetch) can't leave
+        // the Send sheet resolving indefinitely.
+        return await resolveNostrLightningTarget(input, { timeoutMs: 8000 });
+      } catch {
+        return null;
+      }
+    },
+
+    /**
+     * Surface a send-resolution failure (a destination that didn't resolve).
+     * From the open Send sheet we show it inline in the field so the user can
+     * fix the input without leaving; otherwise (deep link, etc.) we fall back
+     * to the global error dialog. The caller has already set `resolved = false`.
+     */
+    failSendResolution(message, fromField, dialogOpts = {}) {
+      if (fromField) {
+        this.sendResolveError = message;
+      } else {
+        this.walletStore.showPaymentError(new Error(message), {
+          context: dialogOpts.context || 'payment',
+          route: dialogOpts.route || 'Payment dispatch',
+          t: this.$t.bind(this),
+        });
+      }
+    },
+
+    /**
+     * User-facing copy for a Spark invoice that cannot be paid. Shared by
+     * the resolve-time check (before the sheet opens) and the pay-time
+     * re-check (the sheet may have outlived the expiry, and sender pinning
+     * is only final against the connected wallet).
+     */
+    sparkInvoiceProblemMessage(problem) {
+      switch (problem) {
+        case 'expired':
+          return this.$t('This payment request has expired. Ask for a new one.');
+        case 'token_invoice':
+          return this.$t('This payment request is for a token, which BuhoGO does not support.');
+        case 'sender_mismatch':
+          return this.$t('This payment request is reserved for a different wallet.');
+        case 'sender_unknown':
+          return this.$t('Unlock your Spark wallet first, then try this payment request again.');
+        default:
+          return this.$t('This payment code cannot be read.');
+      }
+    },
+
+    /**
+     * Resolve the real Nostr profile (name + avatar) behind an npub.cash-style
+     * address and patch it onto the live payment, so the confirm sheet upgrades
+     * from "Cashu + npub1abc…" to the actual person a moment after it opens.
+     *
+     * Fire-and-forget, mirroring runBrantaVerification: it can never block or
+     * break the send, every failure path resolves to "keep the baseline", and
+     * an identity guard stops a late result from landing on a different payment.
+     */
+    runNostrRecipientEnrichment(payment) {
+      try {
+        if (!payment) return;
+        const brand = this.resolveWalletBrand(payment);
+        if (!brand) return; // only providers we'd actually brand (npub.cash …)
+        const ids = npubFromLightningAddress(payment.lightningAddress || brand.address);
+        if (!ids) return;
+        // Already a saved contact? The sheet shows them from the local cache —
+        // no need to hit the relays at all.
+        if (this.addressBookStore.findContactByPubkey(ids.pubkey)) return;
+
+        const token = payment; // identity guard, same as Branta
+        fetchProfile(ids.pubkey, { timeoutMs: DEFAULT_FETCH_TIMEOUT_MS })
+          .then((event) => {
+            if (!event) return;
+            if (this.pendingPayment !== token) return;
+            const profile = parseProfileContent(event);
+            const name = profileDisplayName(profile);
+            const picture = sanitizeImageUrl(profile.picture);
+            // The sheet only reads profile fields, but post-payment contact
+            // saving also needs the verified event and canonical identity.
+            this.pendingPayment.nostrPubkey = ids.pubkey;
+            this.pendingPayment.nostrNpub = ids.npub;
+            this.pendingPayment.nostrProfileEvent = event;
+            this.pendingPayment.nostrRelayHints = [];
+            this.pendingPayment.nostrProfile = { ...profile, name, picture };
+          })
+          .catch(() => { /* never surfaces; baseline stays */ });
+      } catch {
+        // Defensive: enrichment must never disrupt the payment path.
+      }
+    },
+
+    /**
+     * Build a PaymentConfirmSheet recipient payload from a saved
+     * address-book contact, falling back to the supplied defaults
+     * when no contact is found. Threads the Nostr `picture` field
+     * through the sheet's existing `logoUrl` slot so the real
+     * avatar appears on the Send-to screen — same plumbing the
+     * merchant QR flow uses.
+     */
+    recipientFromContact(contact, fallback) {
+      if (!contact) {
+        return {
+          name: fallback.fallbackName,
+          color: fallback.fallbackColor,
+          // Anonymous rail destinations carry the ₿ glyph instead of a
+          // letter initial — one Bitcoin identity across every send.
+          ...(fallback.fallbackInitial ? { initial: fallback.fallbackInitial } : {}),
+          addressType: fallback.addressType,
+          address: fallback.address,
+          matchedContact: false,
         };
-        this.showPaymentConfirmation = true;
+      }
+      const nostrPicture = typeof contact.nostr_profile?.picture === 'string'
+        ? contact.nostr_profile.picture.trim()
+        : '';
+      const service = !!contact.service || contact.addressType === 'lnurl';
+      const serviceLogo = service ? this.serviceImagesStore?.get(contact.address || contact.lightningAddress) : '';
+      const safeLogoUrl = serviceLogo || (/^(https?:|data:image\/)/i.test(nostrPicture) ? nostrPicture : '');
+      return {
+        name: contact.name || fallback.fallbackName,
+        color: contact.color || fallback.fallbackColor,
+        logoUrl: safeLogoUrl,
+        // Matched contact without a picture: the sheet renders the monoline
+        // silhouette (same mark ContactAvatar shows everywhere else) — the
+        // colored-initial circles are retired.
+        silhouette: !safeLogoUrl && !service,
+        service,
+        addressLabel: fallback.addressType === 'lnurl' ? lnurlDomain(fallback.address) : '',
+        addressType: fallback.addressType,
+        address: fallback.address,
+        matchedContact: true,
+      };
+    },
+
+    goToBackup() {
+      this.$router.push('/security');
+    },
+
+    /**
+     * The clipboard strip's Use.
+     *
+     * The destination is already chosen, so the Send sheet has nothing to
+     * ask: raising it only to fill its field, show "Fetching…" and drop it
+     * again made the user watch three surfaces cycle for one tap. We
+     * resolve straight from Home instead — the strip carries the wait in
+     * place (clipboardResolving) and the confirm sheet is the only thing
+     * that opens.
+     *
+     * The Send sheet is still the home for anything that needs a human:
+     * a string these rails can't route on their own (wrapped address
+     * requests, a wallet switched under the offer) is handed to it as a
+     * paste, and a destination that fails to resolve reopens it with the
+     * text and the reason inline, where fixing it belongs.
+     */
+    async useClipboardDestination(text) {
+      if (this.clipboardResolving) return;
+      if (offerAddressRequest(text, { t: this.$t.bind(this) })) return;
+
+      const payload = this.clipboardPaymentPayload(text);
+      if (!payload) {
+        this.showSendModal = true;
+        this.$nextTick(() => this.$refs.sendModal?.useDestination(text));
         return;
       }
 
-      // Lightning and Spark contacts use PaymentModal
-      this.selectedPayContact = contact;
-      this.showContactPayment = true;
-    },
-
-    /**
-     * Handle successful contact payment
-     */
-    handleContactPaymentSent() {
-      this.selectedPayContact = null;
-      this.$q.notify({
-        type: 'positive',
-        message: this.$t('Payment sent'),
-        timeout: 2000
-      });
-      // Refresh balance for active wallet
-      if (this.walletStore.activeWalletId) {
-        this.walletStore.refreshWalletData(this.walletStore.activeWalletId);
+      haptics.tap();
+      this.sendResolveError = '';
+      this.clipboardResolving = true;
+      try {
+        await this.onPaymentDetected(payload);
+      } finally {
+        this.clipboardResolving = false;
+      }
+      // Didn't resolve: the sheet takes over, carrying both the string and
+      // the reason (onPaymentDetected reported it inline — see fromField).
+      if (this.sendResolveError) {
+        const message = this.sendResolveError;
+        this.sendResolveError = '';
+        this.showSendModal = true;
+        this.$nextTick(() => this.$refs.sendModal?.revealFailed(text, message));
       }
     },
 
     /**
-     * Handle Bitcoin payment request from contact modal
+     * Turn a copied destination into the payload onPaymentDetected takes,
+     * or null when these rails can't route it on their own.
+     *
+     * Mirrors the Send field's own pre-dispatch steps — payout phone number
+     * first (its digits would otherwise be read as something else), then
+     * the BIP21 / wrapper unwrap, a bare Nostr key, and the capability
+     * guard — so the strip reaches the confirm sheet by exactly the rails
+     * a paste would take, minus the sheet. Anything else returns null and
+     * the sheet resolves it the long way, which keeps the rarer shapes
+     * (SA-retail QR text, a wrapped address request) on one code path.
      */
-    handleBitcoinPaymentFromContact(paymentData) {
-      this.showContactPayment = false;
-      this.selectedPayContact = null;
-      // Navigate to Bitcoin withdrawal
-      const address = paymentData.address || paymentData.contact?.address;
-      this.pendingPayment = {
-        bitcoinAddress: address,
-        contactName: paymentData.contact?.name
+    clipboardPaymentPayload(text) {
+      const rawInput = (text || '').trim();
+      if (!rawInput) return null;
+      const walletType = this.walletStore.activeWalletType;
+
+      // A recognized KE/ZM mobile number is a fiat payout: resolve it to
+      // its provider Lightning address before any other classifier sees
+      // the digits.
+      const phone = recognizePhoneNumber(rawInput);
+      if (phone) return { data: phone.lightningAddress, type: 'lightning_address', rawInput };
+
+      const { cleaned, bip21 } = normalizeDestination(rawInput, walletType);
+      if (!cleaned) return null;
+      const data = isLightningAddressShared(cleaned) ? cleaned.toLowerCase() : cleaned;
+
+      // Bare npub / nprofile: onPaymentDetected resolves the profile to its
+      // Lightning target and carries the person onto the confirm sheet.
+      const nostrKind = classifyIdentifier(data);
+      if (nostrKind === 'npub' || nostrKind === 'nprofile') {
+        return { data, type: 'nostr_identifier', rawInput, paymentOnly: true };
+      }
+
+      const type = classifyDestination(data, walletType);
+      if (type === 'unknown' || type === 'address_request') return null;
+      if (!canWalletPay(walletType, type)) return null;
+      return { data, type, rawInput, ...(bip21 ? { bip21 } : {}) };
+    },
+
+    async openWalletManagement() {
+      if (this.showWalletSwitcher) return; // Prevent double-open
+      this.showWalletSwitcher = true;
+
+      // Refresh every wallet's balance; the store marks each refresh, which
+      // the sheet shows (utils/balanceState.js). Spark wallets all stay
+      // connected (#285), so each refreshes through the lifecycle; other
+      // wallets through the store.
+      await Promise.allSettled(
+        this.walletStore.wallets.map((w) => (w.type === 'spark'
+          ? this.walletStore.reconcileSpark([w.id], 'user')
+          : this.walletStore.refreshWalletData(w.id))),
+      );
+    },
+
+    /**
+     * One entry point for "pay this saved contact" from every surface
+     * outside the Send sheet (wallet-home quick modal, Address Book page
+     * via route query). Applies the shared capability gate, then hands
+     * the address to the canonical dispatcher — the same pipeline the
+     * scanner and Send sheet feed — so a contact payment gets everything
+     * a scanned address gets: real LNURL metadata (amount bounds,
+     * commentAllowed, LUD-21 payout currency), Branta verification,
+     * wallet/Nostr branding, and fee estimates.
+     *
+     * `sendingWalletId` preselects the wallet that pays ("Pay with"); without
+     * it the default pick applies (the active wallet when it can pay this
+     * rail). The capability gate is asked of that wallet, so a contact the
+     * active wallet cannot pay is still payable from another wallet that can.
+     * The active wallet is never switched.
+     *
+     * `addressType: 'invoice'` pays a BOLT-11 invoice handed over as `address`
+     * (a payment request from the contact chat). `context` is an opaque string
+     * of the caller; it is returned unchanged in the `payment:sent` event once
+     * the payment succeeded (see `emitPaymentSent`). `prefill` ({ amountSats,
+     * note }) fills the confirm sheet for a payment made for a request that has
+     * no invoice any more; the sender still reviews and confirms it.
+     */
+    payContactDestination({ address, addressType, name, sendingWalletId = null, context = null, contactId = null, prefill = null }) {
+      if (!address) return;
+      if (offerAddressRequest(address, { t: this.$t.bind(this), paymentOnly: true })) return;
+      const payerId = this.chooseSendingWalletId(addressType, sendingWalletId);
+      if (!canWalletPay(this.walletTypeOf(payerId), addressType)) {
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('Cannot pay this contact'),
+          caption: walletSwitchHint(addressType, this.$t.bind(this)),
+          timeout: 3500,
+        });
+        return;
+      }
+      const typeMap = {
+        spark: 'spark_address',
+        arkade: 'arkade_address',
+        bitcoin: 'bitcoin_address',
+        lightning: 'lightning_address',
+        lnurl: 'lnurl',
+        invoice: 'lightning_invoice',
       };
-      this.showPaymentConfirmation = true;
+      void this.onPaymentDetected({
+        type: typeMap[addressType] || 'lightning_address',
+        data: address,
+        contactName: name || null,
+        paymentOnly: true,
+        sendingWalletId: payerId,
+        ...(context ? { paymentContext: context } : {}),
+        ...(prefill ? { prefill } : {}),
+        // Only an invoice needs it, and only a contact that exists is kept.
+        ...(addressType === 'invoice' && contactId && this.addressBookStore.getEntryById(contactId)
+          ? { paymentContactId: contactId } : {}),
+      });
     },
 
     /**
      * Handle batch send completion
      */
-    handleBatchCompleted(results) {
-      const succeeded = results.filter(r => r.status === 'success').length;
-      const failed = results.filter(r => r.status === 'failed' || r.status === 'skipped').length;
-
-      this.$q.notify({
-        type: failed === 0 ? 'positive' : 'warning',
-        message: failed === 0
-          ? this.$t('{count} payments sent', { count: succeeded })
-          : this.$t('{sent} sent, {failed} failed', { sent: succeeded, failed }),
-        timeout: 3000
-      });
+    handleBatchCompleted(_results) {
+      // BatchSendModal step 5 already presents the full success
+      // surface (checkmark + total + per-recipient failure list).
+      // A trailing parent toast on top of that would be redundant
+      // chrome — the user has already seen the canonical result.
+      // Kept as a hook in case future flows need to react after a
+      // batch completes (e.g. refresh background data).
     },
 
     // ==========================================
     // L1 Bitcoin Deposit Methods
     // ==========================================
 
-    /**
-     * Open receive modal with Bitcoin tab selected
-     */
+    // One-line explainer for the NFC-ready badge.
+    onNfcBadge() {
+      this.$q.notify({
+        message: this.$t('NFC ready'),
+        caption: this.$t('Hold a Bolt Card or NFC tag to your phone to pay or redeem'),
+        timeout: 3500,
+        position: 'top',
+      });
+    },
+
     openReceiveModalBitcoin() {
       this.showReceiveModal = true;
       // The ReceiveModal will receive this via a prop or event
@@ -1195,97 +2775,52 @@ export default {
     async checkPendingBitcoinDeposits() {
       if (!this.isSparkWallet) return;
 
+      const walletId = this.walletStore.activeWalletId;
+      const read = ++this.bitcoinDepositRead;
+      const isCurrent = () => read === this.bitcoinDepositRead && walletId === this.walletStore.activeWalletId;
       try {
         const provider = await this.walletStore.ensureSparkConnected();
-        if (!provider?.getPendingDeposits) return;
+        if (!isCurrent() || !provider?.getPendingDeposits) return;
 
         const newDeposits = await provider.getPendingDeposits();
+        if (!isCurrent()) return;
+        this.walletStore.reconcileDepositClaims(newDeposits);
 
-        // Detect changes and show notifications
-        this.detectDepositChanges(newDeposits);
+        // An instantly-claimed deposit keeps showing in the SDK's pending
+        // list until its confirmations catch up. Filter it everywhere so
+        // no banner, chip, or handler ever acts on a UTXO we already swept.
+        const unclaimed = newDeposits.filter(
+          (d) => !this.walletStore.isDepositClaimed(d.txId, d.outputIndex)
+        );
 
-        this.pendingBitcoinDeposits = newDeposits;
+        this.pendingBitcoinDeposits = unclaimed;
+        void this.bitcoinDepositsStore.processDeposits(unclaimed, walletId);
       } catch (error) {
         // Silently ignore - wallet may be locked
       }
     },
 
     /**
-     * Detect deposit changes and trigger notifications
-     */
-    detectDepositChanges(newDeposits) {
-      const previousTxIds = new Set(this.pendingBitcoinDeposits.map(d => d.txId));
-      const previousConfirmed = new Map(this.pendingBitcoinDeposits.map(d => [d.txId, d.confirmed]));
-
-      for (const deposit of newDeposits) {
-        // New deposit detected (not seen before)
-        if (!previousTxIds.has(deposit.txId)) {
-          this.notifyNewDeposit(deposit);
-        }
-        // Deposit became claimable (was not confirmed, now is)
-        else if (deposit.confirmed && !previousConfirmed.get(deposit.txId)) {
-          this.notifyDepositReady(deposit);
-        }
-      }
-    },
-
-    /**
-     * Show notification for new deposit detected
-     */
-    notifyNewDeposit(deposit) {
-      this.$q.notify({
-        type: 'info',
-        icon: 'currency_bitcoin',
-        message: this.$t('Bitcoin detected'),
-        caption: `${deposit.amount.toLocaleString()} sats ${this.$t('confirming')}`,
-        position: 'top',
-        timeout: 5000,
-        actions: [{
-          label: this.$t('View'),
-          color: 'white',
-          handler: () => this.openReceiveModalBitcoin()
-        }]
-      });
-    },
-
-    /**
-     * Show notification when deposit is ready to claim
-     */
-    notifyDepositReady(deposit) {
-      this.$q.notify({
-        type: 'positive',
-        icon: 'check_circle',
-        message: this.$t('Ready to claim'),
-        caption: `${deposit.amount.toLocaleString()} sats`,
-        position: 'top',
-        timeout: 8000,
-        actions: [{
-          label: this.$t('Claim'),
-          color: 'white',
-          handler: () => this.openReceiveModalBitcoin()
-        }]
-      });
-    },
-
-    /**
      * Start polling for pending Bitcoin deposits
      */
     startBitcoinDepositPolling() {
-      if (!this.isSparkWallet) return;
+      this.stopBitcoinDepositPolling();
 
       // Initial check
       this.checkPendingBitcoinDeposits();
 
-      // Poll every 5 minutes
+      // Cadence is tuned in stores/bitcoinPreferences.js so it stays a
+      // single knob rather than scattered magic numbers.
       this.bitcoinDepositPollingInterval = setInterval(() => {
         this.checkPendingBitcoinDeposits();
-      }, 300000);
+      }, BITCOIN_DEPOSIT_POLL_MS);
     },
 
     /**
      * Stop Bitcoin deposit polling
      */
     stopBitcoinDepositPolling() {
+      this.bitcoinDepositRead++;
       if (this.bitcoinDepositPollingInterval) {
         clearInterval(this.bitcoinDepositPollingInterval);
         this.bitcoinDepositPollingInterval = null;
@@ -1296,59 +2831,208 @@ export default {
      * Handle deposits updated from ReceiveModal
      */
     handleBitcoinDepositsUpdated(deposits) {
-      this.pendingBitcoinDeposits = deposits;
+      this.pendingBitcoinDeposits = deposits.filter(d => !this.walletStore.isDepositClaimed(d.txId, d.outputIndex));
     },
 
     /**
      * Handle successful Bitcoin withdrawal
      */
-    handleBitcoinWithdrawalComplete(result) {
-      this.showPaymentConfirmation = false;
-      this.pendingPayment = null;
+    /**
+     * Handle a freshly-submitted Bitcoin withdrawal.
+     *
+     * The L1 sheet emits this once with the SSP-issued request ID and
+     * closes itself. From here we:
+     *   1. tear down the pending-payment context so the sheet can unmount,
+     *   2. refresh the wallet balance (the SSP debits immediately even
+     *      though the L1 broadcast happens later),
+     *   3. show a persistent "submitted" toast and poll
+     *      `getCoopExitRequest` in the background until the SSP returns
+     *      the on-chain txid (or reports failure / expiry),
+     *   4. swap the toast for either a tappable mempool link or a clear
+     *      failure message.
+     *
+     * Polling lives here (not on the sheet) because the sheet's `v-if`
+     * is bound to `pendingPayment`, which we clear in step 1 — moving
+     * the polling onto the sheet would race the unmount.
+     */
+    /**
+     * Spark on-chain executor, run from the shared confirm sheet. The
+     * amount comes from the sheet, the speed/quote from the fee panel
+     * (l1Fee — the commit gate guarantees it's settled before the slide
+     * can complete; the guard here is the belt-and-braces backstop).
+     *
+     * On submit-accepted this deliberately does NOT show the instant-
+     * payment success screen: an on-chain withdrawal is a request the
+     * SSP still has to broadcast, so the honest surface is the
+     * submitted-toast + background monitor (mempool link when it lands).
+     */
+    async executeSparkL1Withdrawal(amountSats) {
+      const fee = this.l1Fee;
+      if (!fee?.ready || fee.insufficient) {
+        this.$refs.sendSheetRef?.resetSlide();
+        return;
+      }
 
-      this.$q.notify({
-        type: 'positive',
-        message: this.$t('Bitcoin withdrawal initiated'),
-        caption: this.$t('Your withdrawal is being processed'),
+      // Bound to the wallet that pays before anything is awaited, so a later
+      // wallet switch cannot move a withdrawal that is already under way.
+      const walletId = this.getSendingWallet()?.id || null;
 
-        timeout: 4000,
-        actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+      this.isSendingPayment = true;
+      try {
+        const provider = await this.walletStore.ensureSparkConnected(walletId);
+        if (!provider?.withdrawToL1) throw new Error('Withdrawal not supported');
+
+        const result = await provider.withdrawToL1({
+          amountSats,
+          destinationAddress: this.l1DestinationAddress,
+          speed: fee.speed,
+          feeQuoteId: fee.feeQuoteId,
+          feeAmountSats: fee.totalFeeSats,
+          deductFeeFromWithdrawalAmount: false
+        });
+
+        // Same post-submit lifecycle as before the fold: close the sheet,
+        // clear the payment, poll in the background with toasts. Polling
+        // lives here (not on the sheet) because clearing pendingPayment
+        // tears the sheet down.
+        this.showSendSheet = false;
+        this.pendingPayment = null;
+        this.sendingWalletId = null;
+        this.l1Fee = null;
+        this.sendSheetAmountSats = 0;
+        this.refreshPayerBalance(walletId);
+        this._monitorL1Withdrawal(result.requestId, walletId);
+      } catch (error) {
+        console.error('Withdrawal failed:', error);
+        const msg = describeL1WithdrawError(error, this.$t.bind(this));
+        this.walletStore.showPaymentError(error, {
+          context: 'withdraw',
+          route: 'L1 withdrawal',
+          amountSats,
+          title: msg.title,
+          reason: msg.description,
+          t: this.$t.bind(this),
+        });
+        this.$refs.sendSheetRef?.resetSlide();
+      } finally {
+        this.isSendingPayment = false;
+      }
+    },
+
+    /**
+     * Background poll for an L1 withdrawal until it reaches a terminal
+     * state. Notification handles update in place: persistent "submitted"
+     * → success-with-mempool-link or a clear failure message.
+     */
+    async _monitorL1Withdrawal(requestId, walletId = null) {
+      // The wallet that submitted the withdrawal watches it; the active wallet
+      // only when no other was named.
+      const provider = walletId
+        ? this.walletStore.getProvider(walletId)
+        : this.walletStore.getActiveProvider();
+      if (!provider?.waitForWithdrawalCompletion) {
+        console.warn('Paying provider cannot monitor L1 withdrawals');
+        return;
+      }
+
+      const dismissProcessing = this.$q.notify({
+        type: 'ongoing',
+        message: this.$t('Bitcoin withdrawal submitted'),
+        caption: this.$t('Waiting for on-chain broadcast...'),
+        timeout: 0,
+        spinner: true
       });
 
-      // Refresh balance
-      this.updateWalletBalance();
-    },
+      try {
+        const final = await provider.waitForWithdrawalCompletion(requestId);
+        dismissProcessing();
 
-    /**
-     * Handle Bitcoin withdrawal error
-     */
-    handleBitcoinWithdrawalError(error) {
-      // Error notification is already shown by the component
-      console.error('Bitcoin withdrawal error:', error);
-    },
+        if (final.isFailed) {
+          this.$q.notify({
+            type: 'negative',
+            message: this.$t('Withdrawal failed'),
+            caption: this.$t('Your funds remain in your wallet.'),
+            timeout: 6000
+          });
+          this.refreshPayerBalance(walletId);
+          return;
+        }
 
-    /**
-     * Handle Bitcoin withdrawal request from query params (from contacts)
-     */
-    handleBitcoinWithdrawalFromQuery() {
-      const query = this.$route.query;
-      if (query.action === 'bitcoin_withdrawal' && query.address) {
-        // Wait for wallet to be loaded
-        this.$nextTick(() => {
-          setTimeout(() => {
-            // Set up pending payment for Bitcoin withdrawal
-            this.pendingPayment = {
-              type: 'bitcoin_address',
-              bitcoinAddress: query.address,
-              contactName: query.contactName || null
-            };
-            this.showPaymentConfirmation = true;
+        const mempoolUrl = provider.getMempoolExplorerUrl?.();
+        const txId = final.txId;
 
-            // Clear query params
-            this.$router.replace({ query: {} });
-          }, 500);
+        this.$q.notify({
+          type: 'positive',
+          message: this.$t('Bitcoin sent'),
+          caption: txId ? this.$t('Tap to view transaction') : this.$t('Your withdrawal completed'),
+          timeout: 6000,
+          actions: (txId && mempoolUrl) ? [{
+            icon: 'open_in_new',
+            color: 'white',
+            handler: () => window.open(`${mempoolUrl}/tx/${txId}`, '_blank')
+          }] : []
+        });
+
+        this.refreshPayerBalance(walletId);
+      } catch (error) {
+        console.warn('L1 withdrawal monitor stopped:', error.message);
+        dismissProcessing();
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('Still settling'),
+          caption: this.$t('Your withdrawal is taking longer than usual. Check your activity feed.'),
+          timeout: 6000
         });
       }
+    },
+
+    /**
+     * Handle a payment handed over via route query (Address Book page →
+     * wallet). `pay_contact` carries any contact rail, and optionally the
+     * wallet that should pay as `walletId` ("Pay with" preselection; an
+     * unknown id is ignored); the legacy `bitcoin_withdrawal` action is
+     * still accepted so nothing that linked against it breaks.
+     */
+    handlePaymentFromQuery() {
+      const query = this.$route.query;
+      const isPayContact = query.action === 'pay_contact' && query.address;
+      const isLegacyBitcoin = query.action === 'bitcoin_withdrawal' && query.address;
+      if (!isPayContact && !isLegacyBitcoin) return;
+      // A repeated param arrives as an array; only a single id means anything.
+      const walletId = isPayContact && typeof query.walletId === 'string' ? query.walletId : null;
+      // Opaque caller context, handed back in `payment:sent`. A repeated
+      // param is ignored, like walletId.
+      const context = isPayContact && typeof query.context === 'string' && query.context ? query.context : null;
+      // Amount and note to fill into the confirm sheet (Send anyway on an
+      // expired chat request). Only a clean positive integer counts.
+      const prefillSats = isPayContact && typeof query.prefillAmount === 'string' && /^[1-9][0-9]{0,14}$/.test(query.prefillAmount)
+        ? Number(query.prefillAmount) : null;
+      const prefillNote = isPayContact && typeof query.prefillNote === 'string' ? query.prefillNote : '';
+      const prefill = prefillSats || prefillNote ? { amountSats: prefillSats, note: prefillNote } : null;
+      // Address-book id of the contact an invoice is paid to (a chat request).
+      const contactId = isPayContact && query.addressType === 'invoice'
+        && typeof query.contactId === 'string' && query.contactId ? query.contactId : null;
+
+      // Dispatch once wallet initialization settles (success or failure —
+      // a failed init still gets the proper payment-error surface), then
+      // route through the shared contact entry point (capability gate +
+      // canonical dispatcher).
+      Promise.resolve(this._walletInitPromise)
+        .catch(() => {})
+        .then(() => {
+          this.payContactDestination({
+            address: query.address,
+            addressType: isLegacyBitcoin ? 'bitcoin' : (query.addressType || 'lightning'),
+            name: query.contactName || null,
+            sendingWalletId: walletId,
+            ...(context ? { context } : {}),
+            ...(contactId ? { contactId } : {}),
+            ...(prefill ? { prefill } : {}),
+          });
+
+          // Clear query params
+          this.$router.replace({ query: {} });
+        });
     },
 
     async switchToWallet(walletId) {
@@ -1358,25 +3042,17 @@ export default {
       }
 
       try {
-        // Use the wallet store to switch - this keeps Settings in sync
-        await this.walletStore.switchActiveWallet(walletId);
-
-        // Also update local walletState to stay in sync
-        this.walletState.activeWalletId = walletId;
-
-        // Get the new active wallet's balance from the store
-        this.walletState.balance = this.storeBalances[walletId] || 0;
-
-        // Save state to localStorage
-        localStorage.setItem('buhoGO_wallet_state', JSON.stringify(this.walletState));
-
+        // Use the wallet store to switch - this keeps Settings in sync. The
+        // active wallet changes at once; the sheet closes onto its saved
+        // balance while a wallet that is not live yet connects.
+        const switching = this.walletStore.switchActiveWallet(walletId);
         this.showWalletSwitcher = false;
+        await switching;
 
         this.$q.notify({
           type: 'positive',
           message: this.$t('Wallet switched'),
 
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
 
         // Check if Spark wallet needs PIN unlock
@@ -1386,18 +3062,17 @@ export default {
         this.updateWalletBalance();
       } catch (error) {
         console.error('Error switching wallet:', error);
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Couldn\'t switch wallet'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+        this.walletStore.showPaymentError(error, {
+          context: 'connect',
+          route: 'Switch wallet',
+          t: this.$t.bind(this),
         });
       }
     },
 
     goToSettings() {
       this.showWalletSwitcher = false;
-      this.$router.push('/settings');
+      this.$router.push('/settings?section=wallets');
     },
 
     // ==========================================
@@ -1415,68 +3090,30 @@ export default {
     /**
      * Handle successful internal transfer
      */
-    onTransferComplete(result) {
-      this.$q.notify({
-        type: 'positive',
-        message: this.$t('Transfer complete'),
-        caption: `${result.amount.toLocaleString()} sats`,
-        timeout: 4000,
-        actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-      });
-
-      // Refresh wallet balance
+    onTransferComplete() {
+      // The transfer's completion screen is the confirmation.
       this.updateWalletBalance();
     },
 
-    getWalletColorClass(wallet) {
-      const colors = ['wallet-green', 'wallet-blue', 'wallet-purple', 'wallet-orange', 'wallet-red'];
-      const index = wallet.id.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % colors.length;
-      return colors[index];
-    },
-    getWalletIcon(type) {
-      switch (type) {
-        case 'spark': return 'tabler:flame';
-        case 'lnbits': return 'tabler:server';
-        default: return 'tabler:wallet';
-      }
-    },
-    getWalletBadgeIcon(type) {
-      switch (type) {
-        case 'spark': return 'tabler:flame';
-        case 'lnbits': return 'tabler:server';
-        default: return 'tabler:plug';
-      }
-    },
-    getWalletTypeLabel(type) {
-      switch (type) {
-        case 'spark': return 'Spark';
-        case 'lnbits': return 'LNBits';
-        default: return 'NWC';
-      }
-    },
-    getWalletTypeBadgeClass(type) {
-      switch (type) {
-        case 'spark': return 'type-spark';
-        case 'lnbits': return 'type-lnbits';
-        default: return 'type-nwc';
-      }
-    },
     async initializeWallet() {
       try {
-        await this.loadWalletState();
-
-        // Initialize wallet store
-        await this.walletStore.initialize();
+        // Paint the home screen as soon as the saved wallets and balances
+        // are loaded. Connecting the wallets, fresh rates and the Spark sync
+        // continue behind it and update the figures in place.
+        const ready = this.walletStore.initialize();
+        await this.walletStore.whenHydrated();
+        this.showCachedLastTransaction(this.walletStore.activeWalletId);
+        this.showLoadingScreen = false;
+        await ready;
+        await this.updateWalletBalance();
 
         // Start L1 Bitcoin deposit polling for banner (after wallet store is ready)
         this.startBitcoinDepositPolling();
 
         await this.loadFiatRates();
-        await this.loadTransactions();
-        await this.loadNostrProfiles();
+        await this.loadLastTransaction();
 
         this.startPeriodicRefresh();
-        this.startPulseAnimation();
 
         this.showLoadingScreen = false;
 
@@ -1488,226 +3125,228 @@ export default {
       }
     },
 
+    /** The wallet's last known transaction, before any provider read. */
+    showCachedLastTransaction(walletId) {
+      const cached = walletId ? readCachedTransactions(walletId)[0] || null : null;
+      this.lastTransaction = cached;
+      this.isLoadingLastTransaction = !cached;
+    },
+
     async checkSparkWalletUnlock() {
-      // Check if active wallet is Spark and needs unlocking
+      // Skip if migration is pending — the migration dialog handles connection
+      if (this.walletStore.needsPinMigration) return;
+
+      // Auto-connect Spark wallet if not already connected
       if (this.walletStore.isActiveWalletSpark) {
         const provider = this.walletStore.getActiveProvider();
         if (!provider) {
-          // Spark wallet exists but not unlocked - show PIN dialog
-          this.pinError = '';
-          this.showPinDialog = true;
+          try {
+            await this.walletStore.connectAllSparkWallets();
+            await this.updateWalletBalance();
+            this.checkPendingBitcoinDeposits();
+          } catch (error) {
+            console.warn('Spark auto-connect failed:', error.message);
+          }
         }
       }
     },
 
-    async handlePinComplete(pin) {
+    async handleMigration() {
+      if (!this.migrationPin || this.migrationPin.length < 6) return;
+
+      this.isMigrating = true;
+      this.migrationError = '';
+
       try {
-        this.pinError = '';
-        this.pinUnlocking = true;
-        await this.walletStore.unlockSparkWallet(pin);
-        this.showPinDialog = false;
+        await this.walletStore.migrateSparkWallets(this.migrationPin);
+        this.showMigrationDialog = false;
+        this.migrationPin = '';
 
-        // Refresh balance after unlock
         await this.updateWalletBalance();
-
-        // Check for pending Bitcoin deposits immediately after unlock
         this.checkPendingBitcoinDeposits();
 
         this.$q.notify({
           type: 'positive',
-          message: this.$t('Wallet unlocked'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+          message: this.$t('Wallet unlocked - upgrade complete'),
         });
       } catch (error) {
-        console.error('PIN unlock failed:', error);
-        this.pinError = this.$t('Incorrect PIN. Please try again.');
+        console.error('Migration failed:', error);
+        this.migrationError = this.$t('Incorrect PIN. Please try again.');
+        this.migrationPin = '';
       } finally {
-        this.pinUnlocking = false;
+        this.isMigrating = false;
       }
     },
 
-    handlePinCancel() {
-      this.showPinDialog = false;
-      // Optionally redirect or show warning that wallet features are limited
-      this.$q.notify({
-        type: 'warning',
-        message: this.$t('Wallet locked'),
-        caption: this.$t('Some features require PIN unlock'),
-
-        actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-      });
-    },
-
-    async loadWalletState() {
-      const savedState = localStorage.getItem('buhoGO_wallet_state');
-      if (savedState) {
-        try {
-          const parsedState = JSON.parse(savedState);
-          this.walletState = {...this.walletState, ...parsedState};
-          await this.updateWalletBalance();
-        } catch (error) {
-          console.error('Failed to load wallet state:', error);
-        }
-      } else {
-        this.walletState.balance = 312;
-      }
-    },
-
-    async updateWalletBalance() {
+    /** Refresh through the store; every screen reads the accepted result. */
+    async updateWalletBalance(opts = {}) {
+      const walletId = this.walletStore.activeWalletId;
+      if (!walletId) return;
+      // A refresh the user is waiting on also re-reads the last transaction
+      // right away: it is a local read for Spark and must not wait for the
+      // sync, history catch-up and deposit discovery behind the balance.
+      if (!opts.preferCached) this.loadLastTransaction();
       try {
-        if (this.showLoadingScreen) {
-          // still initializing
-        }
-
-        const awStore = useAutoWithdrawStore();
-        const activeWalletId = this.walletStore.activeWalletId;
-
-        // Check if active wallet is Spark
         if (this.walletStore.isActiveWalletSpark) {
-          // Try to get connected provider, auto-reconnects if session PIN available
-          try {
-            const provider = await this.walletStore.ensureSparkConnected();
-            const balanceResult = await provider.getBalance();
-            this.walletState.balance = balanceResult.balance;
-            localStorage.setItem('buhoGO_wallet_state', JSON.stringify(this.walletState));
-
-            // Auto-withdraw check
-            if (balanceResult.balance > 0 && activeWalletId) {
-              awStore.checkAndExecute(activeWalletId, balanceResult.balance, this.walletStore);
-            }
-          } catch (err) {
-            // Silently fail for background refresh - user will see locked state
-            // Don't spam console with expected "PIN required" messages
-            if (!err.message?.includes('PIN')) {
-              console.warn('Balance refresh skipped:', err.message);
-            }
-          }
-          return;
+          // The existing Spark lifecycle owns its periodic reads and events.
+          if (!opts.preferCached) await this.walletStore.reconcileSpark([walletId], 'user');
+          this.exitHealthTick++;
+        } else {
+          await this.walletStore.refreshBalance(walletId);
         }
-
-        // Check if active wallet is LNBits
-        if (this.walletStore.isActiveWalletLNBits) {
-          try {
-            const provider = this.walletStore.getActiveProvider();
-            if (provider) {
-              const balanceResult = await provider.getBalance();
-              this.walletState.balance = balanceResult.balance;
-
-              // Update wallet in store
-              const activeWallet = this.walletState.connectedWallets.find(
-                w => w.id === this.walletState.activeWalletId
-              );
-              if (activeWallet) {
-                activeWallet.balance = balanceResult.balance;
-              }
-
-              localStorage.setItem('buhoGO_wallet_state', JSON.stringify(this.walletState));
-
-              // Auto-withdraw check
-              if (balanceResult.balance > 0 && activeWalletId) {
-                awStore.checkAndExecute(activeWalletId, balanceResult.balance, this.walletStore);
-              }
-            }
-          } catch (err) {
-            console.warn('LNBits balance refresh failed:', err.message);
-          }
-          return;
-        }
-
-        // NWC wallet flow
-        const activeWallet = this.walletState.connectedWallets.find(
-          w => w.id === this.walletState.activeWalletId
-        );
-
-        if (activeWallet && activeWallet.nwcString) {
-          const nwc = new NostrWebLNProvider({
-            nostrWalletConnectUrl: activeWallet.nwcString,
-          });
-
-          await nwc.enable();
-          const balance = await nwc.getBalance();
-          this.walletState.balance = balance.balance;
-          activeWallet.balance = balance.balance;
-
-          localStorage.setItem('buhoGO_wallet_state', JSON.stringify(this.walletState));
-
-          // Auto-withdraw check
-          if (balance.balance > 0 && activeWalletId) {
-            awStore.checkAndExecute(activeWalletId, balance.balance, this.walletStore);
-          }
-        }
-      } catch (error) {
-        console.error('Failed to update balance:', error);
+      } finally {
+        this.loadLastTransaction();
       }
     },
 
-    async loadTransactions() {
-      this.recentTransactions = [];
+    /**
+     * Fetch the single most recent transaction for the active wallet
+     * and store it in `lastTransaction`. Best-effort: when the active
+     * wallet isn't connected yet, or its provider doesn't expose
+     * `getTransactions`, we silently clear to null so the UI falls
+     * back to just the "History" link without an error state.
+     *
+     * Called from updateWalletBalance's `finally` block — so it fires on
+     * the 30s periodic tick, after every send/receive, and on wallet
+     * switch, for every wallet type (Spark / LNbits / NWC). Also called
+     * directly from created() after initial connect.
+     */
+    async loadLastTransaction() {
+      const walletId = this.activeWallet?.id;
+      if (!walletId) {
+        this.lastTransaction = null;
+        this.isLoadingLastTransaction = false;
+        return;
+      }
+
+      try {
+        const provider = this.walletStore.providers?.[walletId];
+        // Not connected yet: keep the cached card; the read after the
+        // connection replaces it.
+        if (!provider) return;
+        if (typeof provider.getTransactions !== 'function') {
+          this.lastTransaction = null;
+          return;
+        }
+
+        // Fetch a small batch (not just the top one) so the pending-
+        // contact-link consumer has something to match against —
+        // settlement latency on some rails means our just-sent tx may
+        // not yet be the freshest row, or the user may have multiple
+        // sends in flight.
+        const result = await provider.getTransactions({ limit: 10, offset: 0 });
+        const rawTxs = Array.isArray(result) ? result : (result?.transactions || []);
+
+        // One canonical shape for every provider (see services/txNormalizer.js),
+        // merging any stored price-at-settlement snapshot.
+        const walletType = this.activeWallet?.type || null;
+        const txs = rawTxs.map((raw) => normalizeTx(raw, {
+          walletType,
+          fiatAtSettlement: this.transactionMetadataStore.getFiatAtSettlementForTransaction(raw?.id, walletId),
+        }));
+
+        // Drain the queued contact links before we publish the new
+        // lastTransaction, so the home-screen preview reads the
+        // freshly-stamped metadata on the same paint.
+        try {
+          await this.transactionMetadataStore.consumePendingContactLinks(txs, walletId);
+        } catch (err) {
+          console.warn('[wallet] pending-contact-link drain failed:', err);
+        }
+
+        // Capture the BTC rate for just-settled txs while it still
+        // reflects the settlement moment (no-op for older rows).
+        try {
+          const currency = this.walletStore.preferredFiatCurrency || 'USD';
+          await this.transactionMetadataStore.stampFreshTransactions(txs, walletId, currency);
+        } catch (err) {
+          console.warn('[wallet] fiat-at-settlement stamp failed:', err);
+        }
+
+        // The user may have switched wallets while this read ran.
+        if (this.activeWallet?.id !== walletId) return;
+        this.lastTransaction = txs.length > 0 ? txs[0] : null;
+        mergeCachedTransactions(walletId, txs);
+      } catch (err) {
+        // A failed read keeps what is on screen (the cached card).
+        console.warn('Failed to load last transaction:', err);
+      } finally {
+        if (this.activeWallet?.id === walletId) this.isLoadingLastTransaction = false;
+      }
     },
 
-    loadNostrProfiles() {
-      const saved = localStorage.getItem('buhoGO_nostr_profiles');
-      if (saved) {
-        try {
-          this.nostrProfiles = JSON.parse(saved);
-        } catch (error) {
-          console.error('Error loading nostr profiles:', error);
-        }
+    openTransactionHistory() {
+      haptics.tap();
+      this.$router.push('/transactions');
+    },
+
+    openReceive() {
+      haptics.tap();
+      this.showReceiveModal = true;
+    },
+
+    openSend() {
+      haptics.tap();
+      this.showSendModal = true;
+    },
+
+    /**
+     * Build a best-effort relative time string without pulling in a
+     * date library. Falls back to a short absolute date for anything
+     * older than a week.
+     */
+    formatRelativeTime(timestamp) {
+      if (!timestamp) return '';
+      let ts = typeof timestamp === 'number' ? timestamp : new Date(timestamp).getTime();
+      if (!Number.isFinite(ts)) return '';
+      // Providers speak unix SECONDS; Date math needs ms. Normalize by
+      // magnitude (seconds ≈ 1.7e9, ms ≈ 1.7e12; 1e11 separates them for
+      // decades) so a seconds timestamp doesn't render as January 1970.
+      if (ts > 0 && ts < 1e11) ts *= 1000;
+      const diffMs = Date.now() - ts;
+      if (diffMs < 0) return this.$t('just now');
+      const minute = 60 * 1000;
+      const hour = 60 * minute;
+      const day = 24 * hour;
+      const week = 7 * day;
+      if (diffMs < minute) return this.$t('just now');
+      if (diffMs < hour) {
+        const n = Math.floor(diffMs / minute);
+        return `${n} ${n === 1 ? this.$t('min ago') : this.$t('mins ago')}`;
+      }
+      if (diffMs < day) {
+        const n = Math.floor(diffMs / hour);
+        return `${n} ${n === 1 ? this.$t('hr ago') : this.$t('hrs ago')}`;
+      }
+      if (diffMs < week) {
+        const n = Math.floor(diffMs / day);
+        return `${n} ${n === 1 ? this.$t('day ago') : this.$t('days ago')}`;
+      }
+      // Older than a week: show a short absolute date, localised.
+      try {
+        return new Date(ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+      } catch {
+        return '';
       }
     },
 
     startPeriodicRefresh() {
       this.refreshInterval = setInterval(async () => {
-        await this.updateWalletBalance();
-        await this.loadTransactions();
+        // updateWalletBalance refreshes the last-tx card in its finally
+        // block, so we don't call loadLastTransaction separately here.
+        // The tick prefers the SDK's event-stream-backed balance cache;
+        // authoritative fetches stay on the post-send/receive paths.
+        await this.updateWalletBalance({ preferCached: true });
         await this.loadFiatRates();
+        // Keep the profile pill honest while the app remains open: a payment
+        // to the user's public name can arrive without touching a wallet.
+        await this.socialBucketStore.sync({ identityStore: this.identityStore });
       }, 30000);
     },
 
     async loadFiatRates() {
-      try {
-        const rates = await fiatRatesService.getRates();
-        this.walletState.exchangeRates = {
-          usd: rates.USD || 100000,
-          eur: rates.EUR || 85000,
-          gbp: rates.GBP || 75000,
-          cad: rates.CAD || 135000,
-          chf: rates.CHF || 90000,
-          aud: rates.AUD || 150000,
-          jpy: rates.JPY || 15000000
-        };
-        this.walletState.lastRateUpdate = new Date();
-        this.fiatRatesLoaded = true;
-
-        // Save updated state
-        localStorage.setItem('buhoGO_wallet_state', JSON.stringify(this.walletState));
-
-        console.log('Fiat rates loaded:', this.walletState.exchangeRates);
-      } catch (error) {
-        console.error('Error loading fiat rates:', error);
-        // Keep existing rates or use fallbacks
-        if (!this.fiatRatesLoaded) {
-          this.walletState.exchangeRates = {
-            usd: 100000,
-            eur: 85000,
-            gbp: 75000,
-            cad: 135000,
-            chf: 90000,
-            aud: 150000,
-            jpy: 15000000
-          };
-        }
-      }
-    },
-
-    startPulseAnimation() {
-      this.pulseInterval = setInterval(() => {
-        this.shouldPulse = true;
-        setTimeout(() => {
-          this.shouldPulse = false;
-        }, 1000);
-      }, 25000);
+      await this.walletStore.loadExchangeRates();
+      this.fiatRatesLoaded = this.walletStore.exchangeRatesAvailable;
     },
 
     async toggleCurrency() {
@@ -1720,13 +3359,50 @@ export default {
       const currentIndex = modes.indexOf(this.currentDisplayMode);
       const nextIndex = (currentIndex + 1) % modes.length;
 
-      this.walletState.displayMode = modes[nextIndex];
       this.currentDisplayMode = modes[nextIndex];
-      localStorage.setItem('buhoGO_wallet_state', JSON.stringify(this.walletState));
 
       setTimeout(() => {
         this.isSwitchingCurrency = false;
       }, 200);
+    },
+
+    /**
+     * 3-state tap cycle on the hero balance:
+     *
+     *   Bitcoin visible  →  Fiat visible  →  Hidden  →  Bitcoin visible …
+     *
+     * Gives the user a one-handed thumb-roll between the two
+     * unit views they actually toggle between AND a privacy peek
+     * (which they can also reach via the Hide Balance Quick Toggle
+     * in Settings — both paths share the same persisted store
+     * field, so they stay in sync).
+     *
+     * Re-uses `toggleCurrency()` for the bitcoin↔fiat hop so the
+     * existing 200ms swap animation + persistence path is shared.
+     */
+    async cycleBalanceDisplay() {
+      if (this.isSwitchingCurrency) return;
+
+      // 3 → 1: leaving hidden mode lands on Bitcoin view so the
+      // cycle has a predictable start each time the user re-engages.
+      if (this.walletStore.balanceHidden) {
+        this.walletStore.setBalanceHidden(false);
+        if (this.currentDisplayMode !== 'bitcoin') {
+          this.currentDisplayMode = 'bitcoin';
+        }
+        return;
+      }
+
+      // 1 → 2: bitcoin → fiat is the existing currency hop.
+      if (this.currentDisplayMode === 'bitcoin') {
+        await this.toggleCurrency();
+        return;
+      }
+
+      // 2 → 3: fiat → hidden. The currency mode stays on `fiat` so
+      // the next "unhide" tap can return to bitcoin (state 1) per
+      // the spec above; we don't need to clear it.
+      this.walletStore.setBalanceHidden(true);
     },
 
     formatMainBalance(balance) {
@@ -1736,7 +3412,7 @@ export default {
           return formatMainBalanceUtil(balance, this.walletStore.useBip177Format);
         case 'fiat':
           const btcAmount = balance / 100000000;
-          const rate = this.walletState.exchangeRates?.[this.walletState.preferredFiatCurrency?.toLowerCase()];
+          const rate = this.walletStore.exchangeRates?.[this.walletStore.preferredFiatCurrency?.toLowerCase()];
           if (!rate) return '--';
           const fiatValue = btcAmount * rate;
           return fiatValue.toFixed(2);
@@ -1746,7 +3422,7 @@ export default {
     },
 
     getFiatCurrencyIcon() {
-      const currency = this.walletState.preferredFiatCurrency || 'USD';
+      const currency = this.walletStore.preferredFiatCurrency || 'USD';
       const iconMap = {
         'USD': 'tabler:currency-dollar',
         'EUR': 'tabler:currency-euro',
@@ -1819,7 +3495,7 @@ export default {
 
     async getFiatValue(balance) {
       try {
-        const currency = this.walletState.preferredFiatCurrency || 'USD';
+        const currency = this.walletStore.preferredFiatCurrency || 'USD';
         const fiatAmount = await fiatRatesService.convertSatsToFiat(balance, currency);
 
         // Handle unavailable rates - return empty string instead of fake value
@@ -1832,98 +3508,224 @@ export default {
         console.error('Error getting fiat value:', error);
 
         // Check if we have valid stored rates (not guessed/fallback)
-        if (!this.walletState.exchangeRatesAvailable) {
+        if (!this.walletStore.exchangeRatesAvailable) {
           return '--';
         }
 
         // Use stored rates only if they're valid
         const btcAmount = balance / 100000000;
-        const currency = this.walletState.preferredFiatCurrency || 'USD';
-        const rate = this.walletState.exchangeRates[currency.toLowerCase()];
+        const currency = this.walletStore.preferredFiatCurrency || 'USD';
+        const rate = this.walletStore.exchangeRates[currency.toLowerCase()];
 
         if (!rate) {
           return '--';
         }
 
-        const fiatValue = btcAmount * rate;
-
-        const symbols = {
-          USD: '$',
-          EUR: '€',
-          GBP: '£',
-          CAD: 'C$',
-          CHF: 'CHF ',
-          AUD: 'A$',
-          JPY: '¥'
-        };
-
-        const symbol = symbols[currency] || currency;
-        return currency === 'JPY' ? symbol + Math.round(fiatValue).toLocaleString() : symbol + fiatValue.toFixed(2);
+        return fiatRatesService.formatFiatAmount(btcAmount * rate, currency);
       }
     },
 
     // Payment processing methods
 
-    parseInvoiceManually(invoice) {
+    getActiveWallet() {
+      return this.activeWallet;
+    },
+
+    // ========================================================================
+    // "Pay with": the wallet that pays
+    //
+    // Every payment is bound to ONE wallet id (`sendingWalletId`, the active
+    // wallet until the user or a caller chooses another). The helpers below
+    // are the only place that turns that id into a wallet, a type, a
+    // balance or an NWC string; the send pipeline asks them instead of
+    // reading the active wallet. Nothing here ever switches the active wallet.
+    // ========================================================================
+
+    /** The configured wallet with this id, or null. */
+    getWalletById(walletId) {
+      if (!walletId) return null;
+      return (this.walletStore.wallets || []).find((w) => w.id === walletId) || null;
+    },
+
+    /**
+     * Type of a configured wallet ('spark' | 'nwc' | 'lnbits' | 'arkade').
+     * The active wallet answers from the store's own getter, so a payment
+     * from it is typed exactly as it was before "Pay with" existed; an
+     * unknown id falls back to the active wallet's type.
+     */
+    walletTypeOf(walletId) {
+      const wallet = this.getWalletById(walletId);
+      if (!wallet || wallet.id === this.walletStore.activeWalletId) return this.walletStore.activeWalletType;
+      return wallet.type || 'nwc';
+    },
+
+    /** A wallet's known balance in sats (the canonical balance state); null while unknown. */
+    walletBalanceOf(walletId) {
+      return walletId ? (this.walletStore.balanceStates?.[walletId]?.value ?? null) : null;
+    },
+
+    /** NWC connection string of a configured wallet; '' when it has none. */
+    getNwcUrl(walletId) {
+      return this.getWalletById(walletId)?.nwcUrl || '';
+    },
+
+    /**
+     * The wallet that pays the payment on screen: the "Pay with" choice, else
+     * the active wallet. A stale id (the wallet was removed while the sheet
+     * was open) falls back to the active wallet rather than to nothing.
+     */
+    getSendingWallet() {
+      return this.getWalletById(this.sendingWalletId) || this.walletStore.activeWallet || null;
+    },
+
+    getSendingWalletType() {
+      const wallet = this.getSendingWallet();
+      return wallet ? this.walletTypeOf(wallet.id) : this.walletStore.activeWalletType;
+    },
+
+    /**
+     * All wallets ranked for a payment to `destinationType` (active first;
+     * see utils/payingWallets). The one place that feeds the store's facts
+     * into that list, for the sheet, the commit gate and the default pick.
+     * @param {string} destinationType payment type or addressType
+     * @param {number} [amountSats] 0 while unknown: no balance check then
+     * @param {number|null} [knownFeeSats] the provider's own fee estimate, if any
+     */
+    rankPayingWallets(destinationType, amountSats = 0, knownFeeSats = null) {
+      return listPayingWallets({
+        wallets: this.walletStore.wallets || [],
+        activeWalletId: this.walletStore.activeWalletId,
+        balances: this.walletStore.balances || {},
+        connectionStates: this.walletStore.connectionStates || {},
+        destinationType,
+        amountSats,
+        feeReserve: knownFeeReserveSats(destinationType, knownFeeSats),
+      });
+    },
+
+    /**
+     * Which wallet pays a payment to `destinationType`.
+     *
+     * A caller's explicit choice wins when it names a configured wallet; an
+     * unknown id is ignored. A chosen wallet that cannot pay stays chosen:
+     * the sheet then says why and lets the user pick another, instead of the
+     * payment silently going out from a wallet nobody asked for. Without a
+     * choice: the default pick (the active wallet when it can pay, else the
+     * first wallet that can, else the active wallet so the sheet can explain).
+     */
+    chooseSendingWalletId(destinationType, requestedId = null, amountSats = 0) {
+      if (requestedId && this.getWalletById(requestedId)) return requestedId;
+      const entries = this.rankPayingWallets(destinationType, amountSats);
+      return pickDefaultPayingWallet(entries)?.id || this.walletStore.activeWalletId || null;
+    },
+
+    /**
+     * The amount the payment itself fixes (an invoice's, a fixed LNURL's);
+     * 0 when the user still has to type one.
+     */
+    getFixedPaymentSats() {
+      const p = this.pendingPayment;
+      if (!p) return 0;
+      if (p.fixedAmountSats) return p.fixedAmountSats;
+      if (p.amount > 0) return p.amount;
+      if (p.minSendable && p.minSendable === p.maxSendable) return Math.floor(p.minSendable / 1000);
+      return 0;
+    },
+
+    /**
+     * The amount (sats) a BOLT11 payload carries; 0 for an amountless
+     * invoice or any other payload. Never throws: a malformed invoice is the
+     * invoice branch's to report, this only lets the default pick see the
+     * amount early.
+     */
+    invoiceAmountOf(paymentData) {
+      if (paymentData?.type !== 'lightning_invoice' || !paymentData.data) return 0;
       try {
-        const cleanInvoice = invoice.replace(/^lightning:/i, '');
-
-        let amount = 0;
-        const amountMatch = cleanInvoice.match(/lnbc(\d+)([munp]?)/i);
-        if (amountMatch) {
-          const value = parseInt(amountMatch[1]);
-          const unit = amountMatch[2];
-
-          switch (unit) {
-            case 'm':
-              amount = value * 100000; // milli-bitcoin
-              break;
-            case 'u':
-              amount = value * 100; // micro-bitcoin
-              break;
-            case 'n':
-              amount = value / 10; // nano-bitcoin
-              break;
-            case 'p':
-              amount = value / 10000; // pico-bitcoin
-              break;
-            default:
-              // No unit or unrecognized unit - likely variable amount invoice
-              amount = 0;
-          }
-        }
-
-        let description = 'Lightning Payment';
-        const now = Math.floor(Date.now() / 1000);
-        const expiry = now + 3600;
-
-        return {
-          amount: Math.floor(amount),
-          description,
-          expiry,
-          invoice: cleanInvoice
-        };
-      } catch (error) {
-        console.error('Error parsing invoice manually:', error);
-        return {
-          amount: 0,
-          description: 'Lightning Payment',
-          expiry: Math.floor(Date.now() / 1000) + 3600,
-          invoice: invoice
-        };
+        return Number(parseLightningInvoice(paymentData.data).amount) || 0;
+      } catch {
+        return 0;
       }
     },
 
-    getActiveWallet() {
-      return this.walletState.connectedWallets.find(
-        w => w.id === this.walletState.activeWalletId
-      );
+    /**
+     * The user picked another wallet in "Pay with". Only the payment's wallet
+     * changes - the active wallet stays exactly as it is. Capability, balance
+     * and the fee estimate follow from the new id (computeds + the
+     * sendingWalletId watcher).
+     */
+    onSendingWalletChange(walletId) {
+      // The field is frozen mid-send; this covers a stray event all the same.
+      if (this.isSendingPayment || !this.pendingPayment) return;
+      if (walletId === this.payerWalletId) return;
+      const entry = this.payingWalletEntries.find((w) => w.id === walletId);
+      // A wallet that cannot pay is listed with its reason but never selectable.
+      if (!entry?.usable) return;
+      this.sendingWalletId = walletId;
+      // An on-chain fee quote was priced for the previous wallet.
+      this.l1Fee = null;
+    },
+
+    /**
+     * Refresh the balance of the wallet that just paid. The active wallet gets
+     * the full home refresh (balance + last-transaction card) as ever. Any other
+     * wallet only has its own balance re-read - the home screen shows a
+     * different wallet - and, the money having left already, a failure here is
+     * only worth a warning.
+     */
+    async refreshPayerBalance(walletId) {
+      if (!walletId || walletId === this.activeWallet?.id) {
+        await this.updateWalletBalance();
+        return;
+      }
+      try {
+        if (this.walletTypeOf(walletId) === 'spark') await this.walletStore.reconcileSpark([walletId], 'user');
+        else await this.walletStore.refreshBalance(walletId);
+      } catch (error) {
+        console.warn('Could not refresh the balance of the wallet that paid:', error?.message || error);
+      }
     },
 
     handleScanWithdraw() {
+      // Carry whatever amount the user already set — a created invoice or the
+      // value typed on the keypad — into the redeem scan, mirroring the
+      // NFC-tap path. The modal closes here, so stash it for onPaymentDetected
+      // to read after the withdraw QR is scanned.
+      this.pendingWithdrawTargetSats = this.$refs.receiveModal?.intendedReceiveSats || null;
       this.showReceiveModal = false;
       this.$nextTick(() => {
-        this.showSendModal = true;
+        this.showRedeemScanner = true;
+      });
+    },
+
+    /**
+     * Redeem scan → canonical dispatcher. The scanner is redeem-flavored
+     * chrome only; classification is the same parsePaymentDestination the
+     * deep-link path uses, so every form a withdraw QR takes (bare lnurl1,
+     * lightning:/lnurlw: wrappers, ATM fallback URLs) resolves identically.
+     * A non-withdraw code still routes correctly — someone who scans an
+     * invoice here gets the pay flow, not a dead end.
+     */
+    onRedeemScanned(value) {
+      const parsed = parsePaymentDestination(value);
+      if (!parsed || parsed.type === 'unknown' || (!parsed.valid && parsed.type !== 'bolt12_offer')) {
+        // Nothing will consume the stashed receive amount — drop it so it
+        // can never leak into a later, unrelated withdraw.
+        this.pendingWithdrawTargetSats = null;
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t("We don't recognize this code"),
+          caption: this.$t("It doesn't look like a payment request"),
+          timeout: 4000,
+        });
+        return;
+      }
+      const data = parsed.data || parsed.invoice || parsed.offer || parsed.address || parsed.lnurl || value;
+      // Carry the BIP21 metadata so a scanned unified QR can take the
+      // native-rail shortcut in onPaymentDetected, same as the Send field.
+      void this.onPaymentDetected({
+        data,
+        type: parsed.type,
+        ...(parsed.bip21 ? { bip21: parsed.bip21 } : {}),
       });
     },
 
@@ -1939,12 +3741,9 @@ export default {
       if (!amountSats || amountSats <= 0) {
         this.$q.notify({
           type: 'negative',
-          message: this.withdrawDenomination === 'fiat'
-            ? this.$t('Fiat rates unavailable — switch to sats or refresh the app')
-            : this.$t('Invalid amount'),
+          message: this.$t('Invalid amount'),
           icon: 'las la-exclamation-triangle',
           timeout: 10000,
-          actions: [{ icon: 'las la-times', color: 'white', round: true, handler: () => {} }]
         });
         return;
       }
@@ -1956,18 +3755,40 @@ export default {
         const invoice = await this.createInvoiceForWithdraw(amountSats, description);
         this.lnurlWithdrawInvoice = invoice;
 
-        // Step 2: Submit callback to withdraw service
         this.lnurlWithdrawStatus = 'submitting';
-        await this.submitWithdrawCallback(this.pendingPayment, invoice.payment_request);
+        await this.$refs.withdrawAuthorization.submit(
+          this.pendingPayment, invoice.payment_request, amountSats,
+        );
 
-        // Step 3: Monitor for incoming payment
+        // Step 3: Monitor for incoming payment — the existing
+        // PaymentConfirmation surface (SuccessCheckmark + amount)
+        // fires once the monitor confirms receipt.
         this.lnurlWithdrawStatus = 'monitoring';
         await this.startWithdrawPaymentMonitor(invoice, amountSats);
 
       } catch (error) {
-        console.error('Withdraw failed:', error);
+        // Sanitize the error before anything reads `.message` — the PIN
+        // could be in there via a platform-level network error stringifying
+        // the callback URL, and we don't want it landing in console output
+        // or the cross-app payment-error notification surface.
+        if (error?.name === 'AbortError') { this.resetWithdrawState(); return; }
+        const safeMessage = safeWithdrawError(error?.message);
+        const safeError = new Error(safeMessage);
+        safeError.name = error?.name || 'Error';
+        // Carry the code: translateErrorCode keys on it (ARKADE_LN_UNAVAILABLE
+        // and friends), and codes never contain PINs.
+        if (error?.code) safeError.code = error.code;
+
+        console.error('Withdraw failed:', safeMessage);
         this.lnurlWithdrawStatus = 'error';
-        this.lnurlWithdrawError = error.message || 'Something went wrong';
+        this.lnurlWithdrawError = safeMessage;
+        this.walletStore.showPaymentError(safeError, {
+          context: 'withdraw',
+          walletType: this.walletStore.activeWalletType,
+          route: 'LNURL-withdraw',
+          amountSats: typeof amountSats === 'number' ? amountSats : undefined,
+          t: this.$t.bind(this),
+        });
         // Reset to idle after showing error briefly
         setTimeout(() => {
           if (this.lnurlWithdrawStatus === 'error') {
@@ -1976,6 +3797,73 @@ export default {
           }
         }, 4000);
       }
+    },
+
+    // ========================================================================
+    // LUD-14 vouchers — reusable withdraw links
+    // ========================================================================
+
+    /** Refresh only after receipt is confirmed; callback acceptance is not settlement. */
+    async refreshVoucherAfterWithdraw(voucherId, receiptVersion) {
+      const result = await this.withdrawVouchersStore.refresh(voucherId);
+      if (this.withdrawReceiptVersion !== receiptVersion || !this.showWithdrawSuccess) return;
+      if (result.ok && result.voucher) {
+        this.withdrawSuccessNote = this.voucherSuccessNote(result.voucher);
+      } else if (result.erased) {
+        this.withdrawSuccessNote = '';
+      }
+    },
+
+    /**
+     * Sweep a saved voucher: hand its balanceCheck URL to the canonical
+     * dispatcher, which fetches the fresh withdrawRequest (new k1, current
+     * bounds), tracks whatever URL it rotated to, and opens the redeem sheet.
+     * One path — a voucher redeems exactly like a scanned QR.
+     */
+    redeemVoucher(voucher) {
+      if (!voucher?.balanceCheck) return;
+      haptics.tap();
+      this.pendingWithdrawTargetSats = this.$refs.receiveModal?.intendedReceiveSats || null;
+      this.showReceiveModal = false;
+      void this.onPaymentDetected({ type: 'lnurl', data: voucher.balanceCheck });
+    },
+
+    /**
+     * Keep a storeable service's LUD-06 logo, downscaled, in the local image
+     * registry under the address it is stamped with. Fire-and-forget: the
+     * tx row and the address book read the registry live, so nothing waits
+     * on this, and a logo that fails to decode simply leaves the glyph.
+     */
+    rememberServiceImage(address, serviceMeta) {
+      if (!address || !serviceMeta?.image) return;
+      normalizeServiceImage(serviceMeta.image)
+        .then((dataUrl) => { if (dataUrl) this.serviceImagesStore.put(address, dataUrl); })
+        .catch(() => {});
+    },
+
+    /** The Receive sheet owns navigation; opening its list refreshes stale data. */
+    openVouchers() {
+      this.withdrawVouchersStore.refreshStale().catch(() => {});
+    },
+
+    /**
+     * Drop our copy of a voucher, after asking. The URL is the bearer right
+     * to whatever is left, and a rotating service may no longer honour the
+     * paper code, so this is destructive enough to confirm.
+     */
+    removeVoucher(voucher) {
+      if (!voucher?.id) return;
+      this.$q.dialog({
+        title: this.$t('Remove voucher?'),
+        cardClass: 'voucher-remove-dialog',
+        focus: 'cancel',
+        message: this.$t('Removing this voucher may permanently lose access to its remaining funds.'),
+        cancel: { label: this.$t('Cancel'), flat: true, noCaps: true, color: undefined, class: 'voucher-cancel-action' },
+        ok: { label: this.$t('Remove'), flat: true, noCaps: true, color: undefined, class: 'voucher-danger-action' },
+        persistent: true,
+      }).onOk(() => {
+        this.withdrawVouchersStore.forget(voucher.id).catch(() => {});
+      });
     },
 
     async createInvoiceForWithdraw(amountSats, description) {
@@ -1989,6 +3877,13 @@ export default {
         const provider = this.walletStore.getActiveProvider();
         if (!provider) throw new Error('No LNbits provider available');
         result = await provider.createInvoice({ amount: amountSats, description });
+      } else if (walletType === 'arkade') {
+        // Arkade's Lightning rail is out of service (Boltz retired); an
+        // LNURL-withdraw needs an invoice this wallet cannot mint. Throw the
+        // coded error so the dialog shows the translated outage copy.
+        const err = new Error('Lightning is temporarily unavailable for Arkade wallets');
+        err.code = 'ARKADE_LN_UNAVAILABLE';
+        throw err;
       } else {
         // NWC - LightningPaymentService uses positional args and returns snake_case
         const activeWallet = this.getActiveWallet();
@@ -2014,45 +3909,59 @@ export default {
       return {
         payment_request: paymentRequest,
         payment_hash: paymentHash,
+        // Spark-specific receive request ID (UUID). Required by
+        // getLightningReceiveRequest() — the payment hash is NOT a valid
+        // ID for that endpoint. Other backends won't populate this.
+        invoice_id: result.id || null,
         amount: amountSats,
         expires_at: result.expires_at || result.expiresAt || Math.floor(Date.now() / 1000) + 3600
       };
-    },
-
-    async submitWithdrawCallback(withdrawData, bolt11) {
-      const callbackUrl = new URL(withdrawData.callback);
-      callbackUrl.searchParams.set('k1', withdrawData.k1);
-      callbackUrl.searchParams.set('pr', bolt11);
-
-      const response = await fetch(callbackUrl.toString());
-      if (!response.ok) {
-        throw new Error(`Withdraw callback failed: ${response.status} ${response.statusText}`);
-      }
-
-      const data = await response.json();
-      if (data.status === 'ERROR') {
-        throw new Error(data.reason || 'Withdraw service rejected the request');
-      }
-
-      // Some services return { status: "OK" }, others just return without error
-      return data;
     },
 
     async startWithdrawPaymentMonitor(invoice, amountSats) {
       const walletType = this.walletStore.activeWalletType;
 
       if (walletType === 'spark') {
-        // Spark: event-based monitoring
+        // Spark: event-based monitoring as a wake-up signal, verified
+        // against the specific invoice. The raw `onPaymentReceived`
+        // callback fires for ANY incoming payment (the SDK doesn't
+        // expose which invoice was settled), so without this filter an
+        // unrelated wallet credit — or even a stale cached event — would
+        // close the sheet before the user's withdraw actually settles.
+        // We confirm via `lookupInvoice` and fall through silently if
+        // the event doesn't correspond to our payment hash.
         try {
-          const provider = await this.walletStore.ensureSparkConnected();
-          this.withdrawSparkUnsubscribe = provider.onPaymentReceived((transferId, newBalance) => {
-            this.handleWithdrawConfirmed(amountSats);
+          // Pinned to the wallet that minted the invoice: a switch while the
+          // withdraw is in flight must not move the watch to another account.
+          const provider = await this.walletStore.ensureSparkConnected(invoice.walletId || this.walletStore.activeWalletId);
+          // Prefer the Spark receive request ID for getLightningReceiveRequest;
+          // fall back to the payment hash, which lookupInvoice resolves via
+          // the transfer-list scan.
+          const lookupKey = invoice.invoice_id || invoice.payment_hash;
+          this.withdrawSparkUnsubscribe = provider.onPaymentReceived(async () => {
+            if (this.lnurlWithdrawStatus !== 'monitoring') return;
+            if (!lookupKey || typeof provider.lookupInvoice !== 'function') return;
+            try {
+              const result = await provider.lookupInvoice(lookupKey);
+              if (result?.paid) {
+                this.handleWithdrawConfirmed(result.amount || amountSats);
+              }
+            } catch (e) {
+              console.warn('lookupInvoice failed during Spark withdraw monitoring:', e);
+            }
           });
+          // Belt-and-braces: also run polling as a safety net so that if
+          // the event never fires (cold session, dropped subscription)
+          // the withdraw still settles. The polling monitor filters by
+          // payment_hash and stops itself once confirmed.
+          this.startWithdrawPollingMonitor(invoice, amountSats);
         } catch (error) {
           console.warn('Spark event monitoring failed, falling back to polling:', error);
           this.startWithdrawPollingMonitor(invoice, amountSats);
         }
-      } else if (walletType === 'lnbits') {
+      } else if (walletType === 'lnbits' || walletType === 'arkade') {
+        // Both expose a provider `lookupInvoice(hash)`; the generic polling
+        // monitor confirms the reverse-swap / invoice settling into the wallet.
         this.startWithdrawPollingMonitor(invoice, amountSats);
       } else {
         // NWC
@@ -2158,14 +4067,38 @@ export default {
     },
 
     async handleWithdrawConfirmed(amount) {
+      // Idempotency guard — both the Spark event listener and the
+      // polling monitor can race to confirm the same payment. The
+      // first one wins; subsequent calls are silently ignored so we
+      // don't double-fire the success modal or thrash status.
+      if (this.lnurlWithdrawStatus === 'confirmed') return;
+
       this.stopWithdrawMonitor();
       this.lnurlWithdrawStatus = 'confirmed';
 
       this.withdrawConfirmedAmount = amount;
 
-      // Calculate fiat value
+      const voucher = this.pendingPayment?.voucherId
+        ? this.withdrawVouchersStore.byId(this.pendingPayment.voucherId)
+        : this.withdrawVouchersStore.byUrl(this.pendingPayment?.balanceCheck);
+      const receiptVersion = ++this.withdrawReceiptVersion;
+      // Until a fresh service response arrives, do not present an estimate as fact.
+      this.withdrawSuccessNote = voucher ? this.$t('Find your voucher under Receive.') : '';
+
+      // Surface the success screen and close the sheet FIRST, so the confirm
+      // sheet never lingers behind the (optional) fiat lookup. Fiat is
+      // decorative and fills in reactively below.
+      this.withdrawConfirmedFiat = '';
+      this.showWithdrawSheet = false;
+      this.pendingPayment = null;
+      this.showWithdrawSuccess = true;
+      if (voucher) {
+        this.refreshVoucherAfterWithdraw(voucher.id, receiptVersion)
+          .catch((error) => console.warn('[vouchers] post-withdraw check failed:', error));
+      }
+
       try {
-        const currency = this.walletState.preferredFiatCurrency || 'USD';
+        const currency = this.walletStore.preferredFiatCurrency || 'USD';
         const fiatAmount = await fiatRatesService.convertSatsToFiat(amount, currency);
         if (fiatAmount !== null) {
           this.withdrawConfirmedFiat = '≈ ' + fiatRatesService.formatFiatAmount(fiatAmount, currency);
@@ -2173,10 +4106,6 @@ export default {
       } catch (e) {
         // Fiat conversion optional
       }
-
-      this.showPaymentConfirmation = false;
-      this.pendingPayment = null;
-      this.showWithdrawSuccess = true;
 
       await this.updateWalletBalance();
     },
@@ -2199,69 +4128,22 @@ export default {
       this.lnurlWithdrawInvoice = null;
       this.withdrawConfirmedAmount = 0;
       this.withdrawConfirmedFiat = '';
-      this.withdrawDenomination = 'sats';
+      this.withdrawSuccessNote = '';
     },
 
-    toggleWithdrawDenomination() {
-      this.denominationSpinning = true;
-      setTimeout(() => { this.denominationSpinning = false; }, 500);
-      const currentAmount = parseFloat(this.paymentAmount);
-      if (this.withdrawDenomination === 'sats') {
-        // Switching to fiat — check if rates are available
-        if (!fiatRatesService.ratesAvailable) {
-          this.$q.notify({
-            type: 'warning',
-            message: this.$t('Fiat rates unavailable'),
-            caption: this.$t('Use sats denomination or refresh the app to load exchange rates'),
-            icon: 'las la-exclamation-triangle',
-            timeout: 10000,
-            actions: [{ icon: 'las la-times', color: 'white', round: true, handler: () => {} }]
-          });
-          return;
-        }
-        this.withdrawDenomination = 'fiat';
-        if (currentAmount > 0) {
-          const fiat = fiatRatesService.convertSatsToFiatSync(currentAmount, this.withdrawFiatCurrency);
-          this.paymentAmount = fiat !== null ? fiat.toFixed(2) : '';
-        }
-      } else {
-        // Switching to sats
-        this.withdrawDenomination = 'sats';
-        if (currentAmount > 0) {
-          const sats = fiatRatesService.convertFiatToSatsSync(currentAmount, this.withdrawFiatCurrency);
-          this.paymentAmount = sats !== null ? sats.toString() : '';
-        }
+    /**
+     * The success screen's one line about a voucher, or '' for an ordinary
+     * withdraw code, based only on a fresh service response.
+     */
+    voucherSuccessNote(voucher) {
+      if (!voucher) return '';
+      const left = this.withdrawVouchersStore.displaySats(voucher);
+      if (left > 0) {
+        return this.$t('{amount} left on this voucher. Find it under Receive.', {
+          amount: formatAmount(left, this.walletStore.useBip177Format),
+        });
       }
-    },
-
-    toggleSendDenomination() {
-      this.denominationSpinning = true;
-      setTimeout(() => { this.denominationSpinning = false; }, 500);
-      const currentAmount = parseFloat(this.paymentAmount);
-      if (this.sendDenomination === 'sats') {
-        if (!fiatRatesService.ratesAvailable) {
-          this.$q.notify({
-            type: 'warning',
-            message: this.$t('Fiat rates unavailable'),
-            caption: this.$t('Use sats denomination or refresh the app to load exchange rates'),
-            icon: 'las la-exclamation-triangle',
-            timeout: 10000,
-            actions: [{ icon: 'las la-times', color: 'white', round: true, handler: () => {} }]
-          });
-          return;
-        }
-        this.sendDenomination = 'fiat';
-        if (currentAmount > 0) {
-          const fiat = fiatRatesService.convertSatsToFiatSync(currentAmount, this.preferredFiatCurrency);
-          this.paymentAmount = fiat !== null ? fiat.toFixed(2) : '';
-        }
-      } else {
-        this.sendDenomination = 'sats';
-        if (currentAmount > 0) {
-          const sats = fiatRatesService.convertFiatToSatsSync(currentAmount, this.preferredFiatCurrency);
-          this.paymentAmount = sats !== null ? sats.toString() : '';
-        }
-      }
+      return this.$t(voucher.exhausted ? 'This voucher is now empty.' : 'Find your voucher under Receive.');
     },
 
     startMerchantCountdown() {
@@ -2271,15 +4153,15 @@ export default {
         this.merchantCountdown--;
         if (this.merchantCountdown <= 0) {
           this.stopMerchantCountdown();
-          this.showPaymentConfirmation = false;
+          this.showSendSheet = false;
           this.pendingPayment = null;
+          this.sendingWalletId = null;
           this.$q.notify({
             type: 'warning',
             message: this.$t('Payment expired'),
             caption: this.$t('The merchant QR code has expired. Please scan again.'),
             icon: 'schedule',
             timeout: 5000,
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
           });
         }
       }, 1000);
@@ -2299,63 +4181,157 @@ export default {
       this.paymentAmount = '';
     },
 
-    validateWithdrawAmount(val) {
-      if (!this.pendingPayment) return true;
-      const amount = parseFloat(val);
-      if (isNaN(amount) || amount <= 0) return 'Amount must be greater than 0';
-      if (this.withdrawDenomination === 'fiat') {
-        const sats = fiatRatesService.convertFiatToSatsSync(amount, this.withdrawFiatCurrency);
-        if (sats === null) return 'Exchange rate unavailable';
-        if (sats < this.pendingPayment.minSats) return `Below minimum (≈ ${this.pendingPayment.minSats} sats)`;
-        if (sats > this.pendingPayment.maxSats) return `Above maximum (≈ ${this.pendingPayment.maxSats} sats)`;
-      } else {
-        if (amount < this.pendingPayment.minSats) return `Minimum: ${this.pendingPayment.minSats} sats`;
-        if (amount > this.pendingPayment.maxSats) return `Maximum: ${this.pendingPayment.maxSats} sats`;
+    /**
+     * Re-route a BIP21-resolved destination onto a native rail the paying
+     * wallet can settle for free (Spark transfer) or near-free (ark1 → ark1).
+     * `payerType` is that wallet's type (the active wallet's when omitted).
+     *
+     * Only destinations that came out of the URI itself are re-routed
+     * (lightning_invoice / bitcoin_address / bolt12_offer); a payload that is
+     * already on a native rail, or that never was a BIP21 URI, passes through
+     * untouched. The rail values are pre-validated by nativeRailsFromBip21 —
+     * a malformed spark=/ark= param can never hijack the destination.
+     *
+     * Main send flow only, on purpose: batch send, auto-withdraw, internal
+     * transfer and kiosk keep their existing rails.
+     */
+    preferNativeBip21Rail(paymentData, payerType = this.walletStore.activeWalletType) {
+      const bip21 = paymentData?.bip21;
+      if (!bip21) return paymentData;
+      const reroutable = paymentData.type === 'lightning_invoice'
+        || paymentData.type === 'bitcoin_address'
+        || paymentData.type === 'bolt12_offer';
+      if (!reroutable) return paymentData;
+
+      const rails = nativeRailsFromBip21(bip21);
+      const amountSats = bip21AmountToSats(bip21.amount);
+      const withAmount = amountSats ? { fixedAmountSats: amountSats } : {};
+
+      if (payerType === 'spark' && rails.spark) {
+        return { ...paymentData, type: 'spark_address', data: rails.spark, ...withAmount };
       }
-      return true;
-    },
-
-    getPaymentTypeLabel() {
-      if (!this.paymentData && !this.pendingPayment) return '';
-
-      const payment = this.paymentData || this.pendingPayment;
-
-      const labels = {
-        'lightning_invoice': 'Lightning Invoice',
-        'lnurl_pay': 'LNURL Payment',
-        'lnurl_withdraw': 'Withdrawal',
-        'lightning_address': 'Lightning Address',
-        'spark_address': 'Spark Transfer',
-        'bitcoin_address': 'Bitcoin Withdrawal'
-      };
-      return labels[payment.type] || 'Lightning Payment';
-    },
-
-    requiresAmount() {
-      if (!this.paymentData) return false;
-
-      return this.paymentData.type === 'lnurl_pay' ||
-        this.paymentData.type === 'lightning_address' ||
-        (this.paymentData.type === 'lightning_invoice' && this.paymentData.requiresAmount);
-    },
-
-    getAmountLimits() {
-      if (!this.paymentData) return null;
-
-      return {
-        min: Math.floor(this.paymentData.minSendable / 1000),
-        max: Math.floor(this.paymentData.maxSendable / 1000)
-      };
+      if (payerType === 'arkade' && rails.ark) {
+        return { ...paymentData, type: 'arkade_address', data: rails.ark, ...withAmount };
+      }
+      return paymentData;
     },
 
     async onPaymentDetected(paymentData) {
-      console.log('Payment detected:', paymentData);
+      if (offerAddressRequest(paymentData.data, { t: this.$t.bind(this), paymentOnly: !!paymentData.paymentOnly || !!paymentData.nostrPubkey })) {
+        this.pendingWithdrawTargetSats = null;
+        this.showSendModal = false;
+        this.showReceiveModal = false;
+        this.showRedeemScanner = false;
+        return;
+      }
+
+      // Drive the Send sheet's loading CTA + inline error only when the request
+      // came from the open sheet — or from the home clipboard strip, which
+      // resolves with the sheet still down and reveals it (text + reason)
+      // only if this fails. Deep-link / external calls (fromField=false) keep
+      // the existing dialog-based error path and never touch the sheet.
+      const fromField = this.showSendModal || this.clipboardResolving;
+      let delegated = false; // a nested re-dispatch (NIP-05 rescue) owns the outcome
+      let resolved = true;   // assume we'll reach a confirm sheet / handoff
+      if (fromField) { this.sendResolving = true; this.sendResolveError = ''; }
+
+      // Consume any amount stashed by the Receive modal's "Redeem" button
+      // (which closes the modal before this scan, so it can't be read live
+      // below). Cleared unconditionally so a stale value can never leak into
+      // an unrelated withdraw.
+      const deferredWithdrawTargetSats = this.pendingWithdrawTargetSats;
+      this.pendingWithdrawTargetSats = null;
+
+      // "Pay with": a caller (a contact tap, a chat request) may name the
+      // wallet that should pay. That is a request about WHO pays, not part of
+      // WHAT is paid, so it leaves the payload here - pendingPayment never
+      // carries it - and rides along explicitly when this call re-dispatches
+      // itself.
+      const { sendingWalletId: requestedWalletId = null, ...payload } = paymentData;
+      paymentData = payload;
+
+      // The wallet that pays. Decided on first use - a withdrawal (a receive)
+      // never needs one - and decided again when a branch learns the amount,
+      // because the default pick passes over a wallet that cannot cover it.
+      // The wallet-specific rails below (native BIP21 rail, NWC payload
+      // shape, balance checks) follow this wallet, not the active one.
+      let payerId = null;
+      let payerAmount = null;
+      const payerFor = (amountSats = 0) => {
+        if (payerId === null || payerAmount !== amountSats) {
+          payerId = this.chooseSendingWalletId(paymentData.type, requestedWalletId, amountSats);
+          payerAmount = amountSats;
+        }
+        return payerId;
+      };
 
       try {
+        // A unified receive QR (bitcoin:addr?lightning=...&spark=...&ark=...)
+        // may offer a rail this wallet speaks natively at zero / near-zero
+        // fee. Take that road before anything else: the resolved Lightning /
+        // on-chain destination is swapped for the native address from the
+        // same URI, and a BIP21 amount= carries over as the fixed amount so
+        // every rail asks the payer for the same number. "This wallet" is
+        // the one that will pay.
+        paymentData = this.preferNativeBip21Rail(
+          paymentData,
+          paymentData?.bip21 ? this.walletTypeOf(payerFor(this.invoiceAmountOf(paymentData))) : undefined,
+        );
+
         // Transform the payment data to match expected structure
+        if (paymentData.type === 'silent_payment' && paymentData.data) {
+          // Recognized BIP-352 format, unpayable on every rail we have.
+          // Stop before any provider call with the explanation, exactly
+          // like BOLT12 offers.
+          this.walletStore.showUnsupportedSilentPayment({
+            route: 'Silent Payment address',
+            t: this.$t.bind(this),
+          });
+          return;
+        }
+
+        if (paymentData.type === 'bolt12_offer' && paymentData.data) {
+          // This is a recognized payment request, but none of our wallet
+          // providers can request and pay the BOLT12 invoice behind an offer.
+          // Stop before opening confirmation or calling a provider: no payment
+          // has been attempted, and the user needs a clear next step.
+          this.walletStore.showUnsupportedBolt12Offer({
+            route: 'BOLT12 offer',
+            t: this.$t.bind(this),
+          });
+          return;
+        }
+
+        if (paymentData.type === 'nostr_identifier' && paymentData.data) {
+          // System-camera / deep-link entry for a Nostr identity
+          // (nostr:npub… from the identity-card QR, or another client).
+          // Resolve the profile to its Lightning target and re-dispatch —
+          // the same rails the Send sheet uses for a typed npub, carrying
+          // the person's identity onto the confirm sheet.
+          const target = await this.resolveNostrTarget(paymentData.data);
+          if (!target?.address) {
+            resolved = false;
+            this.failSendResolution(this.$t("We couldn't resolve this Nostr profile"), fromField);
+            return;
+          }
+          delegated = true; // the recursive call owns resolving / close / error
+          return this.onPaymentDetected({
+            ...paymentData,
+            type: target.kind, // 'lightning_address' | 'lnurl'
+            data: target.address,
+            _nostrResolved: true,
+            nostrPubkey: target.pubkey,
+            nostrNpub: target.npub,
+            nostrProfile: target.profile,
+            nostrProfileEvent: target.profileEvent,
+            nostrRelayHints: target.relayHints,
+            sendingWalletId: requestedWalletId,
+          });
+        }
+
         if (paymentData.type === 'lightning_invoice' && paymentData.data) {
           // Parse the invoice to get the amount
-          const parsedInvoice = this.parseInvoiceManually(paymentData.data);
+          const parsedInvoice = parseLightningInvoice(paymentData.data);
 
           this.pendingPayment = {
             ...paymentData,
@@ -2364,36 +4340,74 @@ export default {
             description: parsedInvoice.description
           };
         } else if (paymentData.type === 'lnurl' && paymentData.data) {
+          // LUD-04 (LNURL-auth) is identity, not payment. It uses the same
+          // bech32 carrier (lnurl1...) and the same lightning: deep-link
+          // scheme as LNURL-pay/withdraw, so the WalletFactory hands it to
+          // us classified as 'lnurl'. Detect it locally first — `tag=login`
+          // means we must NOT hit the callback URL with a plain GET (that
+          // would burn the k1 challenge before we sign it).
+          if (looksLikeLud04(paymentData.data) && this.openIdentityAuthFromLnurl(paymentData.data)) {
+            return;
+          }
+
           // Fetch LNURL endpoint info for all wallet types to determine pay vs withdraw
           const lnurlInfo = await this.fetchLNURLInfo(paymentData.data);
 
           if (lnurlInfo.error || !lnurlInfo.lnurlType) {
-            this.$q.notify({
-              type: 'negative',
-              message: this.$t('Withdraw link expired or already used'),
-              caption: lnurlInfo.reason || this.$t('Could not retrieve payment details from this link'),
-              icon: 'las la-exclamation-circle',
-              timeout: 10000,
-              actions: [{ icon: 'las la-times', color: 'white', round: true, handler: () => {} }]
-            });
+            // Surface it where the user is: inline in the Send field when that's
+            // where it came from, else the global error dialog (PaymentErrorDialog)
+            // with the raw reason collapsed into "Technical details".
+            const reason = lnurlInfo.reason
+              || this.$t('The server did not respond or the link is no longer valid');
+            resolved = false;
+            this.failSendResolution(reason, fromField, { context: 'link', route: 'LUD-17 scan' });
             return;
           }
 
           if (lnurlInfo.lnurlType === 'withdrawRequest') {
             // LNURL-withdraw: set up withdraw flow
             this.resetWithdrawState();
+
+            // LUD-14: a withdrawRequest carrying a balanceCheck URL is a
+            // voucher, not a one-shot code. Remember it (and whatever it
+            // rotated to) so what is left stays visible after a partial
+            // withdrawal, instead of living on a paper slip. Best effort —
+            // tracking must never stand between the user and their money.
+            const voucher = await this.withdrawVouchersStore.track(lnurlInfo)
+              .catch((err) => console.warn('[vouchers] could not track:', err));
+
+            // Pre-fill the redeem sheet with the amount the user intended to
+            // receive, instead of opening at 0. Two sources feed this:
+            //   - live: the Receive modal is still open (NFC tap or paste while
+            //     viewing it) — read its current intended amount directly.
+            //   - deferred: the user tapped "Redeem", which closed the modal
+            //     before this scan — handleScanWithdraw stashed the amount.
+            // Either way, close the modal so the redeem sheet never stacks on
+            // top of it.
+            let receiveAmount = deferredWithdrawTargetSats;
+            if (this.showReceiveModal) {
+              receiveAmount = this.$refs.receiveModal?.intendedReceiveSats || null;
+              this.showReceiveModal = false;
+            }
+
             this.pendingPayment = {
               ...paymentData,
               type: 'lnurl_withdraw',
               lnurl: paymentData.data,
               ...lnurlInfo,
+              voucherId: voucher?.id || null,
               amount: lnurlInfo.fixedAmountSats || 0,
-              description: lnurlInfo.defaultDescription
+              description: lnurlInfo.defaultDescription,
+              receiveAmount
             };
           } else {
-            // LNURL-pay: existing flow
-            const walletType = this.walletStore.activeWalletType;
-            if (walletType === 'spark' || walletType === 'lnbits') {
+            // LNURL-pay: existing flow. The payload takes the shape the
+            // paying wallet's backend wants (the active wallet's, unless
+            // "Pay with" says otherwise); sendNWCPayment bridges the shapes
+            // if the user later picks a wallet of the other kind.
+            const payerWalletId = payerFor(lnurlInfo.fixedAmountSats || 0);
+            const walletType = this.walletTypeOf(payerWalletId);
+            if (walletType === 'spark' || walletType === 'lnbits' || walletType === 'arkade') {
               this.pendingPayment = {
                 ...paymentData,
                 lnurl: paymentData.data,
@@ -2401,23 +4415,85 @@ export default {
               };
             } else {
               // Process LNURL for NWC wallets
-              const activeWallet = this.getActiveWallet();
-              if (!activeWallet?.nwcString) {
+              const nwcUrl = this.getNwcUrl(payerWalletId);
+              if (!nwcUrl) {
                 throw new Error('No active wallet found');
               }
-              const lightningService = new LightningPaymentService(activeWallet.nwcString);
+              const lightningService = new LightningPaymentService(nwcUrl);
               const processedLnurl = await lightningService.processPaymentInput(paymentData.data);
               console.log('LNURL processed:', processedLnurl);
-              this.pendingPayment = processedLnurl;
+              // The SDK result only contains payment mechanics. Preserve the
+              // source payload so resolved identity metadata is not dropped.
+              this.pendingPayment = {
+                ...paymentData,
+                ...processedLnurl,
+                serviceMeta: lnurlInfo.serviceMeta,
+                lnurl: paymentData.data,
+              };
             }
           }
         } else if (paymentData.type === 'lightning_address' && paymentData.data) {
           // Fetch LNURL info for all wallet types
           const lnurlInfo = await this.fetchLightningAddressInfo(paymentData.data);
-          const walletType = this.walletStore.activeWalletType;
 
-          if (walletType === 'spark' || walletType === 'lnbits') {
-            // For Spark and LNBits wallets, include LNURL info for amount handling
+          // NIP-05 fallback. A name@domain that didn't resolve as a Lightning
+          // Address (empty lnurlInfo) might be a NIP-05 identifier instead —
+          // resolve it to the lud16 on the person's Nostr profile and pay that.
+          // Lightning-address interpretation always wins; this only rescues a
+          // miss. Skipped for SA-retail merchants (curated rails), and guarded
+          // (_nostrResolved + address-changed) so it runs once and can't loop.
+          if (!lnurlInfo.minSendable
+              && !paymentData._nostrResolved
+              && paymentData.source !== SA_RETAIL_SOURCE) {
+            const rescued = await this.resolveNostrTarget(paymentData.data);
+            if (rescued && rescued.address && rescued.address !== paymentData.data) {
+              delegated = true; // the recursive call owns resolving / close / error
+              return this.onPaymentDetected({
+                ...paymentData,
+                type: rescued.kind,        // 'lightning_address' | 'lnurl'
+                data: rescued.address,
+                _nostrResolved: true,
+                nostrPubkey: rescued.pubkey,
+                nostrNpub: rescued.npub,
+                nostrProfile: rescued.profile,
+                nostrProfileEvent: rescued.profileEvent,
+                nostrRelayHints: rescued.relayHints,
+                sendingWalletId: requestedWalletId,
+              });
+            }
+          }
+
+          // The address didn't resolve as a Lightning Address, and the NIP-05
+          // rescue found nothing either — fail early, in the field, rather than
+          // open a confirm sheet that can only fail at send time. (SA-retail
+          // merchants are curated and keep their existing handling below.)
+          // A transport failure (timeout, DNS, CORS on web) carries its own
+          // reason: the address may be perfectly valid, so don't claim it
+          // doesn't exist — mirror the bech32-LNURL branch above.
+          if (!lnurlInfo.minSendable && paymentData.source !== SA_RETAIL_SOURCE) {
+            resolved = false;
+            const reason = lnurlInfo.error && lnurlInfo.reason
+              ? lnurlInfo.reason
+              : this.$t("We couldn't find this Lightning address");
+            this.failSendResolution(reason, fromField);
+            return;
+          }
+
+          // Past the guard the info is spread into pendingPayment; strip the
+          // failure markers so a curated SA-retail miss doesn't carry them.
+          if (lnurlInfo.error) {
+            delete lnurlInfo.error;
+            delete lnurlInfo.reason;
+          }
+
+          // The payload takes the shape the paying wallet's backend wants (see
+          // the LNURL branch above for how a later "Pay with" change is bridged).
+          const payerWalletId = payerFor(lnurlInfo.fixedAmountSats || 0);
+          const walletType = this.walletTypeOf(payerWalletId);
+
+          if (walletType === 'spark' || walletType === 'lnbits' || walletType === 'arkade') {
+            // For Spark, LNbits and Arkade, include LNURL info for amount handling
+            // — the confirm sheet + per-type send path own the actual payment.
             this.pendingPayment = {
               ...paymentData,
               lightningAddress: paymentData.data,
@@ -2425,13 +4501,21 @@ export default {
             };
           } else {
             // Process Lightning Address for NWC wallets
-            const activeWallet = this.getActiveWallet();
-            if (!activeWallet?.nwcString) {
+            const nwcUrl = this.getNwcUrl(payerWalletId);
+            if (!nwcUrl) {
               throw new Error('No active wallet found');
             }
-            const lightningService = new LightningPaymentService(activeWallet.nwcString);
+            const lightningService = new LightningPaymentService(nwcUrl);
             const processedAddress = await lightningService.processPaymentInput(paymentData.data);
-            this.pendingPayment = processedAddress;
+            // Keep the lightning address + any carried Nostr identity on the
+            // payload (processedAddress only exposes `address`), so the confirm
+            // sheet brands NWC sends the same as Spark/lnbits — wallet logo,
+            // payout-service hint, or the resolved Nostr person.
+            this.pendingPayment = {
+              ...paymentData,
+              ...processedAddress,
+              lightningAddress: paymentData.data,
+            };
           }
 
           // Enrich with SA retail merchant context
@@ -2459,29 +4543,90 @@ export default {
               (this.pendingPayment.minSendable === this.pendingPayment.maxSendable
                 ? Math.floor(this.pendingPayment.minSendable / 1000)
                 : 0);
-            if (paymentSats > 0 && paymentSats > this.walletState.balance) {
+            // It is the paying wallet that has to cover it: with several
+            // wallets the default pick passes over one that cannot.
+            const payerBalance = this.walletBalanceOf(payerFor(paymentSats));
+            if (paymentSats > 0 && paymentSats > payerBalance) {
+              resolved = false; // keep the sheet open; the notify explains why
               this.$q.notify({
                 type: 'negative',
                 message: this.$t('Insufficient balance'),
                 caption: this.$t('You need {amount} sats but only have {balance} sats', {
                   amount: paymentSats,
-                  balance: this.walletState.balance
+                  balance: payerBalance
                 }),
-                actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
               });
               return;
             }
           }
         } else if (paymentData.type === 'spark_address' && paymentData.data) {
-          // Spark address payment
+          // A spark-prefixed string is either a durable address or a signed
+          // one-time invoice; the prefix cannot tell them apart. Decode to
+          // route correctly — transfer() rejects invoice strings by design.
+          let dest;
+          try {
+            dest = decodeSparkDestination(paymentData.data);
+          } catch (decodeErr) {
+            console.warn('Spark destination decode failed:', decodeErr?.message);
+            resolved = false;
+            this.failSendResolution(this.$t('This payment code cannot be read.'), fromField);
+            return;
+          }
+
+          if (dest.kind === 'address') {
+            this.pendingPayment = {
+              ...paymentData,
+              sparkAddress: paymentData.data
+            };
+          } else {
+            // Refuse what can never be paid before the sheet opens. Sender
+            // pinning is only decided here when we know our own identity
+            // key; otherwise the check runs again at pay time against the
+            // connected wallet. "Own" is the paying wallet's: the active
+            // wallet's unless "Pay with" says otherwise.
+            const payerWalletId = payerFor(dest.amountSats || 0);
+            const ownAddress = this.walletStore.getSparkAddress(payerWalletId);
+            const problem = sparkInvoiceProblem(dest, {
+              ownIdentityPublicKey: ownAddress
+                ? identityPublicKeyFromSparkAddress(ownAddress)
+                : null,
+            });
+            if (problem && !(problem === 'sender_unknown' && !ownAddress)) {
+              resolved = false;
+              this.failSendResolution(this.sparkInvoiceProblemMessage(problem), fromField);
+              return;
+            }
+
+            if (dest.amountSats > 0 && dest.amountSats > this.walletBalanceOf(payerWalletId)) {
+              resolved = false;
+              this.failSendResolution(this.$t('Insufficient balance'), fromField);
+              return;
+            }
+
+            this.pendingPayment = {
+              ...paymentData,
+              // The durable receiver identity — what contacts, transaction
+              // linking, and the confirm sheet's recipient lookup use. The
+              // single-use invoice string never leaks into any of them.
+              sparkAddress: dest.receiverAddress,
+              sparkInvoice: dest.invoice,
+              sparkInvoiceExpiresAt: dest.expiresAt,
+              fixedAmountSats: dest.amountSats || 0,
+              description: dest.memo || paymentData.description || '',
+            };
+          }
+        } else if (paymentData.type === 'arkade_address' && paymentData.data) {
+          // Arkade address payment (instant ark1 → ark1, near-zero fee)
           this.pendingPayment = {
             ...paymentData,
-            sparkAddress: paymentData.data
+            arkadeAddress: paymentData.data
           };
         } else if (paymentData.type === 'bitcoin_address' && paymentData.data) {
-          // Bitcoin L1 withdrawal (Spark only)
-          if (!this.walletStore.isActiveWalletSpark) {
-            throw new Error('Bitcoin withdrawals require a Spark wallet');
+          // Bitcoin on-chain: Spark (L1 withdraw) or Arkade (Ramps offboard).
+          // The paying wallet must be one of them, not necessarily the active one.
+          const payerType = this.walletTypeOf(payerFor(Number(paymentData.fixedAmountSats) || 0));
+          if (payerType !== 'spark' && payerType !== 'arkade') {
+            throw new Error('Bitcoin withdrawals require a Spark or Arkade wallet');
           }
           this.pendingPayment = {
             ...paymentData,
@@ -2491,150 +4636,168 @@ export default {
           this.pendingPayment = paymentData;
         }
 
-        this.showPaymentConfirmation = true;
+        // Merchant verification (Branta). Fire-and-forget: it runs in the
+        // background, can never block or break the send, and only ever
+        // adds a badge on a positive match. A miss does nothing.
+        this.runBrantaVerification(this.pendingPayment);
+
+        // Nostr-profile enrichment for npub.cash-style addresses. Same
+        // fire-and-forget contract: upgrades the recipient to the real person
+        // (name + avatar) when relays answer, and does nothing on a miss.
+        this.runNostrRecipientEnrichment(this.pendingPayment);
+
+        // Dispatch by payload shape:
+        //   - LNURL-Withdraw  → PaymentConfirmSheet, verb='redeem'
+        //   - Everything else → PaymentConfirmSheet, verb='send'
+        //     (on-chain included: Spark mounts the L1 fee panel in the
+        //     sheet's extras slot, Arkade offboards via Ramps — one
+        //     confirm surface regardless of backend)
+        if (this.pendingPayment?.type === 'lnurl_withdraw') {
+          // A redeem is a receive: no wallet "pays" it.
+          this.sendingWalletId = null;
+          this.showWithdrawSheet = true;
+        } else {
+          // The payload is final: bind the paying wallet to it (a caller's
+          // choice, else the default pick for the amount it fixes) in the same
+          // tick it becomes visible, so nothing ever reads a payment whose
+          // payer is still the previous one's.
+          this.sendingWalletId = payerFor(this.getPaymentAmountForFee());
+          this.showSendSheet = true;
+        }
       } catch (error) {
         console.error('Error processing payment:', error);
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Payment failed'),
-          caption: this.$t('Please try again'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        });
-      }
-    },
-
-    async checkInvoiceStatus() {
-      if (!this.currentInvoicePaymentHash || this.invoicePaid) return;
-
-      try {
-        let isPaid = false;
-
-        if (this.walletStore.isActiveWalletSpark) {
-          // Spark wallet - ensure connected and use provider's lookupInvoice
-          try {
-            const provider = await this.walletStore.ensureSparkConnected();
-            const result = await provider.lookupInvoice(this.currentInvoicePaymentHash);
-            isPaid = result.paid;
-          } catch (e) {
-            // Silently fail if wallet not connected during background check
-            return;
-          }
+        resolved = false;
+        if (fromField) {
+          this.sendResolveError = this.$t("We couldn't process this. Check it and try again");
         } else {
-          // NWC wallet
-          const activeWallet = this.getActiveWallet();
-          if (!activeWallet?.nwcString) return;
-
-          const nwc = new NostrWebLNProvider({
-            nostrWalletConnectUrl: activeWallet.nwcString,
-          });
-          await nwc.enable();
-
-          const transactions = await nwc.getTransactions();
-          const paidInvoice = transactions.find(tx =>
-            tx.type === 'incoming' &&
-            tx.payment_hash === this.currentInvoicePaymentHash
-          );
-          isPaid = !!paidInvoice;
-        }
-
-        if (isPaid) {
-          console.log('Invoice paid!');
-          this.invoicePaid = true;
-          this.waitingForPayment = false;
-          this.stopInvoiceMonitoring();
-
-          await this.updateWalletBalance();
-
-          this.$q.notify({
-            type: 'positive',
-            message: this.$t('Payment received'),
-
-            actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+          this.walletStore.showPaymentError(error, {
+            context: 'payment',
+            walletType: payerId !== null ? this.walletTypeOf(payerId) : this.walletStore.activeWalletType,
+            route: 'Payment dispatch',
+            t: this.$t.bind(this),
           });
         }
-      } catch (error) {
-        console.error('Error checking invoice status:', error);
+      } finally {
+        // The nested NIP-05 rescue call already settled the outcome (closed the
+        // sheet or set the inline error); don't clobber it from the outer call.
+        if (!delegated) {
+          this.sendResolving = false;
+          // Close the Send sheet only on success; failures stay open so the
+          // user sees the inline error and can fix the input in place.
+          if (resolved && fromField) this.showSendModal = false;
+        }
       }
     },
 
-    formatPaymentAmount() {
-      if (!this.pendingPayment) return '';
-
-      // Variable amount - user needs to input
-      if (this.needsAmountInput) {
-        if (!this.paymentAmount) return 'Enter amount';
-        if (this.sendDenomination === 'fiat') {
-          const val = parseFloat(this.paymentAmount);
-          return val > 0 ? fiatRatesService.formatFiatAmount(val, this.preferredFiatCurrency) : 'Enter amount';
-        }
-        return formatAmount(parseInt(this.paymentAmount), this.walletStore.useBip177Format);
-      }
-
-      // Fixed-amount LNURL/Lightning Address - use fixedAmountSats if available
-      if (this.pendingPayment.type === 'lnurl' ||
-          this.pendingPayment.type === 'lnurl_pay' ||
-          this.pendingPayment.type === 'lightning_address') {
-        // Use new fixedAmountSats property if available
-        if (this.pendingPayment.fixedAmountSats) {
-          return formatAmount(this.pendingPayment.fixedAmountSats, this.walletStore.useBip177Format);
-        }
-        // Fallback: calculate from minSendable
-        if (this.pendingPayment.minSendable === this.pendingPayment.maxSendable) {
-          const fixedAmount = Math.floor(this.pendingPayment.minSendable / 1000);
-          return formatAmount(fixedAmount, this.walletStore.useBip177Format);
-        }
-      }
-
-      // Standard invoice with amount
-      return this.pendingPayment.amount ?
-        formatAmount(parseInt(this.pendingPayment.amount), this.walletStore.useBip177Format) :
-        'Variable amount';
-    },
-
-    async formatPaymentFiat() {
-      if (!this.pendingPayment) return '';
-
-      let amount = 0;
-      if (this.pendingPayment.type === 'lnurl_withdraw') {
-        // Handled by withdrawSecondaryDisplay computed
-        return '';
-      } else if (this.needsAmountInput) {
-        // When user is entering in fiat, show sats equivalent instead
-        if (this.sendDenomination === 'fiat') {
-          const sats = this.sendAmountSats;
-          if (sats > 0) return '≈ ' + formatAmount(sats, this.walletStore.useBip177Format);
-          return '';
-        }
-        amount = parseInt(this.paymentAmount) || 0;
-      } else if (this.pendingPayment.type === 'lnurl' ||
-                 this.pendingPayment.type === 'lnurl_pay' ||
-                 this.pendingPayment.type === 'lightning_address') {
-        // Fixed-amount LNURL/Lightning Address - use fixedAmountSats if available
-        if (this.pendingPayment.fixedAmountSats) {
-          amount = this.pendingPayment.fixedAmountSats;
-        } else if (this.pendingPayment.minSendable === this.pendingPayment.maxSendable) {
-          amount = Math.floor(this.pendingPayment.minSendable / 1000);
-        }
-      } else {
-        amount = this.pendingPayment.amount || 0;
-      }
-
-      if (amount === 0) return '';
-
+    /**
+     * Merchant verification (Branta), send side. Fired fire-and-forget
+     * after the payment payload is built and the confirm sheet is on its
+     * way up. It is a progressive enhancement and is wrapped so it can
+     * never disrupt the payment: every failure path resolves to "show
+     * nothing". Mirrors Blitz Wallet's gating and the official wallet docs.
+     *
+     * Verifiable in strict mode:
+     *   - BOLT11 invoices (scanned, pasted, or the lightning leg extracted
+     *     from a BIP21 QR): looked up privately, the raw invoice is never
+     *     sent to Branta. Badge shown on PaymentConfirmSheet.
+     *   - On-chain addresses whose QR carries branta_id + branta_secret
+     *     (ZK params): badge shown on the on-chain withdraw sheet.
+     * Raw Lightning Address / LNURL / Spark cannot resolve in strict mode
+     * and are intentionally skipped (Blitz Wallet skips them too).
+     */
+    runBrantaVerification(payment) {
       try {
-        const currency = this.walletState.preferredFiatCurrency || 'USD';
-        const fiatAmount = await fiatRatesService.convertSatsToFiat(amount, currency);
+        if (!this.bitcoinPrefsStore.brantaVerificationEnabled) return;
+        // SA-retail merchants carry their own curated identity and are not
+        // on Branta; skip so the two never collide.
+        if (!payment || payment.source === SA_RETAIL_SOURCE) return;
 
-        // Handle unavailable rates
-        if (fiatAmount === null) {
-          return '';
+        // Decide what raw text (if any) to hand the SDK.
+        let qrText = null;
+        if (payment.type === 'lightning_invoice') {
+          // The extracted BOLT11 (covers a direct scan, a paste, and the
+          // lightning leg of a BIP21 unified QR).
+          qrText = payment.invoice || payment.data || null;
+        } else if (payment.type === 'bitcoin_address') {
+          // On-chain only resolves when the QR carries the ZK params.
+          const raw = payment.rawInput || '';
+          if (this.hasBrantaParams(raw)) qrText = raw;
         }
+        if (!qrText) return;
 
-        return '≈ ' + fiatRatesService.formatFiatAmount(fiatAmount, currency);
+        // Cancel any earlier in-flight lookup, then bound the new one with
+        // a short timeout so a hung request cannot linger.
+        if (this._brantaAbort) this._brantaAbort.abort();
+        const controller = new AbortController();
+        this._brantaAbort = controller;
+        const timer = setTimeout(() => controller.abort(), BRANTA_LOOKUP_TIMEOUT_MS);
+
+        // Identity guard: only paint the badge if this is still the exact
+        // same pending payment when the lookup resolves. Each new payment
+        // reassigns this.pendingPayment to a fresh object, so a late result
+        // can never land on a different payment.
+        const token = payment;
+
+        lookupBrantaVerification({ qrText, signal: controller.signal })
+          .then((verification) => {
+            if (!verification) return;
+            if (this.pendingPayment !== token) return;
+            // Adding the key on the reactive payload re-runs the sheet
+            // adapter (and the on-chain sheet prop), so the badge appears
+            // the moment the result lands.
+            this.pendingPayment.brantaVerification = verification;
+          })
+          .catch(() => { /* never surfaces; see utils/branta.js */ })
+          .finally(() => clearTimeout(timer));
+      } catch {
+        // Defensive: verification must never disrupt the payment path.
+      }
+    },
+
+    /**
+     * True when a bitcoin: URI carries both Branta ZK params, the only
+     * case an on-chain destination can be verified in strict mode. Mirrors
+     * Blitz Wallet's check.
+     */
+    hasBrantaParams(raw) {
+      if (!raw || typeof raw !== 'string') return false;
+      try {
+        const url = new URL(raw);
+        // The SDK's QR parser lowercases query keys, so match
+        // case-insensitively to agree with it and not skip a
+        // non-canonical-cased QR.
+        const keys = [...url.searchParams.keys()].map((k) => k.toLowerCase());
+        return keys.includes('branta_id') && keys.includes('branta_secret');
+      } catch {
+        return false;
+      }
+    },
+
+    /**
+     * Announce a completed payment on the EventBus (`payment:sent`).
+     *
+     * The wallet page does not know who asked for the payment; listeners that
+     * do (the contact chat's announcer) recognise their own `context`. A
+     * listener that throws must never turn a payment that went through into an
+     * error screen, so this swallows everything.
+     */
+    emitPaymentSent(payload) {
+      try {
+        EventBus.emit('payment:sent', payload);
       } catch (error) {
-        console.error('Error formatting payment fiat:', error);
-        return '';
+        console.warn('[wallet] a payment:sent listener failed:', error?.name || 'Error');
+      }
+    },
+
+    /**
+     * Abort and clear any in-flight Branta lookup. Called when a payment is
+     * abandoned (sheet cancelled, component unmounted) so a request for a
+     * payment the user dropped does not linger.
+     */
+    cancelBrantaLookup() {
+      if (this._brantaAbort) {
+        this._brantaAbort.abort();
+        this._brantaAbort = null;
       }
     },
 
@@ -2673,10 +4836,20 @@ export default {
       if (!this.canConfirmPayment) return;
 
       this.isSendingPayment = true;
+      // The wallet that pays - the "Pay with" choice, else the active wallet -
+      // read once, up front: from here to the metadata writes the payment is
+      // bound to it, whatever the UI does meanwhile. It is never made active.
+      const sendingWalletId = this.getSendingWallet()?.id || this.activeWallet?.id || null;
+      const walletType = this.walletTypeOf(sendingWalletId);
+
+      // Lifted out of the try block so the catch can hand the
+      // attempted amount to the payment-error dialog (used by the
+      // insufficient-funds enhancer to break the upstream total into
+      // send + fee).
+      let amount = null;
 
       try {
         // Determine the amount to send
-        let amount = null;
         if (this.needsAmountInput && this.paymentAmount) {
           // Variable amount - convert to sats if user entered in fiat
           amount = this.sendAmountSats;
@@ -2701,71 +4874,436 @@ export default {
 
         let result;
 
-        // Route payment based on wallet type
-        const walletType = this.walletStore.activeWalletType;
+        // Route the payment by the type of the wallet that pays, and hand each
+        // executor that wallet's id: it connects that wallet on demand and
+        // sends through its provider, so the active wallet is never involved.
         if (walletType === 'spark') {
-          result = await this.sendSparkPayment(amount, comment);
+          result = await this.sendSparkPayment(amount, comment, this.sendPayout, sendingWalletId);
+        } else if (walletType === 'arkade') {
+          result = await this.sendArkadePayment(amount, comment, this.sendPayout, sendingWalletId);
         } else if (walletType === 'lnbits') {
-          result = await this.sendLNBitsPayment(amount, comment);
+          result = await this.sendLNBitsPayment(amount, comment, this.sendPayout, sendingWalletId);
         } else {
-          result = await this.sendNWCPayment(amount, comment);
+          result = await this.sendNWCPayment(amount, comment, sendingWalletId);
         }
 
         console.log('Payment sent:', result);
 
-        // Check if we should offer to save this recipient as a contact
-        const recipientAddress = this.getRecipientAddress();
-        const recipientAddressType = this.getRecipientAddressType();
-        const shouldOfferSave = recipientAddress && !this.addressBookStore.findContactByAddress(recipientAddress);
+        // LUD-09: the recipient may have returned a successAction alongside the
+        // invoice (a post-payment message, link, or AES-encrypted secret).
+        // Resolve it now — decrypting the `aes` variant with this payment's
+        // preimage — into a display-ready, storage-friendly object. This never
+        // throws: a decrypt failure degrades to a flagged state and never
+        // blocks the success screen.
+        const successAction = await resolveSuccessAction(result?.successAction, result?.preimage);
 
-        this.showPaymentConfirmation = false;
-        const pendingPaymentBackup = this.pendingPayment; // Keep reference for save dialog
-        this.pendingPayment = null;
-        this.paymentAmount = '';
-        this.paymentComment = '';
-        this.estimatedFee = null;
-        this.isEstimatingFee = false;
+        // Address-book context: do we know this recipient, and is the
+        // recipient saveable at all? Computed up-front because both the
+        // pending-link queue and the success modal depend on it.
+        // Terminal status of the send (Spark may still be routing → 'pending').
+        const status = (result && typeof result === 'object' && result.status) || 'completed';
+        const isCompletedSend = status !== 'pending';
 
-        await this.updateWalletBalance();
+        // LUD-11: the service said this LNURL is reusable (disposable: false),
+        // which makes it a durable handle on the recipient. It is stamped in
+        // canonical lowercase bech32 so the address book, the tx-row avatar
+        // and a contact's history resolve it through the same lookups a
+        // Lightning address uses. When the service also names its Lightning
+        // address (LUD-06 text/identifier), that is the address to keep: it
+        // is what other apps and the shared contacts understand. A one-shot
+        // link stamps nothing. Pending sends keep their identity for settlement.
+        const payLink = canonicalLnurl(result?.payLink);
+        let recipientAddress = this.getRecipientAddress();
+        let recipientAddressType = this.getRecipientAddressType();
+        const isServiceSend = !recipientAddress && !!payLink;
+        const serviceMeta = isServiceSend ? (result?.serviceMeta || null) : null;
+        const serviceDomain = isServiceSend ? lnurlDomain(payLink) : '';
+        const serviceName = isServiceSend ? serviceTitle(serviceMeta, serviceDomain) : '';
+        if (isServiceSend) {
+          const identity = serviceIdentity(payLink, serviceMeta);
+          recipientAddress = identity.address;
+          recipientAddressType = identity.addressType;
+        }
+        const addressNostrIdentity = npubFromLightningAddress(
+          this.pendingPayment?.lightningAddress,
+        );
+        const recipientNostrPubkey = this.pendingPayment?.nostrPubkey
+          || addressNostrIdentity?.pubkey
+          || null;
+        const recipientNostrNpub = this.pendingPayment?.nostrNpub
+          || addressNostrIdentity?.npub
+          || null;
+        const isNostrSend = !!recipientNostrPubkey;
+        // Identity matching is canonical. An existing Nostr contact may use a
+        // different destination than the address paid today, so address-only
+        // matching would incorrectly offer a duplicate save.
+        const existingContact = (
+          recipientAddress
+            ? this.addressBookStore.findContactByAddress(recipientAddress)
+            : null
+        ) || (
+          recipientNostrPubkey
+            ? this.addressBookStore.findContactByPubkey(recipientNostrPubkey)
+            : null
+        );
+        // A paid invoice has no address to find the contact by: the chat names it.
+        const invoiceContactId = this.pendingPayment?.type === 'lightning_invoice' && this.pendingPayment.paymentContactId
+          && this.addressBookStore.getEntryById(this.pendingPayment.paymentContactId)
+          ? this.pendingPayment.paymentContactId : null;
+        const shouldOfferSave = isCompletedSend && !!(recipientAddress && !existingContact);
+        const recipientLabel = isServiceSend && !existingContact
+          ? serviceName
+          : this.getRecipientDisplayLabel(existingContact);
 
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Sent'),
+        // LUD-21 fiat delivery: only meaningful for a recognized fiat-payout
+        // provider (ChapSmart/Tando/Bitzed) — an ordinary LNURL/LUD-21 endpoint
+        // returns a `verify` URL too, but has no fiat leg to confirm, so we must
+        // NOT drive the "delivery" UI for it. Also skip pending sends (nothing
+        // has settled to deliver yet). `result.verify` is already same-domain
+        // validated at the fetch boundary. The actual poll is owned by
+        // openSendSuccess so its lifecycle (start/abort) lives in one place.
+        const isPayoutProvider = !!recipientAddress && !!matchLnAddressService(recipientAddress);
+        const verifyUrl = (isCompletedSend && isPayoutProvider) ? (result?.verify || null) : null;
 
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        });
+        // Queue a pending link by recipient address + amount + send
+        // time. The next tx-list refresh drains the queue and stamps
+        // the newly observed outgoing tx — wallet-agnostic, so it
+        // works the same for Spark (transfer id ≠ payment id), LNbits
+        // (payment_hash directly), and NWC (only `preimage` comes
+        // back) without us having to know which provider is active.
+        //
+        // We queue for ANY saveable recipient, not just known contacts,
+        // and carry contactId only when we already have it. The address
+        // is stamped durably on the tx so a contact added later still
+        // resolves live against this payment.
+        // Payment-rail source for the history UI's chip/type row. A fiat
+        // payout provider is the phone-number rail; a send that resolved a
+        // Nostr identity (bare npub/nprofile/NIP-05, or an npub-handle
+        // address) is the Nostr rail. Plain Lightning sends carry none.
+        const paymentSource = isPayoutProvider ? 'phone' : (isNostrSend ? 'nostr' : null);
 
-        // Offer to save contact if this is a new recipient
+        // A Branta-verified destination (see runBrantaVerification) carries
+        // the merchant's real name/logo/verify link, resolved async while
+        // the confirm sheet was open. Only the fields Tx Details actually
+        // renders are kept — the longer `description` lives on the sheet,
+        // not the receipt.
+        const bv = this.pendingPayment?.brantaVerification;
+        const merchantVerification = bv
+          ? { name: bv.name || '', logoUrl: bv.logoUrl || '', logoLightUrl: bv.logoLightUrl || '', verifyUrl: bv.verifyUrl || '' }
+          : null;
+
+        if (invoiceContactId && !existingContact) {
+          try {
+            await this.transactionMetadataStore.enqueuePendingContactLink({
+              contactId: invoiceContactId,
+              amountSats: amount,
+              perPayment: true,
+              walletId: sendingWalletId,
+            });
+          } catch (err) {
+            console.warn('[wallet] could not queue contact link:', err);
+          }
+        } else if (recipientAddress || successAction || verifyUrl || paymentSource || merchantVerification || payLink) {
+          try {
+            // A resolved Nostr send carries the person's avatar + display
+            // name so the tx row/hero show who was actually paid instead of
+            // a raw address. Both null for every other rail.
+            let counterpartyAvatar = null;
+            let counterpartyLabel = null;
+            if (isNostrSend) {
+              const npub = recipientNostrNpub;
+              const picture = sanitizeImageUrl(this.pendingPayment?.nostrProfile?.picture) || null;
+              counterpartyAvatar = { kind: 'nostr', npub, picture };
+              counterpartyLabel = profileDisplayName(this.pendingPayment?.nostrProfile) || shortenNpub(npub) || null;
+            } else if (isServiceSend) {
+              // A storeable service: its LUD-06 name on the row, and its logo
+              // resolved live from the local image registry by address, so
+              // the tx list shows who was paid before any contact is saved.
+              counterpartyLabel = serviceName || null;
+              counterpartyAvatar = { kind: 'service', address: recipientAddress };
+              this.rememberServiceImage(recipientAddress, serviceMeta);
+            }
+            await this.transactionMetadataStore.enqueuePendingContactLink({
+              contactId: existingContact?.id || null,
+              recipientAddress,
+              amountSats: amount,
+              // Ride the same deferred queue to durably stamp the recipient's
+              // LUD-09 message onto the outgoing tx once it surfaces in history.
+              successAction,
+              // Persist the LUD-21 verify URL too, so Transaction Details can
+              // re-confirm delivery (receipt + recipient) when viewed later.
+              verifyUrl,
+              // LUD-11 reusable LNURL — Transaction Details turns it into
+              // "Pay again" instead of asking for the QR a second time.
+              payLink,
+              source: paymentSource,
+              // Nostr and service sends — the counterparty's name (title)
+              // and avatar; null for every other rail.
+              label: counterpartyLabel,
+              counterpartyAvatar,
+              // Branta-verified sends only — carries the receipt-ready
+              // merchant identity through to Tx Details.
+              merchantVerification,
+              // The wallet this send went out on, so the link is only ever
+              // drained by that wallet's own tx-list refresh.
+              walletId: sendingWalletId,
+              // Spark's invoice result carries the history payment ID even
+              // while pending. Never match it to a different, later payment.
+              transactionId: walletType === 'spark' && payLink ? result?.id || null : null,
+            });
+          } catch (err) {
+            console.warn('[wallet] could not queue contact link:', err);
+          }
+        }
+
+        // Stash the save-contact payload BEFORE clearing pendingPayment,
+        // so the modal's "Save to Contacts" button has everything it
+        // needs even after the input state is reset. `saveContactData`
+        // is what the existing save dialog already reads.
         if (shouldOfferSave) {
+          // Fiat-payout numbers (Bitzed/Tando): prefill the note so the saved
+          // contact reads clearly as a mobile-money recipient. Empty for any
+          // other address.
+          const payoutService = matchLnAddressService(recipientAddress);
+          const profile = this.pendingPayment?.nostrProfile || null;
+          const profileEvent = this.pendingPayment?.nostrProfileEvent || null;
+          const nostrIdentity = recipientNostrPubkey && recipientNostrNpub && profileEvent
+            ? {
+                pubkey: recipientNostrPubkey,
+                npub: recipientNostrNpub,
+                profile,
+                profileEvent,
+                relayHints: Array.isArray(this.pendingPayment?.nostrRelayHints)
+                  ? this.pendingPayment.nostrRelayHints
+                  : [],
+              }
+            : null;
           this.saveContactData = {
             address: recipientAddress,
             addressType: recipientAddressType,
-            name: '',
-            notes: ''
+            name: nostrIdentity
+              ? (profileDisplayName(profile) || shortenNpub(recipientNostrNpub))
+              : serviceName,
+            notes: payoutService?.note ? this.$t(payoutService.note) : '',
+            // LUD-11 storeable service: what it said about itself (LUD-06),
+            // kept on the entry so the address book can show it as a service.
+            service: isServiceSend
+              ? {
+                  name: serviceName,
+                  identifier: serviceMeta?.identifier || null,
+                  payLink,
+                  domain: serviceDomain,
+                  reusable: true,
+                  seenAt: Date.now(),
+                }
+              : null,
+            // Carry the amount so the post-save handler can queue a
+            // pending contact link against the same outgoing tx the
+            // existing-contact path uses.
+            amountSats: amount,
+            nostrIdentity,
+            // ... and the wallet that sent it: that is the history the link
+            // belongs to, whichever wallet is active by the time Save is tapped.
+            walletId: sendingWalletId,
           };
-          // Small delay so the success notification is seen first
-          setTimeout(() => {
-            this.showSaveContactDialog = true;
-          }, 500);
         }
+
+        // Snap the CTA to its completed state (fill -> 100% + check) while the
+        // recipient payload is still intact, and let that brief micro-
+        // interaction play. This is the bridge from the send CTA to the
+        // confirmation screen.
+        // Tell whoever handed this payment over (the contact chat) that it
+        // went through. Only for a settled send: a pending one may still fail.
+        if (isCompletedSend) {
+          this.emitPaymentSent({
+            contactId: existingContact?.id || invoiceContactId,
+            destination: recipientAddress || this.pendingPayment?.invoice || null,
+            amountSats: amount,
+            preimage: result?.preimage || null,
+            sendingWalletId,
+            note: comment,
+            context: this.pendingPayment?.paymentContext || null,
+          });
+        }
+
+        this.sendDidSucceed = true;
+        await new Promise((resolve) => setTimeout(resolve, 450)); // CTA completion beat
+
+        // Surface the success screen FIRST, then tear the sheet down BEHIND it
+        // — clearing pendingPayment while the sheet is still visible is what
+        // used to flash the generic "Recipient" fallback. The Spark provider's
+        // polling already resolved to a terminal status by now; a 60s timeout
+        // without settling lands on PENDING with softer "still routing" copy.
+        this.openSendSuccess({
+          amount,
+          recipient: recipientLabel,
+          status,
+          showSaveContact: shouldOfferSave,
+          successAction,
+          verifyUrl,
+        });
+
+        this.showSendSheet = false;
+        this.pendingPayment = null;
+        this.sendingWalletId = null;
+        this.paymentAmount = '';
+        this.paymentComment = '';
+        this.sendPayout = null;
+        this.estimatedFee = null;
+        this.isEstimatingFee = false;
+        this.sendDidSucceed = false;
+
+        // Refresh the balance behind the now-visible success screen: the
+        // paying wallet's, which is the active one unless "Pay with" said so.
+        await this.refreshPayerBalance(sendingWalletId);
 
       } catch (error) {
         console.error('Payment failed:', error);
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Payment failed'),
-          caption: this.$t('Please try again'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
+        this.walletStore.showPaymentError(error, {
+          context: 'payment',
+          walletType,
+          route: this.routeLabelForPendingPayment(),
+          amountSats: typeof amount === 'number' ? amount : undefined,
+          t: this.$t.bind(this),
         });
       } finally {
         this.isSendingPayment = false;
       }
     },
 
-    async sendSparkPayment(amount, comment) {
+    /**
+     * Short, debug-friendly label describing how the current
+     * pendingPayment is being routed. Included in the technical
+     * details panel of the global payment-error dialog so a copied
+     * report tells a developer what path actually ran.
+     */
+    routeLabelForPendingPayment() {
+      const p = this.pendingPayment;
+      if (!p) return null;
+      if (p.bitcoinAddress)    return 'Bitcoin on-chain';
+      if (p.sparkAddress)      return 'Spark transfer';
+      if (p.arkadeAddress)     return 'Arkade transfer';
+      if (p.invoice)           return 'BOLT11 invoice';
+      if (p.lightningAddress)  return 'Lightning Address';
+      if (p.lnurl)             return 'LNURL-pay';
+      if (p.type === 'lnurl_withdraw') return 'LNURL-withdraw';
+      return p.type || null;
+    },
+
+    /**
+     * PaymentConfirmSheet → confirm handler.
+     *
+     * The sheet validates the entered amount against its constraints
+     * before emitting, so we trust the value and just bridge it into the
+     * fields that `confirmPayment` reads. On failure we reset the slide
+     * thumb so the user can try again without dismissing the sheet.
+     */
+    async onSendSheetConfirm({ amountSats, comment, payout = null }) {
+      // Spark on-chain rides its own submit lifecycle (withdrawal request
+      // + background monitor), not the instant-payment pipeline.
+      if (this.isSparkL1Payment) {
+        await this.executeSparkL1Withdrawal(amountSats);
+        return;
+      }
+
+      this.paymentAmount = String(amountSats);
+      this.paymentComment = comment || '';
+      this.sendDenomination = 'sats';
+      // Carry the LUD-21 local-currency request (if the sender denominated in
+      // the recipient's currency) so the invoice fetch uses Option A.
+      this.sendPayout = payout || null;
+
+      await this.confirmPayment();
+
+      // On success confirmPayment plays the CTA completion animation, shows the
+      // success screen, and closes the sheet itself. On failure pendingPayment
+      // survives (its catch block doesn't rethrow) — reset the slide so the
+      // user can retry without re-entering anything.
+      if (this.pendingPayment !== null) {
+        this.$refs.sendSheetRef?.resetSlide();
+      }
+    },
+
+    onSendSheetCancel() {
+      this.cancelBrantaLookup();
+      this.showSendSheet = false;
+      this.sendDidSucceed = false;
+      this.pendingPayment = null;
+      // The next payment starts from its own default pick, not this one's choice.
+      this.sendingWalletId = null;
+      this.paymentAmount = '';
+      this.paymentComment = '';
+      this.sendPayout = null;
+      this.estimatedFee = null;
+      this.isEstimatingFee = false;
+      // On-chain state must not leak into the next open: a stale quote
+      // would gate (or worse, price) a different payment.
+      this.l1Fee = null;
+      this.sendSheetAmountSats = 0;
+    },
+
+    /**
+     * PaymentConfirmSheet → confirm handler for the LNURL-Withdraw
+     * (redeem) flow. The sheet has already validated the amount against
+     * the withdraw source's range/fixed constraints, so we just bridge
+     * it into `paymentAmount` (which executeWithdraw reads) and run the
+     * existing pipeline. On failure we reset the slide and keep the
+     * sheet open so the user can retry without re-entering anything.
+     */
+    async onWithdrawSheetConfirm({ amountSats }) {
+      this.paymentAmount = String(amountSats);
+
+      await this.executeWithdraw();
+
+      // executeWithdraw transitions lnurlWithdrawStatus through stages.
+      // 'confirmed' closes the sheet via handleWithdrawConfirmed.
+      // 'error' lands here — let the user retry.
+      if (this.lnurlWithdrawStatus === 'error') {
+        this.$refs.withdrawSheetRef?.resetSlide();
+      }
+    },
+
+    onWithdrawSheetCancel() {
+      this.cancelBrantaLookup();
+      this.showWithdrawSheet = false;
+      this.resetWithdrawState();
+      this.pendingPayment = null;
+      this.paymentAmount = '';
+    },
+
+    /**
+     * Send executors (Spark / Arkade / NWC / LNbits). Each takes the id of
+     * the wallet that pays and connects THAT wallet on demand - the same
+     * ensure*Connected path the active wallet always took - so paying from
+     * another wallet never needs the active wallet to change. Without an id
+     * they pay from the active wallet, as before "Pay with" existed.
+     */
+    async sendSparkPayment(amount, comment, payout = null, walletId = null) {
       // Ensure Spark wallet is connected (auto-connects if session PIN available)
-      const provider = await this.walletStore.ensureSparkConnected();
+      const provider = await this.walletStore.ensureSparkConnected(walletId);
+
+      // Spark invoice — must go through fulfill; transfer() rejects invoice
+      // strings. Checked before the plain-address branch because invoice
+      // payments also carry the decoded receiver in `sparkAddress`.
+      if (this.pendingPayment.sparkInvoice) {
+        const invoice = this.pendingPayment.sparkInvoice;
+        // Re-evaluate refusal conditions at pay time: the sheet may have
+        // been open past the expiry, and sender pinning could only be
+        // finally decided now that the wallet is connected.
+        const dest = decodeSparkDestination(invoice);
+        const ownAddress = await provider.getSparkAddress();
+        const problem = sparkInvoiceProblem(dest, {
+          ownIdentityPublicKey: identityPublicKeyFromSparkAddress(ownAddress),
+        });
+        if (problem) {
+          throw new Error(this.sparkInvoiceProblemMessage(problem));
+        }
+        return await provider.fulfillSparkInvoice(invoice, {
+          // An encoded amount wins SDK-side; only free-amount invoices take
+          // the amount from the sheet.
+          amountSats: dest.amountSats > 0 ? null : amount,
+        });
+      }
 
       // Spark address transfer (zero-fee)
       if (this.pendingPayment.sparkAddress) {
@@ -2787,39 +5325,116 @@ export default {
 
       // Lightning address
       if (this.pendingPayment.lightningAddress) {
-        return await provider.payLightningAddress(this.pendingPayment.lightningAddress, amount, comment || '');
+        return await provider.payLightningAddress(this.pendingPayment.lightningAddress, amount, comment || '', payout);
       }
 
       // LNURL - decode and fetch invoice, then pay
       // Note: LNURL invoices already have amount encoded, so don't pass amountSats
       if (this.pendingPayment.lnurl) {
-        const invoice = await this.fetchLNURLInvoice(this.pendingPayment.lnurl, amount);
-        return await provider.payInvoice({
-          invoice,
+        const { pr, successAction, verify, payLink, serviceMeta } = await this.fetchLNURLInvoice(this.pendingPayment.lnurl, amount, payout);
+        const result = await provider.payInvoice({
+          invoice: pr,
           preferSpark: true,
           maxFee: this.estimatedFee || undefined // Pass UI-displayed fee estimate
           // amountSats intentionally omitted - LNURL invoice has amount encoded
         });
+        return { ...result, successAction, verify, payLink, serviceMeta };
       }
 
       throw new Error('Unsupported payment type for Spark wallet');
     },
 
-    async sendNWCPayment(amount, comment) {
-      const activeWallet = this.getActiveWallet();
-      if (!activeWallet?.nwcString) {
+    /**
+     * Arkade send executor. Routes by destination type, mirroring the LNbits
+     * flow (Arkade pays Lightning via a resolved bolt11 invoice, not a native
+     * address-pay) plus the instant ark1 fast path:
+     *   - ark1 → ark1            : transferToArkadeAddress (near-zero fee)
+     *   - BOLT11 invoice         : Boltz submarine swap (payInvoice)
+     *   - Lightning address/LNURL: resolve to bolt11, then swap
+     *   - on-chain bc1…          : Ramps offboard (collaborative exit)
+     * LUD-21 currency payouts and LUD-09 successActions ride the invoice
+     * fetch exactly like the LNbits path: the swap pays whatever bolt11 the
+     * provider returned, and the metadata is threaded onto the result.
+     */
+    async sendArkadePayment(amount, comment, payout = null, walletId = null) {
+      const provider = await this.walletStore.ensureArkadeConnected(walletId);
+
+      // Native ark1 → ark1: instant, near-zero fee fast path.
+      if (this.pendingPayment.arkadeAddress) {
+        return await provider.transferToArkadeAddress({
+          arkadeAddress: this.pendingPayment.arkadeAddress,
+          amount,
+        });
+      }
+
+      // BOLT11 invoice → Boltz submarine swap.
+      if (this.pendingPayment.invoice) {
+        return await provider.payInvoice({ invoice: this.pendingPayment.invoice });
+      }
+
+      // Lightning address → fetch a bolt11 for the amount, then swap.
+      if (this.pendingPayment.lightningAddress) {
+        const { pr, successAction, verify } = await this.fetchLightningAddressInvoice(
+          this.pendingPayment.lightningAddress,
+          amount,
+          comment,
+          payout
+        );
+        const result = await provider.payInvoice({ invoice: pr });
+        return { ...result, successAction, verify };
+      }
+
+      // LNURL-pay → fetch the encoded-amount invoice, then swap.
+      if (this.pendingPayment.lnurl) {
+        const { pr, successAction, verify, payLink, serviceMeta } = await this.fetchLNURLInvoice(this.pendingPayment.lnurl, amount, payout);
+        const result = await provider.payInvoice({ invoice: pr });
+        return { ...result, successAction, verify, payLink, serviceMeta };
+      }
+
+      // On-chain (bc1…): collaborative exit (offboard) via Ramps.
+      if (this.pendingPayment.bitcoinAddress) {
+        return await provider.offboardToBitcoin({
+          bitcoinAddress: this.pendingPayment.bitcoinAddress,
+          amount,
+        });
+      }
+
+      throw new Error('Unsupported payment type for Arkade wallet');
+    },
+
+    async sendNWCPayment(amount, comment, walletId = null) {
+      // NWC has no shared provider object to ask: the service connects with
+      // the wallet's own NWC string.
+      const nwcUrl = walletId ? this.getNwcUrl(walletId) : this.getActiveWallet()?.nwcString;
+      if (!nwcUrl) {
         throw new Error('No active NWC wallet found');
       }
 
-      const lightningService = new LightningPaymentService(activeWallet.nwcString);
-      return await lightningService.sendPayment(this.pendingPayment, amount, comment);
+      const lightningService = new LightningPaymentService(nwcUrl);
+      return await lightningService.sendPayment(this.getNwcPaymentData(), amount, comment);
     },
 
-    async sendLNBitsPayment(amount, comment) {
-      const provider = await this.walletStore.getProvider(this.walletStore.activeWalletId);
-      if (!provider) {
-        throw new Error('LNBits wallet not connected');
+    /**
+     * The pending payment in the shape LightningPaymentService.sendPayment
+     * reads. A payment resolved for another kind of wallet (the default pick
+     * was a Spark wallet, the user then chose an NWC wallet in "Pay with")
+     * carries `lightningAddress` but no `address`, which the service needs to
+     * re-resolve a Lightning address. A payment resolved for an NWC wallet
+     * already has it and passes through untouched.
+     */
+    getNwcPaymentData() {
+      const p = this.pendingPayment;
+      if (p?.type === 'lightning_address' && !p.address && p.lightningAddress) {
+        return { ...p, address: p.lightningAddress };
       }
+      return p;
+    },
+
+    async sendLNBitsPayment(amount, comment, payout = null, walletId = null) {
+      // Route through ensureLNBitsConnected so a stale `isConnected` flag
+      // (e.g. cleared by a prior 401) self-heals before the send rather than
+      // failing with "wallet is not connected" until app restart.
+      const provider = await this.walletStore.ensureLNBitsConnected(walletId);
 
       // Lightning invoice payment
       if (this.pendingPayment.invoice) {
@@ -2830,28 +5445,27 @@ export default {
 
       // Lightning address - fetch invoice first then pay
       if (this.pendingPayment.lightningAddress) {
-        const invoice = await this.fetchLightningAddressInvoice(
+        const { pr, successAction, verify } = await this.fetchLightningAddressInvoice(
           this.pendingPayment.lightningAddress,
           amount,
-          comment
+          comment,
+          payout
         );
-        return await provider.payInvoice({ invoice });
+        const result = await provider.payInvoice({ invoice: pr });
+        return { ...result, successAction, verify };
       }
 
       // LNURL - fetch invoice then pay
       if (this.pendingPayment.lnurl) {
-        const invoice = await this.fetchLNURLInvoice(this.pendingPayment.lnurl, amount);
-        return await provider.payInvoice({ invoice });
+        const { pr, successAction, verify, payLink, serviceMeta } = await this.fetchLNURLInvoice(this.pendingPayment.lnurl, amount, payout);
+        const result = await provider.payInvoice({ invoice: pr });
+        return { ...result, successAction, verify, payLink, serviceMeta };
       }
 
-      throw new Error('Unsupported payment type for LNBits wallet');
+      throw new Error('Unsupported payment type for LNbits wallet');
     },
 
-    // Helper: Check if input is a Lightning invoice
-    isLightningInvoice(input) {
-      const lower = input.toLowerCase();
-      return lower.startsWith('lnbc') || lower.startsWith('lntb') || lower.startsWith('lnbcrt');
-    },
+    isLightningInvoice(input) { return isLightningInvoiceShared(input); },
 
     // Helper: Check if input is a Lightning address
     isLightningAddress(input) {
@@ -2871,6 +5485,8 @@ export default {
       if (this.pendingPayment.lightningAddress) return this.pendingPayment.lightningAddress;
       // Spark address
       if (this.pendingPayment.sparkAddress) return this.pendingPayment.sparkAddress;
+      // Arkade address
+      if (this.pendingPayment.arkadeAddress) return this.pendingPayment.arkadeAddress;
       // LNURL is not saveable as a stable address
       return null;
     },
@@ -2879,7 +5495,167 @@ export default {
     getRecipientAddressType() {
       if (!this.pendingPayment) return 'lightning';
       if (this.pendingPayment.sparkAddress) return 'spark';
+      if (this.pendingPayment.arkadeAddress) return 'arkade';
       return 'lightning';
+    },
+
+    /**
+     * Build the human-readable recipient string for the success
+     * modal's "To {recipient}" line. Order of preference:
+     *   1. Existing contact name (most personal)
+     *   2. Lightning address (already human-readable)
+     *   3. Spark address (truncated, machine-y but identifies a peer)
+     *   4. '' → modal omits the line entirely (raw bolt11 / generic
+     *      LNURL have no stable counterparty identity to show)
+     *
+     * @param {object|null} existingContact - May be null for new recipients.
+     * @returns {string}
+     */
+    getRecipientDisplayLabel(existingContact) {
+      if (existingContact?.name) return existingContact.name;
+      if (!this.pendingPayment) return '';
+      if (this.pendingPayment.lightningAddress) {
+        return this.pendingPayment.lightningAddress;
+      }
+      if (this.pendingPayment.sparkAddress) {
+        return this.truncateAddress(this.pendingPayment.sparkAddress);
+      }
+      if (this.pendingPayment.arkadeAddress) {
+        return this.truncateAddress(this.pendingPayment.arkadeAddress);
+      }
+      return '';
+    },
+
+    /**
+     * Open the send-success modal. Centralises the state writes so
+     * both call sites (free-amount pay flow + contact pay flow) drive
+     * the modal through the same door.
+     *
+     * Fiat is computed best-effort — failure is silent and just hides
+     * the fiat line; we never want a fiat-rate hiccup to block the
+     * success confirmation.
+     *
+     * Label adapts to the status: COMPLETED gets a definite "Payment
+     * Sent"; PENDING gets softer "Still sending…" wording since Spark
+     * may still be routing. Save-Contact is only honoured for
+     * COMPLETED — promoting a contact off a payment that may yet
+     * fail would be misleading.
+     */
+    async openSendSuccess({ amount, recipient, status, showSaveContact, successAction = null, verifyUrl = null }) {
+      const isCompleted = status !== 'pending';
+
+      // LUD-21 fiat-delivery poll. Owned here (one place) so every success
+      // screen — main send AND contact-pay — starts fresh: the token bump +
+      // abort below invalidate any poll still running from a previous send,
+      // which is what prevents a prior payment's "Delivered · …" status leaking
+      // onto this screen. Seeded only for a completed send with a validated,
+      // payout-provider verify URL; otherwise cleared.
+      this._stopDeliveryPoll();
+      if (isCompleted && verifyUrl) {
+        const token = this._deliveryToken;
+        const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        this._deliveryAbort = controller;
+        this.sendDeliveryStatus = { settled: false, delivered: false, done: false };
+        pollVerify(verifyUrl, (s) => {
+          if (this._deliveryToken === token) this.sendDeliveryStatus = { ...s, done: false };
+        }, { signal: controller?.signal, fetchImpl: lnurlFetch }).then((final) => {
+          // `done` marks the poll terminal, so the UI can distinguish "still
+          // confirming" from "settled but not yet delivered" (M-Pesa lag).
+          if (this._deliveryToken === token) {
+            this.sendDeliveryStatus = { ...(final || { settled: false, delivered: false }), done: true };
+          }
+        });
+      }
+
+      this.sendSuccessAmount = Number(amount) || 0;
+      this.sendSuccessRecipient = recipient || '';
+      this.sendSuccessLabel = isCompleted
+        ? this.$t('Payment Sent')
+        : this.$t('Still sending…');
+      this.sendSuccessShowSaveContact = !!showSaveContact && isCompleted;
+      // LUD-09 message from the recipient. Only surfaced once the payment has
+      // completed — a still-pending send has no settled message to trust yet.
+      this.sendSuccessAction = isCompleted ? (successAction || null) : null;
+      this.sendSuccessFiat = '';
+
+      // Show the success surface immediately — fiat is decorative and must
+      // never gate the confirmation; it fills in reactively below.
+      this.showSendSuccess = true;
+
+      // Best-effort fiat conversion. Mirrors the withdraw-success
+      // pattern (~Wallet.vue:3085) — same try/catch shape so a stale
+      // rate cache can never block the confirmation surface.
+      if (this.sendSuccessAmount > 0) {
+        try {
+          const currency = this.walletStore.preferredFiatCurrency || 'USD';
+          const fiat = await fiatRatesService.convertSatsToFiat(
+            this.sendSuccessAmount,
+            currency,
+          );
+          if (fiat !== null) {
+            this.sendSuccessFiat = '≈ ' + fiatRatesService.formatFiatAmount(fiat, currency);
+          }
+        } catch (err) {
+          // Fiat is decorative here; never let it block the modal.
+          console.warn('[wallet] send-success fiat lookup failed:', err);
+        }
+      }
+    },
+
+    /**
+     * User dismissed the send-success modal via Done / Close Now /
+     * auto-close countdown. Clean up state. If the Save-Contact button
+     * was offered but ignored, that's an explicit opt-out — we drop
+     * the pre-staged save payload so the next send starts clean.
+     */
+    onSendSuccessClosed() {
+      this.showSendSuccess = false;
+      // Stop any in-flight delivery poll (abort the request + ignore late
+      // results) and clear the status so the next send starts clean.
+      this._stopDeliveryPoll();
+      this.sendSuccessAmount = 0;
+      this.sendSuccessFiat = '';
+      this.sendSuccessRecipient = '';
+      this.sendSuccessLabel = '';
+      this.sendSuccessShowSaveContact = false;
+      this.sendSuccessAction = null;
+      // Reset any save payload that was pre-staged for the modal's
+      // Save button. Users who wanted to save would have tapped it
+      // already (see onSendSaveContactClicked).
+      this.saveContactData = emptySaveContactData();
+    },
+
+    /**
+     * User tapped "Save to Contacts" in the success modal. The modal
+     * has already dismissed itself; we just open the existing save
+     * dialog onto the freshly-cleared stack. `saveContactData` was
+     * pre-populated during the pay() success block so the form has
+     * the address + amount it needs.
+     */
+    onSendSaveContactClicked() {
+      this.showSendSuccess = false;
+      this.sendSuccessShowSaveContact = false;
+      // This path closes the success screen without firing onSendSuccessClosed,
+      // so stop the delivery poll here too — otherwise it keeps running and its
+      // status would leak onto the NEXT success screen (e.g. a later contact-pay).
+      this._stopDeliveryPoll();
+      // Reuse the existing save-contact dialog — same form, same
+      // validation, same save handler.
+      this.showSaveContactDialog = true;
+    },
+
+    /**
+     * Stop any in-flight LUD-21 delivery poll: bump the token so late results
+     * are ignored, abort the outstanding request, and clear the status. Safe to
+     * call repeatedly. openSendSuccess calls this before (re)seeding a poll.
+     */
+    _stopDeliveryPoll() {
+      this._deliveryToken = (this._deliveryToken || 0) + 1;
+      if (this._deliveryAbort) {
+        try { this._deliveryAbort.abort(); } catch { /* ignore */ }
+        this._deliveryAbort = null;
+      }
+      this.sendDeliveryStatus = null;
     },
 
     // Save recipient as contact
@@ -2894,19 +5670,67 @@ export default {
           return;
         }
 
-        await this.addressBookStore.addEntry({
-          name: this.saveContactData.name.trim(),
-          address: this.saveContactData.address,
-          addressType: this.saveContactData.addressType,
-          notes: this.saveContactData.notes?.trim() || ''
-        });
+        const data = this.saveContactData;
+        const identity = data.nostrIdentity;
+        let newContact;
+        if (identity?.pubkey && identity?.npub && identity?.profileEvent) {
+          // This is the same verified kind:0 the payment confirmation used.
+          // Persist it as a Nostr contact and explicitly bind the destination
+          // that just succeeded, rather than flattening it into a manual row.
+          newContact = await this.addressBookStore.addNostrContact({
+            pubkey: identity.pubkey,
+            npub: identity.npub,
+            event: identity.profileEvent,
+            relayHints: identity.relayHints || [],
+            paymentAddress: data.address,
+            paymentAddressType: data.addressType,
+            notes: data.notes?.trim() || '',
+          });
+
+          const chosenName = data.name.trim();
+          if (chosenName !== newContact.name) {
+            newContact = await this.addressBookStore.updateEntry(newContact.id, {
+              name: chosenName,
+            });
+          }
+        } else {
+          newContact = await this.addressBookStore.addEntry({
+            name: data.name.trim(),
+            address: data.address,
+            addressType: data.addressType,
+            notes: data.notes?.trim() || '',
+            // LUD-11 service metadata, when the payment came from one.
+            service: data.service || null,
+          });
+        }
+
+        // Queue the contact link for the outgoing tx that just landed
+        // (or is about to land). The pending-link consumer matches by
+        // address + amount + recent timestamp on the next tx-list
+        // refresh, so we don't need to know the provider-assigned id.
+        if (newContact?.id) {
+          try {
+            await this.transactionMetadataStore.enqueuePendingContactLink({
+              contactId: newContact.id,
+              recipientAddress: data.address,
+              amountSats: data.amountSats,
+              // The wallet that sent the payment this dialog follows (carried
+              // from the send: "Pay with" may have used a wallet other than the
+              // active one). Without it - a dialog staged some other way - the
+              // active wallet, which was the only possibility before.
+              walletId: data.walletId || this.activeWallet?.id || null,
+            });
+          } catch (err) {
+            console.warn('[wallet] could not queue contact link for new contact:', err);
+          }
+        }
 
         this.showSaveContactDialog = false;
+        this.saveContactData = emptySaveContactData();
         this.$q.notify({
           type: 'positive',
           message: this.$t('Contact saved'),
 
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       } catch (error) {
         console.error('Error saving contact:', error);
@@ -2922,12 +5746,7 @@ export default {
     // Close save contact dialog
     closeSaveContactDialog() {
       this.showSaveContactDialog = false;
-      this.saveContactData = {
-        address: '',
-        addressType: 'lightning',
-        name: '',
-        notes: ''
-      };
+      this.saveContactData = emptySaveContactData();
     },
 
     // Helper: Truncate address for display
@@ -2940,56 +5759,118 @@ export default {
     },
 
     // Helper: Fetch invoice from LNURL
-    async fetchLNURLInvoice(lnurl, amountSats) {
+    async fetchLNURLInvoice(lnurl, amountSats, payout = null) {
+      assertPaymentInput(lnurl);
       const url = this.decodeLNURL(lnurl);
 
       // Fetch LNURL endpoint
-      const response = await fetch(url);
+      const response = await lnurlGetJson(url);
       if (!response.ok) throw new Error('Failed to fetch LNURL');
 
-      const data = await response.json();
-      if (data.status === 'ERROR') throw new Error(data.reason || 'LNURL error');
+      const data = response.data;
+      if (!data || data.tag !== 'payRequest' || !data.callback || data.status === 'ERROR') throw new Error(data?.reason || 'LNURL error');
 
-      // Validate amount bounds
-      const minSats = Math.ceil((data.minSendable || 1000) / 1000);
-      const maxSats = Math.floor((data.maxSendable || 100000000000) / 1000);
-      if (amountSats < minSats || amountSats > maxSats) {
-        throw new Error(`Amount must be between ${formatAmount(minSats, this.walletStore.useBip177Format)} and ${formatAmount(maxSats, this.walletStore.useBip177Format)}`);
+      // Standard sat sends are bounds-checked here; a currency (Option-A) send
+      // is bounded by the provider in its own units (validated in the sheet).
+      if (!(payout && payout.code && payout.amount > 0)) {
+        const minSats = Math.ceil((data.minSendable || 1000) / 1000);
+        const maxSats = Math.floor((data.maxSendable || 100000000000) / 1000);
+        if (amountSats < minSats || amountSats > maxSats) {
+          throw new Error(`Amount must be between ${formatAmount(minSats, this.walletStore.useBip177Format)} and ${formatAmount(maxSats, this.walletStore.useBip177Format)}`);
+        }
       }
+      const callbackUrl = buildLnurlPayCallbackUrl({ callback: data.callback, amountSats, payout });
 
-      // Request invoice
-      const amountMs = amountSats * 1000;
-      const callbackUrl = `${data.callback}?amount=${amountMs}`;
-      const invoiceResponse = await fetch(callbackUrl);
+      const invoiceResponse = await lnurlGetJson(callbackUrl);
       if (!invoiceResponse.ok) throw new Error('Failed to get invoice');
 
-      const invoiceData = await invoiceResponse.json();
-      if (invoiceData.status === 'ERROR') throw new Error(invoiceData.reason || 'Invoice error');
+      const invoiceData = invoiceResponse.data;
+      if (!invoiceData || invoiceData.status === 'ERROR') throw new Error(invoiceData?.reason || 'Invoice error');
 
-      return invoiceData.pr;
+      // Return the invoice together with any LUD-09 successAction (recipient's
+      // post-payment message) and LUD-21 `verify` URL the callback included.
+      // `verify` is validated same-domain against the callback (never a third
+      // party), mirroring the LUD-09 url guard. Callers thread them onward.
+      //
+      // LUD-11: a service that answers `disposable: false` is telling us this
+      // LNURL is reusable. That is the one case where the QR itself is worth
+      // keeping — a raw LNURL has no address form, so without it paying the
+      // same merchant again means finding the code again. `payLink` is null
+      // for every ordinary (single-use) link.
+      const storeable = isStoreablePayLink(invoiceData);
+      return {
+        pr: invoiceData.pr,
+        successAction: parseSuccessAction(invoiceData.successAction, data.callback),
+        verify: validateVerifyUrl(invoiceData.verify, data.callback),
+        payLink: storeable ? lnurl : null,
+        // What the service says about itself (LUD-06 metadata), kept only
+        // for a storeable link: that is the one that becomes a payee.
+        serviceMeta: storeable ? parsePayRequestMetadata(data.metadata) : null,
+      };
+    },
+
+    /**
+     * Translate a transport-level LNURL fetch failure into a reason the
+     * send field / error dialog can show. Timeouts and network failures
+     * (browser fetch strings and the native HTTP plugin's platform
+     * messages alike, via the shared classifier) map to existing
+     * translated copy; anything else keeps its message for the
+     * technical-details pane.
+     */
+    describeLnurlTransportError(error) {
+      const kind = error?.name === 'AbortError'
+        ? 'timeout'
+        : classifyTransportFailure(error?.message);
+      if (kind === 'timeout') {
+        return this.$t('The server did not respond or the link is no longer valid');
+      }
+      if (kind === 'offline') {
+        return this.$t("Couldn't reach the network. Please check your internet and try again.");
+      }
+      return error?.message
+        || this.$t('The server did not respond or the link is no longer valid');
     },
 
     /**
      * Fetch LNURL info from a Lightning address
-     * Returns min/max amounts and whether it's a fixed amount
+     * Returns min/max amounts and whether it's a fixed amount.
+     * A server that answers but doesn't serve the address yields {} ("not
+     * found"); a transport failure (timeout, DNS, CORS on web) yields
+     * { error: true, reason } so the caller doesn't misreport a reachable
+     * address as nonexistent. Bounded to 10s so a hung server can't leave
+     * the Send sheet spinning forever.
      */
     async fetchLightningAddressInfo(address) {
-      try {
-        const [username, domain] = address.split('@');
-        if (!username || !domain) {
-          return {};
-        }
+      const [username, domain] = address.split('@');
+      if (!username || !domain) {
+        return {};
+      }
 
+      // A payout provider that serves no Access-Control-Allow-Origin cannot be
+      // reached from a browser at all. On device the request goes through the
+      // native HTTP stack and CORS never applies, so this is only ever the web
+      // build. Said here rather than after the attempt, because the browser
+      // reports a blocked request as an indistinguishable "Failed to fetch"
+      // and the user gets told to check an internet connection that is fine.
+      const payoutService = matchLnAddressService(address);
+      if (payoutService?.webUnsupported && !Capacitor.isNativePlatform()) {
+        return {
+          error: true,
+          reason: this.$t('This payout service can only be reached from the BuhoGO app, not from a browser.'),
+        };
+      }
+
+      try {
         const endpoint = `https://${domain}/.well-known/lnurlp/${username}`;
-        const response = await fetch(endpoint);
+        const response = await lnurlGetJson(endpoint, { timeoutMs: 10000 });
 
         if (!response.ok) {
           return {};
         }
 
-        const data = await response.json();
+        const data = response.data;
 
-        if (data.status === 'ERROR') {
+        if (!data || data.tag !== 'payRequest' || !data.callback || data.status === 'ERROR') {
           return {};
         }
 
@@ -3005,56 +5886,79 @@ export default {
           isFixedAmount,
           fixedAmountSats: isFixedAmount ? Math.floor(minSendable / 1000) : null,
           commentAllowed: data.commentAllowed || 0,
-          description: data.metadata ? this.parseLnurlMetadata(data.metadata) : null
+          description: data.metadata ? this.parseLnurlMetadata(data.metadata) : null,
+          // LUD-21 currency extension (#207): the recipient's local payout
+          // currency (e.g. TZS for ChapSmart), so the sender can denominate in
+          // it. Absent on ordinary Lightning addresses. Kept verbatim.
+          currency: data.currency || null
         };
       } catch (error) {
         console.warn('Failed to fetch Lightning address info:', error.message);
-        return {};
+        return { error: true, reason: this.describeLnurlTransportError(error) };
       }
     },
 
     /**
+     * Try to interpret an inbound LNURL string as a LUD-04 (LNURL-auth)
+     * challenge. If it parses as one, open the identity-auth dialog and
+     * return true so the caller short-circuits the regular pay/withdraw
+     * flow. If the input is a different LNURL variant, return false and
+     * let the caller proceed.
+     *
+     * We deliberately do not surface parsing errors as user-facing
+     * notifications — a malformed `keyauth://` URL still has a chance of
+     * being something else, and the regular LNURL fetch path will return
+     * its own descriptive error if it can't reach the server either.
+     *
+     * @param {string} lnurl
+     * @returns {boolean} whether the input was consumed as LUD-04
+     */
+    openIdentityAuthFromLnurl(lnurl) {
+      let challenge;
+      try {
+        challenge = parseLud04Input(lnurl);
+      } catch (err) {
+        // The URL was recognisably LUD-04 but used `http:` — surface
+        // the global error dialog and consume the input so no downstream
+        // handler retries it. Other parse failures (e.g. `tag=login`
+        // missing) fall through with `return false` so payment LNURLs
+        // can be handled by the payment path.
+        if (err?.code === LUD04_ERROR.INSECURE_SCHEME) {
+          // 'identity' context produces "Couldn't sign you in" as the
+          // title — same surface as every other sign-in failure.
+          this.walletStore.showPaymentError(err, {
+            context: 'identity',
+            route: 'LUD-04 scheme check',
+            reason: this.$t('That link uses an insecure connection. Sign-in only works over HTTPS.'),
+            t: this.$t.bind(this),
+          });
+          return true;
+        }
+        return false;
+      }
+
+      this.identityAuthChallenge = challenge;
+      this.showIdentityAuthDialog = true;
+      return true;
+    },
+
+    /**
      * Fetch LNURL endpoint info (min/max amounts, fixed amount detection)
-     * Used by Spark and LNBits wallets to get paycode parameters before confirmation.
+     * Used by Spark and LNbits wallets to get paycode parameters before confirmation.
      * @param {string} lnurl - The LNURL string (bech32 encoded)
      * @returns {Promise<Object>} LNURL info with minSendable, maxSendable, isFixedAmount, etc.
      */
     async fetchLNURLInfo(lnurl) {
       try {
-        const url = this.decodeLNURL(lnurl);
-        const response = await fetch(url);
-
-        if (!response.ok) {
-          return { error: true, reason: `Server returned ${response.status}` };
-        }
-
-        const data = await response.json();
-
-        if (data.status === 'ERROR') {
-          return { error: true, reason: data.reason || 'This link is no longer valid' };
-        }
+        const { url, data } = await fetchLnurlRequest(lnurl);
 
         if (data.tag === 'withdrawRequest') {
-          const minWithdrawable = data.minWithdrawable || 1000;
-          const maxWithdrawable = data.maxWithdrawable || 100000000000;
-          const isFixedAmount = minWithdrawable === maxWithdrawable;
-          const minSats = Math.ceil(minWithdrawable / 1000);
-          const maxSats = Math.floor(maxWithdrawable / 1000);
-
-          return {
-            lnurlType: 'withdrawRequest',
-            k1: data.k1,
-            callback: data.callback,
-            minWithdrawable,
-            maxWithdrawable,
-            minSats,
-            maxSats,
-            isFixedAmount,
-            fixedAmountSats: isFixedAmount ? maxSats : null,
-            defaultDescription: data.defaultDescription || 'Withdrawal'
-          };
+          return withdrawInfo(data, { sourceUrl: url });
         }
 
+        if (data.tag === 'addressRequest') {
+          return { error: true, reason: this.$t('This address request is incomplete or does not match the original link. Ask the service for a new one.') };
+        }
         if (data.tag !== 'payRequest') {
           return {};
         }
@@ -3073,11 +5977,15 @@ export default {
           fixedAmountSats: isFixedAmount ? Math.floor(minSendable / 1000) : null,
           commentAllowed: data.commentAllowed || 0,
           callback: data.callback,
-          description: data.metadata ? this.parseLnurlMetadata(data.metadata) : null
+          description: data.metadata ? this.parseLnurlMetadata(data.metadata) : null,
+          serviceMeta: parsePayRequestMetadata(data.metadata),
         };
       } catch (error) {
-        console.warn('Failed to fetch LNURL info:', error.message);
-        return {};
+        console.warn('Failed to fetch LNURL info:', safeWithdrawError(error.message));
+        // Surface the underlying failure so the send field / error dialog
+        // shows what actually happened (timeout, offline) instead of a
+        // misleading upstream-attributed message.
+        return { error: true, reason: this.describeLnurlTransportError(error) };
       }
     },
 
@@ -3088,7 +5996,7 @@ export default {
      * @param {string} [comment] - Optional comment
      * @returns {Promise<string>} Lightning invoice (bolt11)
      */
-    async fetchLightningAddressInvoice(address, amountSats, comment) {
+    async fetchLightningAddressInvoice(address, amountSats, comment, payout = null) {
       const [username, domain] = address.split('@');
       if (!username || !domain) {
         throw new Error('Invalid Lightning address');
@@ -3096,62 +6004,68 @@ export default {
 
       // Fetch LNURL endpoint info
       const endpoint = `https://${domain}/.well-known/lnurlp/${username}`;
-      const response = await fetch(endpoint);
+      const response = await lnurlGetJson(endpoint);
 
       if (!response.ok) {
         throw new Error('Failed to resolve Lightning address');
       }
 
-      const data = await response.json();
-      if (data.status === 'ERROR') {
-        throw new Error(data.reason || 'Lightning address error');
+      const data = response.data;
+      if (!data || data.tag !== 'payRequest' || !data.callback || data.status === 'ERROR') {
+        throw new Error(data?.reason || 'Lightning address error');
       }
 
-      // Validate amount bounds
-      const minSats = Math.ceil((data.minSendable || 1000) / 1000);
-      const maxSats = Math.floor((data.maxSendable || 100000000000) / 1000);
-      if (amountSats < minSats || amountSats > maxSats) {
-        throw new Error(`Amount must be between ${minSats} and ${maxSats} sats`);
+      // Standard sat sends are bounds-checked here; a currency (Option-A) send
+      // is bounded by the provider in its own units (validated in the sheet).
+      if (!(payout && payout.code && payout.amount > 0)) {
+        const minSats = Math.ceil((data.minSendable || 1000) / 1000);
+        const maxSats = Math.floor((data.maxSendable || 100000000000) / 1000);
+        if (amountSats < minSats || amountSats > maxSats) {
+          throw new Error(`Amount must be between ${minSats} and ${maxSats} sats`);
+        }
       }
-
-      // Build callback URL with amount (and comment if allowed)
-      const amountMsats = amountSats * 1000;
-      let callbackUrl = `${data.callback}${data.callback.includes('?') ? '&' : '?'}amount=${amountMsats}`;
-
-      if (comment && data.commentAllowed && comment.length <= data.commentAllowed) {
-        callbackUrl += `&comment=${encodeURIComponent(comment)}`;
-      }
+      const callbackUrl = buildLnurlPayCallbackUrl({
+        callback: data.callback,
+        amountSats,
+        payout,
+        comment,
+        commentAllowed: data.commentAllowed,
+      });
 
       // Request the invoice
-      const invoiceResponse = await fetch(callbackUrl);
+      const invoiceResponse = await lnurlGetJson(callbackUrl);
       if (!invoiceResponse.ok) {
         throw new Error('Failed to get invoice from Lightning address');
       }
 
-      const invoiceData = await invoiceResponse.json();
-      if (invoiceData.status === 'ERROR') {
-        throw new Error(invoiceData.reason || 'Invoice generation failed');
+      const invoiceData = invoiceResponse.data;
+      if (!invoiceData || invoiceData.status === 'ERROR') {
+        throw new Error(invoiceData?.reason || 'Invoice generation failed');
       }
 
-      return invoiceData.pr;
+      // Return the invoice together with any LUD-09 successAction (recipient's
+      // post-payment message) and LUD-21 `verify` URL, validated same-domain
+      // against the callback (never a third party). null when absent.
+      return {
+        pr: invoiceData.pr,
+        successAction: parseSuccessAction(invoiceData.successAction, data.callback),
+        verify: validateVerifyUrl(invoiceData.verify, data.callback),
+      };
     },
 
     /**
      * Parse LNURL metadata to extract description
      */
     parseLnurlMetadata(metadata) {
-      try {
-        const parsed = JSON.parse(metadata);
-        const textEntry = parsed.find(entry => entry[0] === 'text/plain');
-        return textEntry ? textEntry[1] : null;
-      } catch {
-        return null;
-      }
+      return parsePayRequestMetadata(metadata).description;
     },
 
     // Helper: Decode LNURL (bech32 LUD-01 or URL scheme LUD-17) to URL
     decodeLNURL(lnurl) {
-      const clean = lnurl.trim().replace(/^lightning:/i, '');
+      const clean = stripWrapperScheme(lnurl);
+
+      // Plain https:// or http:// URL (e.g. Bolt Card NFC URL — already decoded)
+      if (/^https?:\/\//i.test(clean)) return clean;
 
       // LUD-17: lnurlp://, lnurlw://, lnurlc://, keyauth://
       const lud17Url = resolveLUD17URL(clean);
@@ -3193,19 +6107,17 @@ export default {
     },
 
     async updateSecondaryValue() {
-      if (this.walletState.balance !== undefined) {
-        this.secondaryValue = await this.getSecondaryValue(this.walletState.balance);
-      }
-    },
-
-    async updatePaymentFiatValue() {
-      this.paymentFiatValue = await this.formatPaymentFiat();
-      // Also update fee estimate when payment changes
-      await this.updateFeeEstimate();
+      const walletId = this.walletStore.activeWalletId;
+      const balance = this.activeCanonicalBalance;
+      const value = balance == null ? '--' : await this.getSecondaryValue(balance);
+      if (walletId === this.walletStore.activeWalletId && balance === this.activeCanonicalBalance) this.secondaryValue = value;
     },
 
     async updateFeeEstimate() {
-      // Reset fee state
+      // Reset fee state. Bumping the run number also orphans any estimate
+      // still in flight for the previous payment or paying wallet: the last
+      // call wins.
+      this._feeEstimateRun = (this._feeEstimateRun || 0) + 1;
       this.estimatedFee = null;
       this.isEstimatingFee = false;
 
@@ -3213,22 +6125,26 @@ export default {
         return;
       }
 
+      // The wallet that pays decides who can estimate: the active wallet,
+      // unless "Pay with" chose another.
+      const walletType = this.getSendingWalletType();
+
       // === SPARK WALLET: Use SDK fee estimation ===
-      if (this.walletStore.isActiveWalletSpark) {
+      if (walletType === 'spark') {
         await this.updateSparkFeeEstimate();
         return;
       }
 
       // === NWC WALLET: No fee estimation available ===
       // Alby SDK / NIP-47 does not provide fee estimation
-      if (this.walletStore.isActiveWalletNWC) {
+      if (walletType === 'nwc') {
         this.estimatedFee = null;
         return;
       }
 
       // === LNBITS WALLET: No fee estimation available ===
-      // LNBits API does not provide routing fee estimation
-      if (this.walletStore.isActiveWalletLNBits) {
+      // LNbits API does not provide routing fee estimation
+      if (walletType === 'lnbits') {
         this.estimatedFee = null;
         return;
       }
@@ -3247,17 +6163,24 @@ export default {
 
       // For Lightning invoices, get fee estimate from Spark SDK
       if (this.pendingPayment.invoice) {
+        // Read before the first await: by the time the SDK answers, the sheet
+        // may show another payment or another paying wallet.
+        const run = this._feeEstimateRun;
+        const invoice = this.pendingPayment.invoice;
+        const walletId = this.getSendingWallet()?.id || null;
         this.isEstimatingFee = true;
         try {
-          const provider = await this.walletStore.ensureSparkConnected();
-          const estimate = await provider.getLightningSendFeeEstimate(this.pendingPayment.invoice);
+          const provider = await this.walletStore.ensureSparkConnected(walletId);
+          const estimate = await provider.getLightningSendFeeEstimate(invoice);
+          if (run !== this._feeEstimateRun) return;
           this.estimatedFee = estimate.estimatedFeeSats;
         } catch (error) {
+          if (run !== this._feeEstimateRun) return;
           console.warn('Spark fee estimation failed:', error.message);
           // No fallback - don't show estimated fee if SDK fails
           this.estimatedFee = null;
         } finally {
-          this.isEstimatingFee = false;
+          if (run === this._feeEstimateRun) this.isEstimatingFee = false;
         }
         return;
       }
@@ -3272,42 +6195,9 @@ export default {
       if (this.paymentAmount && parseInt(this.paymentAmount) > 0) {
         return parseInt(this.paymentAmount);
       }
-      if (this.pendingPayment.fixedAmountSats) {
-        return this.pendingPayment.fixedAmountSats;
-      }
-      if (this.pendingPayment.amount > 0) {
-        return this.pendingPayment.amount;
-      }
-      if (this.pendingPayment.minSendable === this.pendingPayment.maxSendable && this.pendingPayment.minSendable) {
-        return Math.floor(this.pendingPayment.minSendable / 1000);
-      }
-      return 0;
+      return this.getFixedPaymentSats();
     },
 
-    startInvoiceMonitoring() {
-      if (this.invoiceCheckInterval) {
-        clearInterval(this.invoiceCheckInterval);
-      }
-
-      this.invoiceCheckInterval = setInterval(async () => {
-        await this.checkInvoiceStatus();
-      }, 2000);
-    },
-
-    stopInvoiceMonitoring() {
-      if (this.invoiceCheckInterval) {
-        clearInterval(this.invoiceCheckInterval);
-        this.invoiceCheckInterval = null;
-      }
-    },
-
-    onInvoiceCreated(invoice) {
-      console.log('Invoice created:', invoice);
-      this.generatedInvoice = invoice;
-      this.currentInvoicePaymentHash = invoice.payment_hash || invoice.paymentHash;
-      this.waitingForPayment = true;
-      this.startInvoiceMonitoring();
-    }
   }
 };
 </script>
@@ -3324,7 +6214,8 @@ export default {
 }
 
 .wallet-page-light {
-  background: #f8f9fa;
+  /* Single source of truth lives in app.css → body.body--light → --bg-primary */
+  background: var(--bg-primary);
   min-height: 100vh;
   display: flex;
   flex-direction: column;
@@ -3332,7 +6223,74 @@ export default {
   max-width: 100vw;
 }
 
+/* Top app bar. Quasar's default q-toolbar is 50px min-height with its own
+   vertical padding, which stacks on top of the --safe-top status-bar inset and
+   reads as an oversized gap. Trim it so the logo/icons sit just below the inset
+   — the inset itself stays (it's the required status-bar clearance). */
+.wallet-page-dark :deep(.q-toolbar),
+.wallet-page-light :deep(.q-toolbar) {
+  min-height: 44px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
 /* Header */
+.wallet-toolbar { flex-wrap: wrap; }
+
+/* Keep the persistent key reachable while the existing reminder is visible. */
+:deep(.backup-banner-wrapper) { position: relative; flex-shrink: 0; }
+
+/* Optional device/deposit badges get their own line on compact screens. */
+@media (max-width: 480px) {
+  .wallet-toolbar-status { order: 1; }
+  .wallet-toolbar::after { content: ''; flex-basis: 100%; order: 0; }
+}
+
+.app-logo-button {
+  all: unset;
+  position: relative;
+  width: 44px;
+  height: 44px;
+  flex: 0 0 44px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  cursor: pointer;
+  overflow: visible;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.app-logo-button:focus-visible {
+  outline: 2px solid var(--brand-accent);
+  outline-offset: 2px;
+}
+
+.app-logo-button:active {
+  background: var(--brand-accent-soft);
+}
+
+.app-logo-update-pill {
+  position: absolute;
+  top: 0;
+  left: -2px;
+  min-width: 20px;
+  height: 17px;
+  padding: 0 5px;
+  display: grid;
+  place-items: center;
+  border: 2px solid var(--bg-primary);
+  border-radius: 999px;
+  background: var(--brand-accent);
+  color: #08291a;
+  font: 800 9px/1 'Manrope', sans-serif;
+  letter-spacing: -0.02em;
+  box-sizing: border-box;
+  box-shadow: 0 2px 7px rgba(5, 149, 115, 0.32);
+}
+
+.update-pill-enter-active { transition: opacity .18s ease, transform .22s cubic-bezier(.2, .8, .2, 1); }
+.update-pill-enter-from { opacity: 0; transform: scale(.55); }
+
 .wallet-header {
   padding: 1rem;
   flex-shrink: 0;
@@ -3378,6 +6336,10 @@ export default {
   -webkit-text-fill-color: transparent;
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .update-pill-enter-active { transition: none; }
+}
+
 @keyframes gradientShift {
   0% {
     background-position: 0% 0%;
@@ -3396,16 +6358,41 @@ export default {
   }
 }
 
+/* Toolbar icons: Tabler ships them at stroke-width 2, which reads as chunky
+   once the glyph is scaled up. A CSS stroke-width overrides the SVG's own
+   attribute, so the icons stay large but keep a fine, crisp line. */
+.header-icon {
+  stroke-width: 1.6;
+}
+
 .modern-menu-btn-dark,
 .modern-menu-btn-light {
   width: 40px;
   height: 40px;
-  border-radius: 10px;
+  border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
   transition: background-color 0.15s ease, transform 0.1s ease;
   position: relative;
+}
+
+.profile-money-pill {
+  position: absolute;
+  top: 2px;
+  right: 1px;
+  min-width: 20px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  background: #10b981;
+  color: #07140f;
+  border: 2px solid var(--bg-primary);
+  font: 800 9px/1 'Manrope', sans-serif;
+  letter-spacing: -0.02em;
+  pointer-events: none;
 }
 
 .modern-menu-btn-dark {
@@ -3417,33 +6404,11 @@ export default {
 }
 
 .modern-menu-btn-light {
-  color: #374151;
+  color: var(--text-primary);
 }
 
 .modern-menu-btn-light:hover {
-  background: #f1f5f9;
-}
-
-.menu-icon {
-  display: flex;
-  flex-direction: column;
-  gap: 2.5px;
-  width: 16px;
-  height: 12px;
-}
-
-.menu-line {
-  height: 1.5px;
-  border-radius: 0.75px;
-  transition: all 0.2s ease;
-}
-
-.menu-line-dark {
-  background: #F6F6F6;
-}
-
-.menu-line-light {
-  background: #374151;
+  background: var(--bg-input);
 }
 
 /* Main Content */
@@ -3459,13 +6424,28 @@ export default {
 }
 
 /* Wallet Chip (q-chip) */
+/* ===== Spark Tab Bar ===== */
+
 .wallet-chip {
+  position: relative;
   margin-bottom: 1rem;
   font-size: 12px;
   font-weight: 600;
   font-family: 'Manrope', sans-serif;
   letter-spacing: -0.01em;
   transition: all 0.2s ease;
+}
+
+/* The chip reads small; its tap target is the full 44pt. */
+.wallet-chip::after {
+  content: '';
+  position: absolute;
+  inset: -10px -6px;
+}
+
+.wallet-chip-disclosure {
+  margin-left: 4px;
+  opacity: 0.7;
 }
 
 .wallet-chip-dark {
@@ -3541,6 +6521,7 @@ export default {
   font-weight: 800;
   line-height: 1;
   font-family: 'Manrope', sans-serif;
+  transition: opacity 0.3s ease;
 }
 
 .amount-number-dark {
@@ -3548,8 +6529,9 @@ export default {
 }
 
 .amount-number-light {
-  color: #1F2937;
+  color: var(--text-primary);
 }
+
 
 .amount-unit {
   font-size: 1.5rem;
@@ -3561,7 +6543,7 @@ export default {
 }
 
 .amount-unit-light {
-  color: #6B7280;
+  color: var(--text-secondary);
 }
 
 .currency-icon-left {
@@ -3595,12 +6577,29 @@ export default {
   font-weight: 500;
 }
 
+/* Quiet, factual line under the balance: funds that exist but cannot be
+   spent yet. Muted on purpose, it explains rather than alarms. */
+.balance-unspendable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  margin-top: 6px;
+  font-size: 0.78rem;
+  font-weight: 500;
+  opacity: 0.72;
+}
+
 .balance-secondary-dark {
   color: #15DE72;
 }
 
 .balance-secondary-light {
-  color: #059573;
+  /* Fiat is a secondary readout — the primary balance below should
+     carry the room. Warm muted grey sits quiet on cream, leaving
+     the brand-green reserved for semantic "incoming" states in
+     the tx list. */
+  color: var(--text-muted);
 }
 
 .secondary-amount-display {
@@ -3652,60 +6651,297 @@ export default {
   transform: translateY(10px);
 }
 
-/* Transaction History Button */
-.transaction-icon-section {
+/* ------------------------------------------------------------------
+   Last-transaction preview + History link.
+   Neutral palette only — deliberately no green accents here. The
+   balance above carries the brand colour; this block stays quiet so
+   the eye lands on the amount, not the last-tx direction.
+------------------------------------------------------------------ */
+.last-tx-section {
   display: flex;
-  justify-content: center;
-  margin-bottom: 2rem;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 0 1.25rem;
+  margin-bottom: 1.5rem;
+  /* Never size to the content: a long memo's unwrapped width would
+     otherwise widen the section, and the card with it, past the screen. */
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
-.transaction-history-btn-dark,
-.transaction-history-btn-light {
-  width: 48px;
-  height: 48px;
+/* ── Card ──────────────────────────────────────────────────────── */
+.last-tx-card {
+  width: 100%;
+  max-width: 440px;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+  transition: transform 0.12s ease, background 0.15s ease;
+  -webkit-tap-highlight-color: transparent;
+  font-family: 'Manrope', sans-serif;
+}
+
+.last-tx-card:active {
+  transform: scale(0.99);
+}
+
+.last-tx-card-light {
+  background: #ffffff;
+  border-color: #e2e8f0;
+}
+
+.last-tx-card-dark {
+  background: var(--bg-secondary);
+  border-color: var(--border-card);
+}
+
+.last-tx-icon {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
   border-radius: 50%;
-  transition: transform 0.1s ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.last-tx-icon-light {
+  background: #f1f5f9;
+  color: #475569;
+}
+
+.last-tx-icon-dark {
+  background: rgba(255, 255, 255, 0.06);
+  color: #cbd5e1;
+}
+
+/* Inherit-class slot for the ContactAvatar substitution — matches the
+   icon's footprint so the row's rhythm stays identical whether the
+   preview shows a contact picture or the generic arrow. */
+.last-tx-avatar-wrap {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+
+.last-tx-avatar {
+  flex: 0 0 auto;
+  width: 36px;
+  height: 36px;
+  font-size: 14px;
+}
+
+/* Movement-type badge — same vocabulary and colors as the history
+   list, so the home preview reads identically. */
+.last-tx-type-badge {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  width: 15px;
+  height: 15px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  box-shadow: 0 0 0 2px var(--bg-card);
+}
+
+.tx-badge-in { background: #10B981; }
+.tx-badge-out { background: #EF4444; }
+.tx-badge-pos { background: #3B82F6; }
+.tx-badge-aux { background: #64748B; }
+.tx-badge-zap { background: #662482; }
+
+/* Nostr ostrich head, sized up for the same reason as in the history
+   list: it is filled art, not a stroked glyph. This disc is the
+   smallest of the three at 15px, so 12px is the floor that still
+   reads; the mark very nearly fills it. */
+.tx-badge-zap :deep(svg) {
+  width: 12px;
+  height: 12px;
+}
+
+.last-tx-info {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  overflow: hidden;
+}
+
+.last-tx-title {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.last-tx-title-light {
+  color: #0f172a;
+}
+
+.last-tx-title-dark {
+  color: #f1f5f9;
+}
+
+/* Counterparty-written text never wears contact typography — see the
+   matching rule on the transaction list's .tx-row-title-message. */
+.last-tx-title-message {
+  font-weight: 400;
+}
+
+.last-tx-title-message.last-tx-title-light {
+  color: #334155;
+}
+
+.last-tx-title-message.last-tx-title-dark {
+  color: #cbd5e1;
+}
+
+.last-tx-time,
+.last-tx-fiat {
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.last-tx-muted-light {
+  color: #64748b;
+}
+
+.last-tx-muted-dark {
+  color: #94a3b8;
+}
+
+.last-tx-amount-wrap {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
+  /* The memo yields first, but the amount column cannot take the row. */
+  max-width: 45%;
+}
+
+.last-tx-amount {
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── History link ─────────────────────────────────────────────── */
+.history-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 18px;
+  border: none;
+  background: none;
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: opacity 0.12s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.history-link:active {
   opacity: 0.6;
 }
 
-.transaction-history-btn-dark {
-  background: #2A342A;
-  color: #B0B0B0;
+.history-link-light {
+  color: #475569;
 }
 
-.transaction-history-btn-light {
-  background: #f8f9fa;
-  color: #6b7280;
+.history-link-dark {
+  color: #cbd5e1;
 }
 
-.transaction-history-btn-dark:active,
-.transaction-history-btn-light:active {
-  transform: scale(0.95);
+/* ── Skeleton ─────────────────────────────────────────────────── */
+.last-tx-card-skeleton {
+  width: 100%;
+  max-width: 440px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid;
 }
 
-.transaction-history-btn-dark.pulse,
-.transaction-history-btn-light.pulse {
-  animation: subtle-pulse 1s ease-out;
+.last-tx-skeleton-light {
+  background: #ffffff;
+  border-color: #e2e8f0;
 }
 
-@keyframes subtle-pulse {
-  0% {
-    opacity: 0.6;
-    transform: scale(1);
+.last-tx-skeleton-dark {
+  background: var(--bg-secondary);
+  border-color: var(--border-card);
+}
+
+.last-tx-card-skeleton-text {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.last-tx-card-skeleton-amount {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.history-link-skeleton {
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .last-tx-card,
+  .history-link {
+    transition: none;
   }
-  50% {
-    opacity: 0.8;
-    transform: scale(1.02);
-  }
-  100% {
-    opacity: 0.6;
-    transform: scale(1);
+  .last-tx-card:active {
+    transform: none;
   }
 }
 
-/* Bottom Actions */
+/* Bottom Actions
+   Uses var(--safe-bottom) so the Android boot patch in
+   src/boot/safe-area.js applies (env() returns 0 on Android
+   WebView with a gesture bar). Floor raised to 2.25rem so the
+   CTAs clear the notchless-phone edge with visual breathing room. */
 .bottom-actions {
-  padding: 1rem 1.5rem 2rem 1.5rem;
+  padding: 1rem 1.5rem;
+  padding-bottom: max(2.25rem, var(--safe-bottom, 2.25rem));
   position: fixed;
   bottom: 0;
   left: 0;
@@ -3722,57 +6958,141 @@ export default {
   margin: 0 auto;
 }
 
+/* Twin tinted-fill buttons. Send and Receive are equal, co-primary
+   actions — no outlined-vs-filled hierarchy. Each carries a soft
+   wash of its brand colour with full-saturation label and icon; the
+   background is atmosphere, the foreground is meaning. Sharper 18px
+   radius matches the app's card language and drops the pill that
+   fought the rest of the wallet UI. */
 .action-btn {
   flex: 1;
-  height: 72px;
-  border-radius: 16px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-  font-weight: 600;
-  transition: all 0.2s ease;
+  height: 56px;
+  min-height: 56px;
+  min-width: 120px;
+  border-radius: 18px;
+  padding: 0 20px;
   position: relative;
   overflow: hidden;
-  min-height: 72px;
-  min-width: 120px;
+  transition:
+    transform 0.18s cubic-bezier(0.4, 0, 0.2, 1),
+    filter 0.18s ease,
+    background-color 0.18s ease,
+    border-color 0.18s ease;
+}
+
+/* Identical layout on both: icon + label in a single row, centered.
+   Neutralises Quasar's internal content padding which otherwise
+   offsets one button against the other. */
+.action-btn :deep(.q-btn__content) {
+  padding: 0;
+  flex-direction: row;
+  column-gap: 10px;
+  width: 100%;
+  height: 100%;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Micro top-edge sheen — a barely-there light source. Adds form
+   without introducing a new colour or animation surface. */
+.action-btn::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.05) 0%,
+    rgba(255, 255, 255, 0) 40%
+  );
+  pointer-events: none;
 }
 
 .action-btn:hover {
-  transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
+  filter: brightness(1.08);
 }
 
 .action-btn:active {
-  transform: translateY(0) scale(0.98);
+  transform: scale(0.97);
+  transition-duration: 0.08s;
+  filter: brightness(0.92);
 }
 
-.receive-btn-dark,
-.receive-btn-light {
-  background: linear-gradient(135deg, #059573, #43B65B);
-  color: white;
+/* Receive — green tinted fill. Uses the same #15DE72 accent as the
+   ReceiveModal so the button and the modal it opens feel like one
+   continuous surface. */
+.action-btn-receive {
+  background: rgba(21, 222, 114, 0.14);
+  color: #15DE72;
+  border: 1px solid rgba(21, 222, 114, 0.22);
 }
 
-.receive-btn-dark:hover,
-.receive-btn-light:hover {
-  background: linear-gradient(135deg, #047857, #059573);
+/* LUD-14: the only home-screen trace of a saved voucher. Sits on the
+   icon's top-right corner; the button already positions its content. */
+.action-btn-receive :deep(.q-btn__content) {
+  position: relative;
 }
 
-.send-btn-dark,
-.send-btn-light {
-  background: linear-gradient(135deg, #3B82F6, #2563EB);
-  color: white;
+.action-dot {
+  position: absolute;
+  top: -2px;
+  left: 16px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--brand-accent);
+  box-shadow: 0 0 0 2px var(--bg-primary);
 }
 
-.send-btn-dark:hover,
-.send-btn-light:hover {
-  background: linear-gradient(135deg, #2563EB, #1D4ED8);
+/* Send — blue tinted fill. #3B82F6 chosen over #2563EB for the
+   icon/label because it has stronger contrast on the tinted wash
+   in dark mode. The shade still belongs to the brand-blue family. */
+.action-btn-send {
+  background: rgba(59, 130, 246, 0.14);
+  color: #3B82F6;
+  border: 1px solid rgba(59, 130, 246, 0.22);
+}
+
+/* Light mode: drop the green/blue tint story entirely. On cream
+   the twin tinted washes read as two competing brand colors; the
+   audit flagged this as the single loudest inconsistency. Both
+   buttons now share one neutral "primary action" look — dark pill
+   on cream — so Send and Receive feel like peer actions with equal
+   visual weight. Dark mode keeps the tinted-fill language because
+   coloured accents on black are the whole point of that theme. */
+.body--light .action-btn-receive,
+.body--light .action-btn-send {
+  background: var(--btn-neutral-bg);
+  color: var(--btn-neutral-fg);
+  border: 1px solid var(--btn-neutral-border);
 }
 
 .btn-text {
-  font-size: 1rem;
+  font-family: 'Manrope', sans-serif;
+  font-size: 0.9375rem; /* 15px */
   font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .action-btn,
+  .action-btn:hover,
+  .action-btn:active {
+    transition: none;
+    transform: none;
+    filter: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .action-btn,
+  .action-btn:hover,
+  .action-btn:active {
+    transition: none;
+    transform: none;
+    filter: none;
+  }
 }
 
 /* Dialog Header Styles */
@@ -3826,9 +7146,9 @@ export default {
 }
 
 .payment_input_light :deep(.q-field__control) {
-  background: white;
-  color: #1f2937;
-  border: 1px solid #e5e7eb;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-card);
   border-radius: 12px;
 }
 
@@ -3947,11 +7267,11 @@ export default {
   align-items: center;
   gap: 0.5rem;
   font-size: 0.875rem;
-  color: #6b7280;
-  background: white;
+  color: var(--text-secondary);
+  background: var(--bg-input);
   padding: 0.75rem;
   border-radius: 8px;
-  border: 1px solid #e5e7eb;
+  border: 1px solid var(--border-card);
 }
 
 .limits-icon {
@@ -4168,9 +7488,9 @@ export default {
 
 .amount_input_light :deep(.q-field__control),
 .comment_input_light :deep(.q-field__control) {
-  background: white;
-  color: #1f2937;
-  border: 1px solid #e5e7eb;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-card);
   border-radius: 12px;
   margin-bottom: 1rem;
 }
@@ -4182,8 +7502,8 @@ export default {
 }
 
 .payment_actions_light {
-  background: #f8f9fa;
-  border-top: 1px solid #e5e7eb;
+  background: var(--bg-primary);
+  border-top: 1px solid var(--border-card);
 }
 
 .cancel_btn_dark {
@@ -4191,7 +7511,7 @@ export default {
 }
 
 .cancel_btn_light {
-  color: #6b7280;
+  color: var(--text-secondary);
 }
 
 /* Invoice Form */
@@ -4209,9 +7529,9 @@ export default {
 }
 
 .description_input_light :deep(.q-field__control) {
-  background: white;
-  color: #1f2937;
-  border: 1px solid #e5e7eb;
+  background: var(--bg-input);
+  color: var(--text-primary);
+  border: 1px solid var(--border-card);
   border-radius: 12px;
 }
 
@@ -4531,7 +7851,14 @@ export default {
 /* Responsive Design */
 @media (max-width: 480px) {
   .bottom-actions {
-    padding: 0.75rem 1rem 1.5rem 1rem;
+    /* Keep the narrow-viewport side padding but preserve the safe-area
+       floor from the base rule. Shorthand padding was erasing the
+       padding-bottom calculation on mobile, which was the biggest
+       safe-area offender flagged in the audit. */
+    padding-left: 1rem;
+    padding-right: 1rem;
+    padding-top: 0.75rem;
+    padding-bottom: max(1.75rem, var(--safe-bottom, 1.75rem));
   }
 
   .action-buttons {
@@ -4617,322 +7944,16 @@ export default {
   }
 }
 
-/* Wallet Switcher Dialog */
-.wallet-switcher-card {
-  width: 100%;
-  max-width: 360px;
-  border-radius: 20px;
-  overflow: hidden;
-}
-
-.switcher-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 1rem 1.25rem;
-  border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-}
-
-.switcher-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 17px;
-  font-weight: 600;
-}
-
-.switcher-content {
-  padding: 0.5rem;
-  max-height: 320px;
-  overflow-y: auto;
-  scrollbar-width: none;
-}
-
-.switcher-content::-webkit-scrollbar {
-  display: none;
-}
-
-.wallet-switch-list {
-  display: flex;
-  flex-direction: column;
-  gap: 0.375rem;
-}
-
-/* Wallet Switch Card - iOS style */
-.wallet-switch-card {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding: 0.75rem 0.875rem;
-  border-radius: 12px;
-  cursor: pointer;
-  transition: background 0.15s ease;
-}
-
-.wallet-switch-card-dark {
-  background: transparent;
-}
-
-.wallet-switch-card-light {
-  background: transparent;
-}
-
-.wallet-switch-card-dark:hover {
-  background: #222;
-}
-
-.wallet-switch-card-light:hover {
-  background: #F3F4F6;
-}
-
-.wallet-switch-card-active {
-  box-shadow: inset 0 0 0 1px #15DE72;
-  background: rgba(21, 222, 114, 0.03) !important;
-}
-
-.wallet-switch-card-active.wallet-switch-card-dark:hover {
-  background: rgba(21, 222, 114, 0.06) !important;
-}
-
-.wallet-switch-card-active.wallet-switch-card-light:hover {
-  background: rgba(21, 222, 114, 0.05) !important;
-}
-
-/* Switch Avatar */
-.switch-avatar {
-  position: relative;
-  flex-shrink: 0;
-}
-
-.switch-avatar-circle {
-  width: 40px;
-  height: 40px;
-  border-radius: 50%;
+/* Arkade background maintenance (VTXO renew/recover) */
+.arkade-maintenance {
   display: flex;
   align-items: center;
   justify-content: center;
-  color: white;
-}
-
-.switch-avatar-black {
-  background: linear-gradient(135deg, #2A2A2A, #1A1A1A);
-}
-
-.wallet-green {
-  background: linear-gradient(135deg, #15DE72, #059573);
-}
-
-.wallet-blue {
-  background: linear-gradient(135deg, #3B82F6, #2563EB);
-}
-
-.wallet-purple {
-  background: linear-gradient(135deg, #8B5CF6, #7C3AED);
-}
-
-.wallet-orange {
-  background: linear-gradient(135deg, #F59E0B, #D97706);
-}
-
-.wallet-red {
-  background: linear-gradient(135deg, #EF4444, #DC2626);
-}
-
-.switch-status-dot {
-  position: absolute;
-  bottom: 0;
-  right: 0;
-  width: 11px;
-  height: 11px;
-  border-radius: 50%;
-  border: 2px solid;
-}
-
-.wallet-switch-card-dark .switch-status-dot {
-  border-color: #0C0C0C;
-}
-
-.wallet-switch-card-light .switch-status-dot {
-  border-color: #FFF;
-}
-
-.status-connected {
-  background: #15DE72;
-}
-
-.status-disconnected {
-  background: #EF4444;
-}
-
-/* Switch Details */
-.switch-details {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-}
-
-.switch-name {
+  gap: 6px;
   font-family: 'Manrope', sans-serif;
-  font-size: 14px;
-  font-weight: 600;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  margin-bottom: 0.125rem;
-}
-
-.switch-name-dark {
-  color: #F6F6F6;
-}
-
-.switch-name-light {
-  color: #212121;
-}
-
-/* Meta Row with Badges */
-.switch-meta-row {
-  display: flex;
-  align-items: center;
-  gap: 0.375rem;
-  margin-bottom: 0.25rem;
-  flex-wrap: wrap;
-}
-
-.switch-type-badge {
-  display: flex;
-  align-items: center;
-  gap: 0.15rem;
-  padding: 0.1rem 0.35rem;
-  border-radius: 5px;
-  font-family: 'Manrope', sans-serif;
-  font-size: 8px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-  color: white;
-}
-
-.type-spark {
-  background: linear-gradient(135deg, #3A3A3A, #1A1A1A);
-}
-
-.type-nwc {
-  background: linear-gradient(135deg, #FFCA4A, #F7931A);
-}
-
-.type-lnbits {
-  background: linear-gradient(135deg, #FF1FE1, #C919B0);
-}
-
-.switch-tag {
-  font-family: 'Manrope', sans-serif;
-  font-size: 8px;
-  font-weight: 600;
-  padding: 0.1rem 0.3rem;
-  border-radius: 4px;
-  text-transform: capitalize;
-  letter-spacing: 0.02em;
-}
-
-.tag-active {
-  background: #D1FAE5;
-  color: #065F46;
-}
-
-/* Switch Balance */
-.switch-balance {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-weight: 500;
-}
-
-.switch-balance-dark {
-  color: #777;
-}
-
-.switch-balance-light {
-  color: #9CA3AF;
-}
-
-/* Check Icon */
-.switch-check-icon {
-  flex-shrink: 0;
-  color: #15DE72;
-}
-
-/* Switcher Footer */
-.switcher-footer {
-  padding: 0.75rem 1rem;
-  border-top: 1px solid;
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px;
-}
-
-.switcher-footer-dark {
-  border-top-color: #222;
-  background: #171717;
-}
-
-.switcher-footer-light {
-  border-top-color: #E5E7EB;
-  background: #F8F9FA;
-}
-
-/* Transfer Funds Button */
-.transfer-funds-btn {
-  font-family: 'Manrope', sans-serif;
-  font-size: 13px;
-  font-weight: 600;
-  border-radius: 10px;
-  padding: 0.5rem 1rem;
-  transition: all 0.15s ease;
-}
-
-.transfer-btn-dark {
-  color: #22c55e;
-  background: rgba(34, 197, 94, 0.1);
-}
-
-.transfer-btn-dark:hover {
-  background: rgba(34, 197, 94, 0.2);
-}
-
-.transfer-btn-light {
-  color: #16a34a;
-  background: rgba(34, 197, 94, 0.1);
-}
-
-.transfer-btn-light:hover {
-  background: rgba(34, 197, 94, 0.15);
-}
-
-.manage-wallets-btn {
-  font-family: 'Manrope', sans-serif;
-  font-size: 13px;
-  font-weight: 500;
-  border-radius: 10px;
-  padding: 0.5rem 1rem;
-  transition: all 0.15s ease;
-}
-
-.manage-btn-dark {
-  color: #888;
-}
-
-.manage-btn-light {
-  color: #6B7280;
-}
-
-.manage-wallets-btn:hover {
-  background: rgba(107, 114, 128, 0.1);
-}
-
-.manage-btn-dark:hover {
-  color: #F6F6F6;
-}
-
-.manage-btn-light:hover {
-  color: #374151;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 2px 0 -4px;
 }
 
 /* Save Contact Dialog */
@@ -4958,6 +7979,19 @@ export default {
 
 .save-contact-content {
   padding: 1.25rem;
+}
+
+.save-contact-avatar-wrap {
+  display: flex;
+  justify-content: center;
+  margin-bottom: 0.75rem;
+}
+
+.save-contact-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  object-fit: cover;
 }
 
 .save-contact-address {
@@ -5054,6 +8088,32 @@ export default {
   border: 1px solid rgba(247, 147, 26, 0.3) !important;
 }
 
+/* NFC-ready badge next to the logo. Quiet pill: present enough to "feature"
+   tap-to-pay, restrained enough not to compete with the logo. */
+.nfc-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: 8px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: none;
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  line-height: 1;
+}
+.nfc-badge-dark {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-secondary, #9ca3af);
+}
+.nfc-badge-light {
+  background: rgba(17, 24, 39, 0.06);
+  color: var(--text-secondary, #6b7280);
+}
+
 /* Animation for chip */
 .btc-banner-fade-enter-active,
 .btc-banner-fade-leave-active {
@@ -5065,4 +8125,25 @@ export default {
   opacity: 0;
   transform: translateX(-10px);
 }
+.withdraw-review-context { margin: 0; font-size: .9375rem; line-height: 1.5; overflow-wrap: anywhere; }
+</style>
+
+<style>
+/* Dialog-plugin cards are teleported outside the wallet page. */
+.voucher-remove-dialog {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 48px);
+  overflow: hidden;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border-radius: 20px;
+}
+.voucher-remove-dialog .q-dialog__title { flex-shrink: 0; font-size: 1.25rem; line-height: 1.3; }
+.voucher-remove-dialog .q-dialog__message { overflow-y: auto; min-height: 0; font-size: 1rem; line-height: 1.5; color: var(--text-secondary); }
+.voucher-remove-dialog .q-card__actions { flex-shrink: 0; gap: 8px; flex-wrap: wrap; padding: 8px 16px 16px; }
+.voucher-remove-dialog .q-btn { min-height: 44px; font-size: 1rem; line-height: 1.4; margin: 0; }
+.voucher-remove-dialog .voucher-cancel-action { color: var(--brand-accent-text); }
+.voucher-remove-dialog .voucher-danger-action { color: #b42318; }
+.body--dark .voucher-remove-dialog .voucher-danger-action { color: #ffb4ab; }
 </style>

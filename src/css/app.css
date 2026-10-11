@@ -1,5 +1,45 @@
 /* app global css */
 
+@import 'quasar.variables.scss';
+
+/* ─── Unified brand-green palette ───
+   Quasar's color system lets any string be a color name as long as
+   matching `.bg-{name}` / `.text-{name}` classes exist. We register
+   our two brand-green shades here so toggles, radios and any native
+   Quasar `color="…"` binding can opt into the BuhoGO palette with
+   a single consistent value rather than drifting between the stock
+   `green` / `green-7` shades. */
+.bg-brand-green { background: #15DE72 !important; }
+.text-brand-green { color: #15DE72 !important; }
+.bg-brand-green-dark { background: #059573 !important; }
+.text-brand-green-dark { color: #059573 !important; }
+
+/* ─── Theme transition ───
+   Every coloured surface cross-fades to the new theme at the same
+   time. No overlays. No sweeps. Just a scoped blanket transition
+   that's active during the toggle and then gone.
+
+   Scoping via the `theme-transitioning` class on <html> is the
+   critical part — leaving a blanket `*` transition on permanently
+   would make every hover, focus and state change across the entire
+   app acquire a 280 ms colour fade and feel sluggish. The class is
+   added right before Quasar's dark flag flips and removed after
+   the transition completes (see themeTransition.js). */
+html.theme-transitioning,
+html.theme-transitioning body,
+html.theme-transitioning *,
+html.theme-transitioning *::before,
+html.theme-transitioning *::after {
+  transition:
+    background-color 280ms cubic-bezier(0.4, 0, 0.2, 1),
+    color 280ms cubic-bezier(0.4, 0, 0.2, 1),
+    border-color 280ms cubic-bezier(0.4, 0, 0.2, 1),
+    fill 280ms cubic-bezier(0.4, 0, 0.2, 1),
+    stroke 280ms cubic-bezier(0.4, 0, 0.2, 1),
+    box-shadow 280ms cubic-bezier(0.4, 0, 0.2, 1) !important;
+}
+
+
 /* ─── Local Manrope font (no external network dependency) ─── */
 @font-face {
   font-family: 'Manrope';
@@ -18,8 +58,6 @@
   src: url('/fonts/Manrope-latin-ext.woff2') format('woff2');
   unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
-
-@import 'quasar.variables.scss';
 
 /* ─── Mobile-first: prevent horizontal scroll ─── */
 *, *::before, *::after {
@@ -50,13 +88,22 @@ body {
 }
 
 /*
- * Android fallback: env(safe-area-inset-top) returns 0 on many Android
- * WebViews/browsers even with display cutouts. Use a sensible default.
- * The JS boot/safe-area.js will refine this at runtime.
+ * Android fallback: env(safe-area-inset-top) returns 0 on Capacitor
+ * edge-to-edge WebViews even when there's a real status bar / nav bar,
+ * because the inset is reported by Android Window-Insets which the
+ * WebView doesn't surface to CSS without a native bridge. The 24px
+ * fallback in env() only kicks in when env() is *unsupported* — not
+ * when it returns 0 — so we wrap it in max() with a generous floor
+ * that clears the status bar (28px) and gesture nav indicator (24px).
+ * boot/safe-area.js refines this at runtime; the floor remains the
+ * lower bound so JS detection can only ever increase it.
  */
 body.platform-android {
-  --safe-top: env(safe-area-inset-top, 24px);
-  --safe-bottom: env(safe-area-inset-bottom, 16px);
+  --safe-top: max(env(safe-area-inset-top, 0px), 28px);
+  /* 32px floor handles both gesture nav (~24dp indicator) and most
+     3-button nav bars (~48dp) with a slight visual buffer. JS lifts
+     this further when screen-vs-viewport math finds a larger inset. */
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), 32px);
 }
 
 /* 2) Apply safe-area top padding to ALL pages automatically */
@@ -93,6 +140,12 @@ body.platform-android {
 
 * {
     font-family: 'Manrope', sans-serif;
+}
+
+/* Quasar wraps icon names in a span. Preserve the icon font there instead
+   of applying the global text font, which renders names such as "close". */
+.q-icon > span {
+    font-family: inherit;
 }
 
 .q-field__bottom {
@@ -138,8 +191,75 @@ body.platform-android {
     /* Shared tokens */
     --color-green: #15DE72;
     --color-red: #FF4444;
+    /* "Not done yet". One token, because the app had two hardcoded amber
+       pairs for the same state and the same warning came out a different
+       yellow depending on which tab you were on. */
+    --color-warn: #E8C468;
+    --color-warn-soft: rgba(232, 196, 104, 0.12);
     --gradient-green: linear-gradient(90deg, #059573 0%, #78D53C 100%);
+
+    /* ─── Brand accent + neutral-button tokens (theme-aware) ────
+       Dark theme keeps the bright brand green as its accent;
+       light theme remaps the same semantic slots to muted /
+       neutral values so the cream paper stays calm.
+
+       --brand-accent:       used where a component currently
+                             hard-codes the brand green as a
+                             decorative accent. Semantic
+                             "success" states (incoming tx,
+                             payment confirmed) should KEEP a
+                             raw #15DE72 instead — those are
+                             meaning, not decoration.
+       --brand-accent-soft:  for tinted backgrounds / washes.
+       --btn-neutral-*:      for any CTA that previously used a
+                             green or blue tinted fill as its
+                             primary button style. Cream gets a
+                             single neutral "primary action"
+                             styling; dark keeps a dark card.
+    ──────────────────────────────────────────────────────── */
+    --brand-accent:       #15DE72;
+    --brand-accent-soft:  rgba(21, 222, 114, 0.14);
+    /* Accent for TEXT. The decorative accent is tuned for fills and glyphs;
+       text needs 4.5:1 against the page. On the dark paper the bright brand
+       green already clears it, so the two coincide here. */
+    --brand-accent-text:  #15DE72;
+    /* ─── Arkade brand (core rule) ─────────────────────────
+       Red/orange in dark mode, purple in light mode, always on a
+       background that fits. Every Arkade mark, tint, tile, badge and
+       accent reads these; never hard-code an Arkade colour. */
+    --arkade-ink:         #F14317;
+    --arkade-ink-text:    #FF8A66;
+    --arkade-tint:        rgba(241, 67, 23, 0.16);
+    --arkade-tint-border: rgba(241, 67, 23, 0.34);
+    --arkade-tile:        linear-gradient(135deg, #3A1C9C, #24105F);
+    --btn-neutral-bg:     #1A1A1A;
+    --btn-neutral-fg:     #FFFFFF;
+    --btn-neutral-border: transparent;
+    /* A sheet's one primary action: the brand green on dark paper, with
+       dark text so the label clears 4.5:1. */
+    --btn-primary-bg:     linear-gradient(135deg, #15DE72, #0DBB5F);
+    --btn-primary-fg:     #04140B;
+    /* Error text and destructive consequences, readable on the dark card. */
+    --color-negative:     #FF939B;
+
+    /* ─── Bitcoin Map accents ──────────────────────────────────
+       Map UI leans on green in dark mode (it pops on the dark
+       basemap) but goes black-forward in light mode — green is
+       used sparingly there. Pins stay Bitcoin-orange in both, and
+       the freshness "verified" check stays green in both (it's a
+       semantic signal, not decoration). These tokens centralize
+       the swap so the map components don't carry light/dark chains.
+         --map-accent       emphasis text + active states
+         --map-accent-soft  tinted selection washes
+         --map-cta-bg/-fg   primary action button (Directions, Search) */
+    --map-accent:         var(--color-green);
+    --map-accent-soft:    var(--brand-accent-soft);
+    --map-cta-bg:         var(--color-green);
+    --map-cta-fg:         #0E1F17;
     --radius-sm: 8px;
+    /* The step between sm and md. Small marks and inline chips, whose corners
+       have to read as concentric inside a 16px control. */
+    --radius-ms: 12px;
     --radius-md: 16px;
     --radius-lg: 20px;
     --radius-xl: 24px;
@@ -155,19 +275,89 @@ body.platform-android {
 }
 
 body.body--light {
-    --bg-primary: #FFF;
-    --bg-secondary: #F5F5F5;
-    --bg-card: #FFF;
-    --bg-input: #F0F0F0;
-    --border-card: #EBEBEB;
-    --text-primary: #212121;
-    --text-secondary: #6D6D6D;
-    --text-muted: #9CA3AF;
+    /* ─── Cream paper palette ──────────────────────────────
+       Design intent: ONE paper. No tonal stack, no "cream zones."
+       Every flat surface (page, sections, cards) renders on the
+       SAME base color. Shape comes from hairline borders and a
+       whisper shadow — never from a deeper fill.
 
-    /* Light shadows */
-    --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
-    --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.1);
-    --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.15);
+       This is the iOS Reminders / Apple Books approach:
+         • page, section, card = identical cream
+         • input is barely 2% deeper for a subtle inset feel
+         • border-card does the card-definition work
+         • shadows only used for true elevation (modals, menus)
+    ──────────────────────────────────────────────────────── */
+    --bg-primary: #FAF7EF;      /* the paper — ALL flat surfaces use this */
+    --bg-secondary: #FAF7EF;    /* intentionally identical */
+    --bg-card: #FAF7EF;         /* intentionally identical */
+    --bg-input: #F3EFE3;        /* ~3% deeper, just enough for inset */
+    --border-card: #E3DCC7;     /* visible hairline — does the shaping */
+
+    --text-primary: #1A1A1C;    /* near-black, faint warmth */
+    --text-secondary: #5F5B52;  /* warm muted */
+    --text-muted: #928D83;      /* cream-tinted gray */
+
+    /* Whisper shadows — only on true elevation (menus, modals) */
+    --shadow-sm: 0 1px 2px rgba(40, 34, 20, 0.03);
+    --shadow-md: 0 4px 10px rgba(40, 34, 20, 0.05);
+    --shadow-lg: 0 12px 32px rgba(40, 34, 20, 0.09);
+
+    /* Light-mode accent remap — dark green reads as "confident"
+       on cream without the neon buzz of #15DE72. Used only where
+       the original component chose green for decoration; all raw
+       #15DE72 references that encode meaning (tx success, balance
+       inflow) stay untouched. */
+    --brand-accent:       #059573;
+    --brand-accent-soft:  rgba(5, 149, 115, 0.08);
+    /* 6.07:1 on cream, where the decorative #059573 manages only 3.53:1. */
+    --brand-accent-text:  #046B53;
+    /* Arkade on cream: the purple mark, a soft lavender tile and tint. */
+    --arkade-ink:         #351791;
+    --arkade-ink-text:    #351791;
+    --arkade-tint:        rgba(53, 23, 145, 0.09);
+    --arkade-tint-border: rgba(53, 23, 145, 0.22);
+    --arkade-tile:        linear-gradient(135deg, #EFEAFC, #E0D7F7);
+
+    /* Neutral primary CTA — single dark pill on cream. Gives one
+       visual weight to any "primary action" button regardless of
+       the component that hosts it. Dark mode keeps the dark card
+       look defined above. */
+    --btn-neutral-bg:     #1A1A1C;
+    --btn-neutral-fg:     #FAF7EF;
+    --btn-neutral-border: transparent;
+    --btn-primary-bg:     #1A1A1C;
+    --btn-primary-fg:     #FAF7EF;
+    --color-negative:     #B42332;
+
+    /* Legacy token alignment — anything still reading
+       var(--color-green) will now get the muted accent instead of
+       the bright brand green. */
+    --color-green: #059573;
+
+    /* Darker than either amber it replaces: #B8780E was 3.42:1 on the cream
+       paper and #9A6B00 was 4.38:1, both under AA for the small text this
+       colour is used on. */
+    --color-warn: #8A5F00;
+    --color-warn-soft: rgba(138, 95, 0, 0.10);
+
+    /* Map goes black-forward in light mode: emphasis, active states,
+       and primary actions render in near-black on cream rather than
+       green. (Freshness "verified" check + Bitcoin-orange pins keep
+       their own colours — they're semantic, set directly in their
+       components, not via these tokens.) */
+    --map-accent:         #1A1A1C;
+    --map-accent-soft:    rgba(0, 0, 0, 0.05);
+    --map-cta-bg:         #1A1A1C;
+    --map-cta-fg:         #FAF7EF;
+}
+
+/* Ensure Quasar's page chrome picks up the cream paper, not its default white.
+   Any page that does NOT paint its own bg will show --bg-primary through. */
+body.body--light,
+body.body--light .q-layout,
+body.body--light .q-page-container {
+    background: var(--bg-primary);
+    color: var(--text-primary);
 }
 
 /* Utility: hide scrollbar */
@@ -289,32 +479,6 @@ body.body--light {
 }
 
 
-.add_btn_dark {
-    border-radius: 24px !important;
-    border: 1px solid rgba(255, 255, 255, 0.20) !important;;
-    background: linear-gradient(90deg, #059573 0%, #78D53C 100%) !important;;
-    box-shadow: 0px 4px 8px 0px rgba(61, 61, 61, 0.25) !important;;
-    color: #0C0C0C !important;;
-    font-family: 'Manrope', sans-serif;
-    font-size: 14px;
-    font-style: normal;
-    font-weight: 400;
-}
-
-.add_btn_light {
-    border-radius: 24px !important;;
-    border: 1px solid rgba(255, 255, 255, 0.20) !important;;
-    background: linear-gradient(90deg, #059573 0%, #78D53C 100%) !important;;
-    box-shadow: 0px 4px 8px 0px rgba(206, 206, 206, 0.25) !important;;
-    color: #FFF !important;;
-    font-family: 'Manrope', sans-serif;
-    font-size: 14px;
-    font-style: normal;
-    font-weight: 400;
-    line-height: 100%; /* 14px */
-}
-
-
 .main_page_title_dark {
     color: #FFF !important;
     font-family: 'Manrope', sans-serif !important;
@@ -345,6 +509,34 @@ body.body--light {
     backdrop-filter: blur(6px) !important;
 }
 
+/* Keyboard focus ring for the shop and the transaction report.
+   Both carry a marker class on their outermost surface, so one rule covers
+   every control inside them, including ones added later. Both are full of
+   custom `all: unset` buttons, which have no focus indicator of their own, and
+   a control nobody can see they have selected is unusable with a keyboard or
+   with Android switch access. Scoped rather than applied app-wide, because the
+   rest of the app has its own per-component treatments. */
+.shop-surface :focus-visible,
+.report-surface :focus-visible {
+    outline: 2px solid #15DE72;
+    outline-offset: 2px;
+    border-radius: 8px;
+}
+
+/* Shared safe-area for centered Settings sub-dialogs.
+   Quasar's minimized (card-style) dialogs are rendered in a
+   portal outside .q-page, so they don't inherit the automatic
+   --safe-top padding. On devices with a notch the dialog header
+   can clip under the status bar, and on tall-content dialogs
+   like "Exchange rate source" the body extends past the home
+   indicator. Padding the inner wrapper by --safe-* keeps the
+   content fully in the visible viewport on every device. */
+.dialog_dark .q-dialog__inner--minimized,
+.dialog_light .q-dialog__inner--minimized {
+    padding-top: max(12px, var(--safe-top, 12px));
+    padding-bottom: max(12px, var(--safe-bottom, 12px));
+}
+
 .card_dark_style {
     border-radius: 24px !important;
     border: 1px solid #2A342A !important;;
@@ -353,10 +545,11 @@ body.body--light {
 }
 
 .card_light_style {
-    border-radius: 24px !important;;
-    border: 1px solid #F3F3F3 !important;;
-    background: #FFF !important;;
-    box-shadow: 4px 4px 32px 0px rgba(198, 198, 198, 0.25) !important;
+    border-radius: 24px !important;
+    border: 1px solid var(--border-card) !important;
+    background: var(--bg-card) !important;
+    /* Border does the shape work; shadow is only a whisper of depth */
+    box-shadow: var(--shadow-sm) !important;
 }
 
 
@@ -386,8 +579,8 @@ body.body--light {
 
 .search_light {
     border-radius: 20px !important;
-    background-color: #F8F8F8 !important;
-    color: #212121 !important;
+    background-color: var(--bg-input) !important;
+    color: var(--text-primary) !important;
 }
 
 .add_wallet_textbox_dark {
@@ -400,30 +593,81 @@ body.body--light {
     border: 1px solid #EBEBEB !important;
 }
 
+/* ------------------------------------------------------------------
+   Primary CTA — BuhoGO's brand-green tinted fill (Apple-style).
+   Used across onboarding, earn, setup, receive and all primary
+   affirmative actions. Same visual grammar as the Wallet's Receive
+   button, the Create Invoice button, and the active state of the
+   Spark / Lightning / Bitcoin toggle: brand-green wash + saturated
+   green label + 1px inset ring. No pill, no gradient, no heavy
+   shadow — the colour is the meaning.
+
+   Send-flow buttons (where blue is semantically correct) override
+   this locally with a blue-tinted variant.
+------------------------------------------------------------------ */
 .dialog_add_btn_dark {
-    border-radius: 24px;
-    border: 1px solid rgba(255, 255, 255, 0.20);
-    background: linear-gradient(90deg, #059573 0%, #78D53C 100%);
-    box-shadow: 0px 4px 8px 0px rgba(61, 61, 61, 0.25);
-    color: #0C0C0C;
+    border-radius: 16px;
+    border: none;
+    background: rgba(21, 222, 114, 0.14);
+    color: #15DE72;
+    box-shadow: inset 0 0 0 1px rgba(21, 222, 114, 0.22);
     font-family: 'Manrope', sans-serif;
-    font-size: 14px;
+    font-size: 15px;
     font-style: normal;
-    font-weight: 400;
-    line-height: 100%; /* 14px */
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    line-height: 1;
+    transition:
+        background-color 0.18s ease,
+        color 0.18s ease,
+        box-shadow 0.18s ease,
+        filter 0.18s ease,
+        transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 .dialog_add_btn_light {
-    border-radius: 24px;
-    border: 1px solid rgba(255, 255, 255, 0.20);
-    background: linear-gradient(90deg, #059573 0%, #78D53C 100%);
-    box-shadow: 0px 4px 8px 0px rgba(206, 206, 206, 0.25);
-    color: #0C0C0C;
+    border-radius: 16px;
+    /* Neutral dark pill on cream — matches the wallet-home Receive/Send
+       treatment from Bucket B. Every dialog primary CTA (Create Wallet,
+       Continue, Save, Confirm…) now shares the same visual weight
+       regardless of which modal it lives in, removing the "is this the
+       green one or the other one?" guessing game the audit surfaced. */
+    border: none;
+    background: var(--btn-neutral-bg);
+    color: var(--btn-neutral-fg);
+    box-shadow: none;
     font-family: 'Manrope', sans-serif;
-    font-size: 14px;
+    font-size: 15px;
     font-style: normal;
-    font-weight: 400;
-    line-height: 100%; /* 14px */
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    line-height: 1;
+    transition:
+        background-color 0.18s ease,
+        color 0.18s ease,
+        box-shadow 0.18s ease,
+        filter 0.18s ease,
+        transform 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.dialog_add_btn_dark:hover:not(:disabled),
+.dialog_add_btn_light:hover:not(:disabled) {
+    filter: brightness(1.06);
+}
+
+.dialog_add_btn_dark:active:not(:disabled),
+.dialog_add_btn_light:active:not(:disabled) {
+    transform: scale(0.98);
+    transition-duration: 0.08s;
+    filter: brightness(0.94);
+}
+
+.dialog_add_btn_dark:disabled,
+.dialog_add_btn_dark[disabled],
+.dialog_add_btn_light:disabled,
+.dialog_add_btn_light[disabled] {
+    opacity: 0.45;
+    cursor: not-allowed;
 }
 
 .menu_dark {
@@ -435,9 +679,10 @@ body.body--light {
 
 .menu_light {
     border-radius: 16px;
-    border: 1px solid var(--Shark-50, #F6F6F6);
-    background: #FFF;
-    box-shadow: 4px 4px 16px 0px rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border-card);
+    background: var(--bg-card);
+    /* Menus float — need a touch more shadow than inline cards */
+    box-shadow: var(--shadow-md);
 }
 
 
@@ -482,8 +727,8 @@ body.body--light {
 
 .card_style_light { /* @deprecated duplicate of card_light_style */
     border-radius: 24px !important;
-    border: 1px solid #EBEBEB !important;
-    background: #FFF !important;
+    border: 1px solid var(--border-card) !important;
+    background: var(--bg-card) !important;
 }
 
 .table_header {
@@ -606,7 +851,7 @@ body.body--light {
   align-items: center;
   justify-content: center;
   transition: background-color 0.15s ease;
-  color: #6B7280;
+  color: var(--text-secondary);
 }
 
 .back_btn_dark:hover,
@@ -627,5 +872,496 @@ body.body--dark .q-skeleton::after {
   background: linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent);
 }
 body.body--light .q-skeleton {
-  background: #EBEBEB;
+  background: var(--border-card);
 }
+
+/* ─── Notification Toasts ─── */
+
+/* Position: respect safe area on iOS/Android */
+.q-notifications__list--bottom {
+  margin-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px) !important;
+}
+
+/* Base toast pill */
+.buho-notify {
+  font-family: 'Manrope', sans-serif !important;
+  font-size: 13px !important;
+  font-weight: 600 !important;
+  letter-spacing: -0.01em;
+  border-radius: 14px !important;
+  padding: 10px 14px !important;
+  min-height: 0 !important;
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 8px 32px -4px rgba(0, 0, 0, 0.18),
+              0 2px 8px rgba(0, 0, 0, 0.08) !important;
+  border: 1px solid rgba(255, 255, 255, 0.12) !important;
+  max-width: calc(100vw - 32px);
+  animation: notifySlideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes notifySlideUp {
+  from { opacity: 0; transform: translateY(16px) scale(0.96); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* Semantic color backgrounds — BuhoGO palette, semi-transparent for glassmorphism */
+.buho-notify.bg-positive { background: rgba(21, 222, 114, 0.88) !important; }
+.buho-notify.bg-accent   { background: rgba(21, 222, 114, 0.88) !important; }
+.buho-notify.bg-info     { background: rgba(165, 193, 225, 0.92) !important; }
+.buho-notify.bg-negative { background: rgba(255, 68, 68, 0.92) !important; }
+.buho-notify.bg-warning  { background: rgba(247, 147, 26, 0.92) !important; }
+
+/* Progress bar */
+.buho-notify .q-notification__progress {
+  background: rgba(255, 255, 255, 0.3) !important;
+  height: 2px !important;
+}
+
+/* Icon size */
+.buho-notify .q-notification__icon {
+  font-size: 20px !important;
+}
+
+/* Close button */
+.buho-notify .q-notification__actions .q-btn {
+  opacity: 0.7;
+}
+.buho-notify .q-notification__actions .q-btn:active {
+  opacity: 1;
+}
+
+/* ============================================================
+   MLKit BARCODE SCANNER (transparent webview)
+   The native MLKit scanner renders the camera feed BEHIND the
+   webview. For it to be visible, every webview surface must drop
+   its background and everything that isn't part of the scanner
+   overlay must be hidden — otherwise an opaque element paints over
+   the camera. `.barcode-scanner-modal` (the ScannerOverlay root,
+   teleported to <body>) is the one thing kept visible; Quasar's
+   notification portal is also spared so toasts still surface.
+   ============================================================ */
+html:has(body.barcode-scanner-active),
+body.barcode-scanner-active,
+body.barcode-scanner-active #q-app {
+  background: transparent !important;
+}
+
+body.barcode-scanner-active > *:not(.barcode-scanner-modal):not(.q-notifications) {
+  visibility: hidden !important;
+}
+
+body.barcode-scanner-active .barcode-scanner-modal,
+body.barcode-scanner-active .barcode-scanner-modal * {
+  visibility: visible !important;
+}
+
+/* ==================================================================
+   Inset connect form — shared by the NWC and LNbits setup pages.
+
+   Presented as a route-hosted full-height sheet: the ground dims, the
+   surface slides up to the large detent with a grabber and a glass
+   back button for chrome, and the identity lives in a centered hero
+   (brand tile over the serif title). Below it: a section label with
+   an inline "Scan" action, one grouped inset card of fields, and the
+   Connect CTA pinned in the sheet footer. Fully theme-aware through
+   the design tokens (var(--bg-input) etc.), so it renders dark on
+   near-black and cream on paper without per-theme class juggling.
+   ================================================================== */
+.iform-sheet-page {
+  padding: 0 !important;
+  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  align-items: center;
+}
+
+.iform-sheet-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  animation: iform-scrim-in 0.22s ease-out both;
+}
+
+/* The large detent: a sliver of dimmed ground stays visible above. */
+.iform-sheet {
+  position: relative;
+  width: 100%;
+  max-width: 520px;
+  height: calc(100vh - var(--safe-top, 0px) - 10px);
+  height: calc(100dvh - var(--safe-top, 0px) - 10px);
+  border-radius: var(--radius-xl, 24px) var(--radius-xl, 24px) 0 0;
+  background: var(--bg-card);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 -20px 60px rgba(0, 0, 0, 0.35);
+  animation: iform-sheet-up 0.38s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.iform-sheet-grab {
+  width: 36px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  opacity: 0.45;
+  margin: 8px auto 4px;
+  flex-shrink: 0;
+}
+
+.iform-sheet-top {
+  display: flex;
+  align-items: center;
+  padding: 4px 12px 8px;
+  flex-shrink: 0;
+}
+.iform-sheet-title {
+  flex: 1;
+  text-align: center;
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  color: var(--text-primary);
+}
+.iform-sheet-spacer {
+  width: 40px;
+  flex-shrink: 0;
+}
+
+.iform-sheet-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.iform-sheet-footer {
+  flex-shrink: 0;
+  padding: 12px 20px calc(12px + var(--safe-bottom, 0px));
+}
+.iform-sheet-footer .iform-connect {
+  margin-top: 0;
+}
+
+@keyframes iform-sheet-up {
+  from { transform: translateY(100%); }
+  to { transform: translateY(0); }
+}
+@keyframes iform-scrim-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .iform-sheet,
+  .iform-sheet-scrim {
+    animation: none;
+  }
+}
+
+.iform-body {
+  padding: 0 20px 22px;
+}
+
+/* Centered identity hero: the brand tile above the serif title. */
+.iform-hero {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding-top: 8px;
+  margin-bottom: 24px;
+}
+.iform-tile {
+  width: 48px;
+  height: 48px;
+  border-radius: 13px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-input);
+  border: 1px solid var(--border-card);
+}
+.iform-hero .iform-tile {
+  width: 56px;
+  height: 56px;
+  border-radius: 15px;
+}
+.iform-hero-title {
+  font-family: 'Fraunces', 'Manrope', serif;
+  font-weight: 400;
+  font-size: 24px;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+  color: var(--text-primary);
+  margin-top: 12px;
+}
+.iform-hero-sub {
+  font-family: 'Manrope', sans-serif;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin-top: 5px;
+  max-width: 34ch;
+}
+
+.iform-secrow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 9px;
+}
+.iform-seclabel {
+  font-family: 'Manrope', sans-serif;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.iform-scan {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #15DE72;
+  padding: 4px;
+  border-radius: 8px;
+}
+body.body--light .iform-scan {
+  color: #059573;
+}
+.iform-scan svg {
+  width: 14px;
+  height: 14px;
+}
+
+.iform-group {
+  border-radius: 16px;
+  background: var(--bg-input);
+  border: 1px solid var(--border-card);
+  overflow: hidden;
+}
+.iform-row {
+  padding: 11px 14px 12px;
+  position: relative;
+}
+.iform-row + .iform-row {
+  border-top: 1px solid var(--border-card);
+}
+.iform-label {
+  font-family: 'Manrope', sans-serif;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+
+/* Strip the q-input chrome so each field sits flush under its label
+   inside the grouped card (borderless already drops the underline;
+   this removes the residual dense min-height and control padding). */
+.iform-input .q-field__control {
+  min-height: 30px;
+  padding: 0;
+}
+.iform-input .q-field__control::before,
+.iform-input .q-field__control::after {
+  display: none;
+}
+.iform-input .q-field__native,
+.iform-input .q-field__input,
+.iform-input textarea {
+  padding: 0;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+.iform-input textarea {
+  min-height: 40px;
+  max-height: 120px;
+  overflow-y: auto;
+  resize: none;
+}
+.iform-input .q-field__marginal {
+  height: auto;
+  color: var(--text-muted);
+}
+
+.iform-hint {
+  font-family: 'Manrope', sans-serif;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin: 10px 4px 0;
+}
+
+.iform-connect {
+  height: 52px;
+  border-radius: 16px;
+  margin-top: 20px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+
+
+/* ─── Glass back button ──────────────────────────────────────────────
+   The circular back affordance on sheet headers (receive + send flows):
+   translucent fill, backdrop blur, hairline ring. Themed via body class. */
+.glass-back-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(0, 0, 0, 0.07);
+  color: #212121;
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+
+body.body--dark .glass-back-btn {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.12);
+  color: #FFF;
+}
+
+/* ─── Destructive confirm dialog (shared) ────────────────────────────
+   Used by the address book's remove-contact and clear-all confirms.
+   Rounded card, red destructive accent on the action button only. */
+.delete-confirm-card {
+  width: 100%;
+  max-width: 380px;
+  border-radius: var(--radius-xl);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35),
+              0 4px 12px rgba(0, 0, 0, 0.18);
+}
+
+body.body--light .delete-confirm-card {
+  box-shadow: 0 20px 40px rgba(17, 24, 39, 0.14),
+              0 4px 12px rgba(17, 24, 39, 0.06);
+}
+
+.delete-confirm-card .delete-header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  padding: 1.75rem 1.5rem 0.5rem;
+}
+
+.delete-confirm-card .delete-icon-wrapper {
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: rgba(239, 68, 68, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 1.1rem;
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.18);
+}
+
+.delete-confirm-card .delete-icon { color: #EF4444; }
+
+.delete-confirm-card .delete-title {
+  font-family: 'Manrope', sans-serif;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 0.5rem;
+  letter-spacing: -0.01em;
+}
+
+.delete-confirm-card .delete-message {
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  max-width: 280px;
+}
+
+.delete-confirm-card .delete-message strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.delete-confirm-card .delete-actions {
+  padding: 1.25rem 1.5rem 1.5rem;
+  display: flex;
+  gap: 0.6rem;
+}
+
+.delete-confirm-card .cancel-btn,
+.delete-confirm-card .delete-action-btn {
+  flex: 1;
+  height: 44px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  border-radius: var(--radius-xl);
+}
+
+.delete-confirm-card .cancel-btn {
+  font-weight: 500;
+  background: var(--bg-input);
+}
+
+body.body--light .delete-confirm-card .cancel-btn {
+  background: rgba(17, 24, 39, 0.05);
+}
+
+.delete-confirm-card .delete-action-btn {
+  font-weight: 600;
+  background: #EF4444 !important;
+  color: #fff !important;
+  transition: background 0.15s ease, transform 0.08s ease;
+}
+
+.delete-confirm-card .delete-action-btn:hover { background: #DC2626 !important; }
+.delete-confirm-card .delete-action-btn:active { transform: scale(0.98); }
+
+/* Stand-in for a balance that has not loaded yet, never a 0. Sized in em so
+   it matches the figure it replaces, and drawn in that figure's colour; the
+   element around it pulses (directives/balanceUpdating.js). */
+.balance-placeholder {
+  display: inline-block;
+  width: 5em;
+  height: 0.8em;
+  border-radius: 0.25em;
+  background: currentColor;
+  opacity: 0.2;
+  vertical-align: baseline;
+}
+
+/* A last-known balance that has not been verified recently (cached, saved
+   from an earlier session, or a failed sync). Readable, but visibly not
+   live — never presented as a verified figure. */
+.balance-stale {
+  opacity: 0.6;
+}
+
+/* ─── Form sheets ─────────────────────────────────────────────
+   A bottom sheet with Cancel, a centred title and one primary
+   action (Add Spark wallet, Move address): the iOS form-sheet
+   layout. One definition, so every such sheet looks the same. */
+.form-sheet-grabber { display: flex; justify-content: center; padding: 10px 0 2px; }
+.form-sheet-grabber::before { content: ''; width: 36px; height: 5px; border-radius: 3px; background: var(--text-muted); opacity: .4; }
+.form-sheet-header { display: grid; grid-template-columns: minmax(64px, 1fr) auto minmax(64px, 1fr); align-items: center; gap: 8px; padding: 6px 16px 4px; }
+.form-sheet-title { margin: 0; font-family: 'Manrope', sans-serif; font-size: 17px; font-weight: 650; line-height: 1.3; text-align: center; color: var(--text-primary); }
+.form-sheet-cancel { justify-self: start; min-height: 44px; padding: 0 4px; border: 0; background: transparent; color: var(--brand-accent-text); font: 500 16px/1.3 'Manrope', sans-serif; cursor: pointer; }
+.form-sheet-primary { display: inline-flex; align-items: center; justify-content: center; gap: 10px; min-height: 50px; border: 0; border-radius: 14px; background: var(--btn-primary-bg); color: var(--btn-primary-fg); font: 650 16px/1.3 'Manrope', sans-serif; cursor: pointer; }
+.form-sheet-primary:disabled { opacity: .5; cursor: default; }
+.form-sheet-error { color: var(--color-negative); font-size: 13px; line-height: 1.45; }
+.form-sheet-cancel:focus-visible,
+.form-sheet-primary:focus-visible { outline: 2px solid currentColor; outline-offset: 3px; }

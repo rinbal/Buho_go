@@ -1,3 +1,4 @@
+import { isAddressRequest } from '../utils/lud23.js';
 /**
  * WalletFactory - Creates wallet provider instances
  *
@@ -5,10 +6,22 @@
  * based on wallet type (spark or nwc).
  */
 
-import { SparkWalletProvider } from './SparkWalletProvider';
+import { BreezSparkWalletProvider } from './BreezSparkWalletProvider';
 import { NWCWalletProvider } from './NWCWalletProvider';
 import { LNBitsWalletProvider } from './LNBitsWalletProvider';
+import { ArkadeWalletProvider } from './ArkadeWalletProvider';
 import { WalletProvider } from './WalletProvider';
+import { parseBip21, selectBip21Destination, extractLnFallbackParam } from '../utils/bip21';
+import { isSilentPaymentAddress,
+  isSparkAddress,
+  isArkadeAddress,
+  isBolt12Offer,
+  isLightningInvoice,
+  isLightningAddress,
+  isLnurl,
+  isBitcoinAddress,
+  stripWrapperScheme,
+} from '../utils/addressUtils';
 
 /**
  * Create a wallet provider instance based on wallet type
@@ -28,11 +41,23 @@ export function createWalletProvider(wallet) {
 
   switch (type) {
     case 'spark':
-      return new SparkWalletProvider(wallet.id, {
+      return new BreezSparkWalletProvider(wallet.id, {
         name: wallet.name,
         network: wallet.connectionData?.network || 'MAINNET',
         accountNumber: wallet.connectionData?.accountNumber,
         encryptedMnemonic: wallet.connectionData?.encryptedMnemonic,
+        ...wallet
+      });
+
+    case 'arkade':
+      if (!wallet.connectionData?.encryptedMnemonic) {
+        throw new Error('Arkade wallet requires an encrypted recovery phrase');
+      }
+      return new ArkadeWalletProvider(wallet.id, {
+        name: wallet.name,
+        network: wallet.connectionData?.network,
+        arkServerUrl: wallet.connectionData?.arkServerUrl,
+        encryptedMnemonic: wallet.connectionData.encryptedMnemonic,
         ...wallet
       });
 
@@ -78,6 +103,12 @@ export function inferWalletType(wallet) {
     return wallet.type;
   }
 
+  // Arkade and Spark both store an encrypted mnemonic, so disambiguate on the
+  // Arkade-only `arkServerUrl` marker BEFORE falling through to Spark.
+  if (wallet.connectionData?.encryptedMnemonic && wallet.connectionData?.arkServerUrl) {
+    return 'arkade';
+  }
+
   // Check for Spark-specific properties
   if (wallet.connectionData?.encryptedMnemonic) {
     return 'spark';
@@ -97,14 +128,8 @@ export function inferWalletType(wallet) {
   return 'nwc';
 }
 
-/**
- * Check if an address is a Spark address
- * @param {string} address - Address to check
- * @returns {boolean}
- */
-export function isSparkAddress(address) {
-  return WalletProvider.isSparkAddress(address);
-}
+// `isSparkAddress` / `isArkadeAddress` are re-exported from addressUtils — no wrapper needed.
+export { isSparkAddress, isArkadeAddress, isSilentPaymentAddress } from '../utils/addressUtils';
 
 /**
  * Parse a payment destination and determine its type
@@ -116,78 +141,124 @@ export function parsePaymentDestination(input) {
     return { type: 'unknown', valid: false };
   }
 
+  if (isAddressRequest(input)) return { type: 'address_request', data: input, valid: true };
   let cleaned = input.trim();
-  // Strip common URI prefixes (lightning:, bitcoin:, LIGHTNING:, etc.)
-  if (cleaned.toLowerCase().startsWith('lightning:')) {
-    cleaned = cleaned.substring(10);
-  } else if (cleaned.toLowerCase().startsWith('bitcoin:')) {
-    cleaned = cleaned.substring(8);
-  }
 
-  const normalized = cleaned.toLowerCase();
-
-  // Spark address (zero-fee transfer)
-  // New format: spark1 (mainnet), sparkrt1 (regtest), sparkt1 (testnet), sparks1 (signet), sparkl1 (local)
-  // Legacy format: sp1 (mainnet), tsp1 (testnet), sprt1 (regtest)
-  const sparkNewPrefixes = ['spark1', 'sparkrt1', 'sparkt1', 'sparks1', 'sparkl1'];
-  const sparkLegacyPrefixes = ['sp1', 'tsp1', 'sprt1'];
-  const isSparkAddr = sparkNewPrefixes.some(p => normalized.startsWith(p)) ||
-                      sparkLegacyPrefixes.some(p => normalized.startsWith(p));
-
-  if (isSparkAddr) {
-    return {
-      type: 'spark_address',
-      address: cleaned,
-      isZeroFee: true,
-      valid: true
-    };
-  }
-
-  // Lightning invoice (BOLT11): lnbc (mainnet), lntb (testnet), lntbs (signet), lnbcrt (regtest)
-  if (normalized.startsWith('lnbc') || normalized.startsWith('lntb') ||
-      normalized.startsWith('lntbs') || normalized.startsWith('lnbcrt')) {
-    return {
-      type: 'lightning_invoice',
-      invoice: cleaned,
-      valid: true
-    };
-  }
-
-  // Lightning address
-  if (cleaned.includes('@') && cleaned.split('@').length === 2) {
-    const [name, domain] = cleaned.split('@');
-    if (name.length > 0 && domain.includes('.')) {
-      return {
-        type: 'lightning_address',
-        address: cleaned.toLowerCase(),
-        valid: true
-      };
+  // BIP21 (bitcoin:<addr>?amount=...&lightning=lnbc...) needs structured
+  // parsing — a naive prefix strip would leave the query string glued to the
+  // address. We resolve to the preferred inner destination (LN > on-chain)
+  // and let the existing prefix-based branches below handle the result.
+  let bip21 = null;
+  const bip21Parsed = parseBip21(cleaned);
+  if (bip21Parsed) {
+    bip21 = bip21Parsed;
+    const destination = selectBip21Destination(bip21Parsed);
+    if (!destination) {
+      return { type: 'unknown', valid: false, bip21 };
+    }
+    cleaned = destination.value;
+  } else {
+    // http(s) "fallback URL" with the LNURL/invoice in a `lightning=` query
+    // param (LNbits / Fossa ATMs). Pull it out so the branches below classify
+    // it (LNURL-withdraw in the ATM case); leave non-matching URLs untouched.
+    const lnFallback = extractLnFallbackParam(cleaned);
+    if (lnFallback) {
+      cleaned = lnFallback;
+    } else {
+      // Otherwise strip a wrapper URI scheme (`lightning:` / `lnurl:`) so the
+      // bare payload reaches the prefix-based branches below. No-op when none
+      // is present.
+      cleaned = stripWrapperScheme(cleaned);
     }
   }
 
-  // LNURL (bech32 LUD-01 or URL scheme LUD-17)
-  if (normalized.startsWith('lnurl1') || normalized.startsWith('lnurlp://') ||
-      normalized.startsWith('lnurlw://') || normalized.startsWith('lnurlc://') ||
-      normalized.startsWith('keyauth://')) {
-    return {
+  if (isAddressRequest(cleaned)) return { type: 'address_request', data: cleaned, valid: true };
+
+  // Attach BIP21 metadata (amount, label, message, ...) to every result so
+  // downstream UI can prefill where useful.
+  const withBip21 = (result) => (bip21 ? { ...result, bip21 } : result);
+
+  // BIP-352 Silent Payments share Spark's legacy sp1/tsp1 prefixes, so
+  // this more specific check must run first. Recognized, not payable:
+  // deriving the one-time output needs sender-side BIP-352 support none
+  // of our rails (Spark SDK, Arkade, Lightning backends) offer.
+  if (isSilentPaymentAddress(cleaned)) {
+    return withBip21({
+      type: 'silent_payment',
+      address: cleaned,
+      valid: false,
+      unsupported: true,
+    });
+  }
+
+  if (isSparkAddress(cleaned)) {
+    return withBip21({
+      type: 'spark_address',
+      address: cleaned,
+      isZeroFee: true,
+      valid: true,
+    });
+  }
+
+  // Arkade native address — instant ark1 → ark1 fast path, near-zero fee
+  // (the Ark analogue of the Spark zero-fee path above).
+  if (isArkadeAddress(cleaned)) {
+    return withBip21({
+      type: 'arkade_address',
+      address: cleaned,
+      isZeroFee: true,
+      valid: true,
+    });
+  }
+
+  // BOLT12 offers need an onion-message invoice request before a BOLT11
+  // payment can be made. BuhoGO has no provider capability for that yet, so
+  // preserve the recognition and let the UI show its dedicated explanation.
+  if (isBolt12Offer(cleaned)) {
+    return withBip21({
+      type: 'bolt12_offer',
+      offer: cleaned,
+      valid: false,
+      unsupported: true,
+    });
+  }
+
+  if (isLightningInvoice(cleaned)) {
+    return withBip21({
+      type: 'lightning_invoice',
+      invoice: cleaned,
+      valid: true,
+    });
+  }
+
+  // A description inside a withdraw URL may contain @. Only normalize
+  // actual Lightning addresses; callback paths and challenges are opaque.
+  if (isLightningAddress(cleaned)) {
+    return withBip21({
+      type: 'lightning_address',
+      address: cleaned.toLowerCase(),
+      valid: true,
+    });
+  }
+
+  if (isLnurl(cleaned)) {
+    return withBip21({
       type: 'lnurl',
       lnurl: cleaned,
-      valid: true
-    };
+      valid: true,
+    });
   }
 
-  // Bitcoin on-chain address (supported by Spark wallets for L1 withdrawals)
-  if (normalized.startsWith('bc1') || normalized.startsWith('tb1') ||
-      normalized.startsWith('1') || normalized.startsWith('3')) {
-    return {
+  // Bitcoin on-chain (only Spark wallets can pay these; UI layer decides).
+  if (isBitcoinAddress(cleaned)) {
+    return withBip21({
       type: 'bitcoin_address',
       address: cleaned,
-      valid: true
-      // Note: UI will check if active wallet supports L1 withdrawals
-    };
+      valid: true,
+    });
   }
 
-  return { type: 'unknown', valid: false };
+  return withBip21({ type: 'unknown', valid: false });
 }
 
 /**
@@ -196,7 +267,16 @@ export function parsePaymentDestination(input) {
 export const WALLET_TYPES = {
   SPARK: 'spark',
   NWC: 'nwc',
-  LNBITS: 'lnbits'
+  LNBITS: 'lnbits',
+  ARKADE: 'arkade'
+};
+
+/** Provider names as shown in the UI; brand names, so they are not translated. */
+export const WALLET_TYPE_LABELS = {
+  [WALLET_TYPES.SPARK]: 'Spark',
+  [WALLET_TYPES.NWC]: 'NWC',
+  [WALLET_TYPES.LNBITS]: 'LNbits',
+  [WALLET_TYPES.ARKADE]: 'Arkade'
 };
 
 /**
@@ -204,6 +284,7 @@ export const WALLET_TYPES = {
  */
 export const PAYMENT_TYPES = {
   SPARK_ADDRESS: 'spark_address',
+  ARKADE_ADDRESS: 'arkade_address',
   LIGHTNING_INVOICE: 'lightning_invoice',
   LIGHTNING_ADDRESS: 'lightning_address',
   LNURL: 'lnurl',
@@ -216,6 +297,7 @@ export default {
   createWalletProvider,
   inferWalletType,
   isSparkAddress,
+  isArkadeAddress,
   parsePaymentDestination,
   WALLET_TYPES,
   PAYMENT_TYPES

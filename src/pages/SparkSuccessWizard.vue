@@ -1,0 +1,688 @@
+<template>
+  <q-page class="wizard-page" :class="$q.dark.isActive ? 'bg-dark' : 'bg-light'">
+    <div class="wizard-container">
+
+      <!-- Top bar: Logo left, Skip right -->
+      <div class="wizard-topbar">
+        <div class="wizard-logo">
+          <img src="/buho_logo.svg" alt="Buho" class="wizard-logo-img" />
+        </div>
+        <q-btn flat no-caps dense class="skip-btn" @click="goToWallet">
+          {{ $t('Skip') }}
+        </q-btn>
+      </div>
+
+      <!-- Carousel -->
+      <q-carousel
+        v-model="currentSlide"
+        swipeable
+        animated
+        transition-prev="slide-right"
+        transition-next="slide-left"
+        :navigation="false"
+        :arrows="false"
+        :infinite="false"
+        class="wizard-carousel"
+      >
+        <!-- Spark-specific screens -->
+        <template v-if="isSparkMode">
+          <!-- 1: The wallet -->
+          <q-carousel-slide name="spark-wallet" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-piggy-bank-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Your Spark wallet') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Send and receive Bitcoin in seconds. Your recovery phrase is the key, so the money stays yours.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 2: More Spark wallets -->
+          <q-carousel-slide name="spark-wallets" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-ewallet-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Up to six Spark wallets') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Keep money apart for savings, a shop or the family. Every Spark wallet comes from the same recovery phrase, so one backup covers them all.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 3: Save to Hardware -->
+          <q-carousel-slide name="savings" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-investing-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Save for the Future') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Ready to save? You can send your Bitcoin to a hardware wallet or any Bitcoin address for long-term storage.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+        </template>
+
+        <!-- Arkade intro (single self-custodial wallet) -->
+        <template v-if="isArkadeMode">
+          <q-carousel-slide name="arkade-intro" class="wizard-slide">
+            <div class="slide-content">
+              <ArkadeLogo variant="full" :size="260" class="slide-illustration arkade-hero-logo" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Your Arkade wallet') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Send and receive Bitcoin in an instant, with fees so low you barely notice. Your keys, your coins.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+        </template>
+
+        <!-- Extended screens (only if user opted in or general mode) -->
+        <template v-if="showExtended">
+          <!-- 4: Send & Receive -->
+          <q-carousel-slide name="send-receive" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-bitcoin-p2p-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Send & Receive') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Pay anyone instantly with Lightning or send to any Bitcoin address. Just scan a QR code or paste an address.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 5: NFC / Bolt Card -->
+          <!-- Notifications. Placed right after Send/Receive: the wallet
+               exists, the user has just been told money can arrive, and this
+               is the moment that makes the ask make sense. Shown once, and in
+               the installed app only — on the web the Settings row is the way
+               in. The copy promises exactly what a local notification can do,
+               no more. -->
+          <q-carousel-slide v-if="showNotificationsSlide" name="notifications" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-money-income-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Know when money arrives') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Get a notification when a payment lands while you are in another app. It works while BuhoGO stays open in the background, not after it is closed.') }}
+              </p>
+              <p v-if="notificationsAnswered" class="slide-text wizard-notify-state" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                <template v-if="notifications.canNotify">{{ $t('Notifications are on. You can change this in Settings.') }}</template>
+                <template v-else>{{ $t('No notifications. You can turn them on later in Settings.') }}</template>
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <q-carousel-slide name="nfc" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-mobile-payments-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Tap to Pay with NFC') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Accept Bolt Card payments with a single tap. Customers hold their card to your phone and pay instantly.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 6: Internal Transfer -->
+          <q-carousel-slide name="transfer" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-transfer-money-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Move Between Wallets') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Move money between your wallets anytime. Between Spark wallets it happens instantly and costs nothing.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 6: Auto-Transfer -->
+          <q-carousel-slide name="auto-transfer" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-manage-money-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Auto-Transfer') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Set a rule and your funds move automatically when your balance grows past a certain amount. Set it and forget it.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 7: Transaction History -->
+          <q-carousel-slide name="history" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-finance-app-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Your Transaction History') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Every payment you send or receive is saved. Tag them, add notes, and keep track of everything.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 8: Contacts -->
+          <q-carousel-slide name="contacts" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-online-friends-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Your Contacts') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Save the people you pay often. Next time, just pick a name instead of typing an address.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 9: Identity -->
+          <q-carousel-slide name="identity" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-account-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Your BuhoGO Identity') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('One profile to share, sign in to social apps with a tap, and let others add you with a quick scan.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 10: Amount Display -->
+          <q-carousel-slide name="display" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-mobile-apps-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Choose Your View') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('See your balance in sats or in Bitcoin (₿). You can change this anytime in Settings.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 9: More Wallets -->
+          <q-carousel-slide name="more-wallets" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-connected-world-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('More Wallets') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('You can also connect other wallets like NWC or LNbits and manage everything in one place.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 10: App Lock -->
+          <q-carousel-slide name="security" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-fingerprint-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Keep It Locked') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Protect your app with Face ID, fingerprint, or your phone\'s lock screen. Turn it on in Settings.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 11: Backup Reminder -->
+          <q-carousel-slide name="backup" class="wizard-slide">
+            <div class="slide-content">
+              <BackupKeyring :size="100" class="q-mb-lg" />
+              <div class="wizard-backup-types"><span>{{ $t('Bitcoin') }}</span><span>{{ $t('Identity') }}</span></div>
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Two backups, kept separate') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('The keyring takes you to both backups. Save each set of words when you are ready.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 12: Kiosk Mode -->
+          <q-carousel-slide name="kiosk" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-receipt-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Kiosk Mode') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Hand your device to an employee. They can only take payments while your wallet stays locked behind a PIN.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 13: Bitcoin Lessons -->
+          <q-carousel-slide name="lessons" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Learn and Earn/education.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Bitcoin Lessons') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Learn about Bitcoin step by step and earn real sats along the way. The more you learn, the more you earn.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 14: Bitcoin Map -->
+          <q-carousel-slide name="map" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-Papermap-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('Find Places to Spend') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Open the Bitcoin map to discover shops, cafés, and businesses that accept Bitcoin near you. Tap a pin for details and directions.') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+
+          <!-- 15: You're ready! -->
+          <q-carousel-slide name="ready" class="wizard-slide">
+            <div class="slide-content">
+              <img src="/Onboarding wizard spark/storyset-setup-wizard-bro.svg" class="slide-illustration" alt="" />
+              <h2 class="slide-title" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
+                {{ $t('You\'re All Set!') }}
+              </h2>
+              <p class="slide-text" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+                {{ $t('Your wallet is ready. Send, receive, and manage your Bitcoin from one app. Enjoy!') }}
+              </p>
+            </div>
+          </q-carousel-slide>
+        </template>
+      </q-carousel>
+
+      <!-- Dots -->
+      <div class="wizard-dots">
+        <span
+          v-for="step in activeSlides"
+          :key="step"
+          class="dot"
+          :class="{ active: currentSlide === step }"
+          @click="currentSlide = step"
+        />
+      </div>
+
+      <!-- Navigation -->
+      <div class="wizard-nav">
+        <!-- Last core slide: two buttons (Spark mode only) -->
+        <template v-if="currentSlide === 'savings' && !showExtended && isSparkMode">
+          <q-btn
+            unelevated
+            no-caps
+            :label="$t('Let\'s go!')"
+            @click="goToWallet"
+            class="wizard-btn"
+            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
+          />
+          <q-btn
+            flat
+            no-caps
+            :label="$t('Tell me more')"
+            @click="expandWizard"
+            class="wizard-btn-secondary"
+          />
+        </template>
+
+        <!-- Notifications slide: our explanation is above, so this button is
+             the one that raises the OS dialog. Either answer moves on; nothing
+             else in the app depends on it. -->
+        <template v-else-if="currentSlide === 'notifications' && !notificationsAnswered">
+          <q-btn
+            unelevated
+            no-caps
+            :label="$t('Turn on')"
+            :loading="askingNotifications"
+            @click="turnOnNotifications"
+            class="wizard-btn"
+            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
+          />
+          <q-btn
+            flat
+            no-caps
+            :label="$t('Not now')"
+            @click="skipNotifications"
+            class="wizard-btn-secondary"
+          />
+        </template>
+
+        <!-- Final extended slide -->
+        <template v-else-if="currentSlide === lastSlide">
+          <q-btn
+            unelevated
+            no-caps
+            :label="$t('Let\'s go!')"
+            @click="goToWallet"
+            class="wizard-btn"
+            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
+          />
+        </template>
+
+        <!-- All other slides -->
+        <template v-else>
+          <q-btn
+            unelevated
+            no-caps
+            :label="$t('Next')"
+            @click="nextSlide"
+            class="wizard-btn"
+            :class="$q.dark.isActive ? 'dialog_add_btn_dark' : 'dialog_add_btn_light'"
+          />
+        </template>
+      </div>
+    </div>
+  </q-page>
+</template>
+
+<script>
+/**
+ * Wizard modes:
+ *   'spark'      — Full Spark onboarding (3 Spark screens + "Tell me more" gate + all features)
+ *   'nwc-lnbits' — NWC / LNbits onboarding (features only, no Spark-specific screens)
+ *
+ * Query params:
+ *   ?mode=nwc-lnbits  — triggers the non-Spark flow
+ *   ?mode=arkade       — Arkade onboarding (single wallet, seed-based)
+ *   ?full=true         — shows all screens immediately (used by Settings "Onboarding Guide")
+ */
+
+import ArkadeLogo from '../components/ArkadeLogo.vue'
+import BackupKeyring from '../components/BackupKeyring.vue'
+import { useNotificationsStore } from '../stores/notifications'
+
+// Spark-only intro screens (the wallet, more wallets, savings)
+const SPARK_INTRO = ['spark-wallet', 'spark-wallets', 'savings']
+
+// All feature screens (shown after Spark intro or standalone for NWC/LNbits)
+const ALL_FEATURES = [
+  'send-receive', 'notifications', 'nfc', 'transfer', 'auto-transfer', 'history',
+  'contacts', 'identity', 'display', 'more-wallets', 'security', 'backup', 'kiosk', 'lessons', 'map', 'ready'
+]
+
+// NWC/LNbits: only features that apply (no internal transfer, auto-transfer, or seed backup)
+const NWC_LNBITS_FEATURES = [
+  'send-receive', 'notifications', 'nfc', 'history', 'contacts', 'identity', 'display', 'more-wallets', 'security', 'lessons', 'map', 'ready'
+]
+
+// Arkade: single self-custodial wallet, seed-based (keep the backup reminder),
+// but no internal-transfer / auto-transfer slides.
+const ARKADE_FEATURES = [
+  'send-receive', 'notifications', 'nfc', 'history', 'contacts', 'identity', 'display', 'more-wallets', 'security', 'backup', 'lessons', 'map', 'ready'
+]
+
+export default {
+  name: 'SparkSuccessWizard',
+  components: { BackupKeyring, ArkadeLogo },
+  setup() {
+    return { notifications: useNotificationsStore() }
+  },
+  data() {
+    const mode = this.$route.query.mode || 'spark'
+    const isArkadeMode = mode === 'arkade'
+    const isSparkMode = mode === 'spark'
+    return {
+      currentSlide: isArkadeMode ? 'arkade-intro' : (isSparkMode ? 'spark-wallet' : 'send-receive'),
+      // Arkade & NWC/LNbits show the full feature tour straight away; Spark
+      // gates it behind "Tell me more" unless ?full=true.
+      showExtended: !isSparkMode || this.$route.query.full === 'true',
+      isSparkMode,
+      isArkadeMode,
+      // Decided once, in created(): the slide must not disappear from under
+      // the user the moment they answer (which is exactly what `canAsk`
+      // stops being true after).
+      showNotificationsSlide: false,
+      notificationsAnswered: false,
+      askingNotifications: false
+    }
+  },
+
+  async created() {
+    await this.notifications.initialize()
+    // Native only — see canAskInSetup. On the web the Settings row carries it.
+    this.showNotificationsSlide = this.notifications.canAskInSetup
+  },
+  computed: {
+    activeSlides() {
+      const slides = this.isArkadeMode
+        ? ['arkade-intro', ...ARKADE_FEATURES]
+        : (!this.isSparkMode
+          ? NWC_LNBITS_FEATURES
+          : (this.showExtended ? [...SPARK_INTRO, ...ALL_FEATURES] : SPARK_INTRO))
+      // Nothing to ask (web, already asked, or the OS has decided): the tour
+      // skips it entirely rather than showing a dead slide.
+      return this.showNotificationsSlide ? slides : slides.filter((slide) => slide !== 'notifications')
+    },
+    lastSlide() {
+      return this.activeSlides[this.activeSlides.length - 1]
+    }
+  },
+  methods: {
+    nextSlide() {
+      const idx = this.activeSlides.indexOf(this.currentSlide)
+      if (idx < this.activeSlides.length - 1) {
+        this.currentSlide = this.activeSlides[idx + 1]
+      }
+    },
+    /** Our explanation has been read; this is the OS dialog. */
+    async turnOnNotifications() {
+      this.askingNotifications = true
+      try {
+        await this.notifications.enable()
+      } finally {
+        this.askingNotifications = false
+        this.notificationsAnswered = true
+      }
+    },
+
+    /** "Not now" is a real answer: we don't ask again on our own. */
+    skipNotifications() {
+      this.notifications.declineForNow()
+      this.notificationsAnswered = true
+      this.nextSlide()
+    },
+
+    expandWizard() {
+      this.showExtended = true
+      this.$nextTick(() => {
+        this.currentSlide = ALL_FEATURES[0]
+      })
+    },
+    goToWallet() {
+      this.$router.replace('/wallet')
+    }
+  }
+}
+</script>
+
+<style scoped>
+/* padding-top: 0 cancels the global `.q-page { padding-top: var(--safe-top) }`
+   in app.css — .wizard-container below is already a full viewport tall, so
+   inheriting that pad makes the page taller than the screen and pushes the nav
+   buttons behind the system bar. .wizard-topbar takes the inset instead. */
+.wizard-page {
+  min-height: 100dvh;
+  padding-top: 0;
+  display: flex;
+  justify-content: center;
+}
+
+.bg-dark { background: var(--bg-primary); }
+.bg-light { background: var(--bg-primary); }
+
+.wizard-container {
+  width: 100%;
+  max-width: 420px;
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* ── Top bar ── */
+.wizard-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(16px + var(--safe-top, 0px)) 20px 0;
+  flex-shrink: 0;
+}
+
+.wizard-logo-img {
+  height: 30px;
+  width: auto;
+  display: block;
+}
+
+.skip-btn {
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+/* ── Carousel (fills all space between topbar and footer) ── */
+.wizard-carousel {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  background: transparent !important;
+}
+
+.wizard-slide {
+  padding: 0;
+}
+
+.slide-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  height: 100%;
+  padding: 0 24px;
+}
+
+/* ── Illustration ── */
+.slide-illustration {
+  width: 90%;
+  max-width: 380px;
+  max-height: 42vh;
+  object-fit: contain;
+  margin-top: auto;
+  margin-bottom: 0;
+  flex-shrink: 1;
+}
+
+/* Spacer between illustration and text */
+.slide-title {
+  font-family: 'Manrope', sans-serif;
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.2;
+  margin: 40px 0 8px 0;
+  flex-shrink: 0;
+}
+
+.slide-text {
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 400;
+  line-height: 1.55;
+  margin: 0 0 auto 0;
+  max-width: 310px;
+  flex-shrink: 0;
+}
+
+/* ── Dot indicators ── */
+.wizard-dots {
+  display: flex;
+  justify-content: center;
+  gap: 6px;
+  padding: 12px 20px;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  transition: all 300ms cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+}
+
+body.body--light .dot {
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.dot.active {
+  width: 24px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #059573, #15DE72);
+}
+
+/* ── Navigation buttons ── */
+.wizard-nav {
+  padding: 0 20px 24px;
+  padding-bottom: max(24px, var(--safe-bottom, 16px));
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.wizard-btn {
+  width: 100%;
+  padding: 14px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 16px;
+  font-weight: 600;
+  border-radius: 16px;
+}
+
+.wizard-btn-secondary {
+  width: 100%;
+  padding: 10px;
+  font-family: 'Manrope', sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-muted);
+  border-radius: 12px;
+}
+
+.wizard-btn-secondary:hover {
+  color: var(--text-primary);
+}
+
+/* ── Responsive ── */
+@media (max-height: 700px) {
+  .slide-illustration {
+    max-height: 32vh;
+  }
+  .slide-title { font-size: 20px; margin-top: 20px; }
+  .slide-text { font-size: 13px; }
+  .wizard-dots { padding: 8px 20px; }
+  .wizard-nav { padding-bottom: max(16px, var(--safe-bottom, 16px)); }
+}
+
+@media (max-width: 380px) {
+  .slide-illustration { width: 85%; }
+  .slide-title { font-size: 20px; }
+  .slide-text { font-size: 14px; }
+}
+.wizard-backup-types { display: flex; gap: 12px; justify-content: center; margin: 0 0 20px; }
+.wizard-backup-types span { padding: 8px 18px; border: 1px solid var(--border-card); border-radius: 12px; color: var(--text-primary); }
+</style>

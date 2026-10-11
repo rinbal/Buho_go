@@ -19,109 +19,101 @@
       </q-input>
     </div>
 
-    <!-- Entries List (sectioned: Favorites + Other Contacts) -->
+    <!-- The payee list: a quick-pay shelf of recent recipients, then
+         everyone as split rows — the row opens the contact's page,
+         the capsule Pay button pays. -->
     <div class="entries-container" v-if="filteredEntries.length > 0">
-      <div class="entries-header" :class="$q.dark.isActive ? 'entries-header-dark' : 'entries-header-light'">
-        <span class="entries-count">
-          {{ filteredEntries.length }} {{ $t('contact') }}{{ filteredEntries.length !== 1 ? 's' : '' }}
-        </span>
-        <q-btn
-          flat
-          dense
-          no-caps
-          :label="$t('Clear All')"
-          @click="showClearAllDialog"
-          class="clear-all-btn"
-          :class="$q.dark.isActive ? 'clear-all-btn-dark' : 'clear-all-btn-light'"
-          size="sm"
-          v-if="entries.length > 0"
-        />
-      </div>
+      <q-scroll-area class="entries-scroll">
+        <div class="entries-list">
+          <!-- The Quick pay shelf: a swipeable strip of the last people
+               actually paid. No per-bubble verb — the section title
+               carries it for the whole shelf. The shelf bleeds to the
+               screen edge so the next bubble peeks, which is the swipe
+               affordance. Hidden while searching: the search is about
+               the list below. -->
+          <!-- Strangers who wrote to you: one quiet row, only while there
+               are any. The requests live in the Messages sheet. -->
+          <button
+            v-if="requestCount > 0 && !searchQuery"
+            type="button"
+            class="msg-requests"
+            @click="openRequests"
+          >
+            <span class="msg-requests-label">{{ $t('Message requests') }}</span>
+            <span class="msg-requests-count" aria-hidden="true">{{ requestCount }}</span>
+            <Icon icon="tabler:chevron-right" width="16" height="16" class="msg-requests-chev" />
+          </button>
 
-      <q-scroll-area class="entries-scroll" style="height: calc(100vh - 280px);">
-        <!-- Favorites Section -->
-        <div v-if="filteredFavorites.length > 0">
-          <div class="section-header">
-            <Icon icon="tabler:star-filled" width="16" height="16" style="color: var(--color-green)" />
-            <span class="section-title">{{ $t('Favorites') }}</span>
-            <span class="section-count">{{ filteredFavorites.length }}</span>
-          </div>
-          <div class="entries-list">
+          <template v-if="!searchQuery && recentlyPaidEntries.length > 0">
+            <div class="sec-label">{{ $t('Quick pay') }}</div>
+            <div class="quickpay-shelf">
+              <button
+                v-for="entry in recentlyPaidEntries"
+                :key="'recent-' + entry.id"
+                type="button"
+                class="quickpay-bubble"
+                :aria-label="$t('Pay {name}', { name: entry.name })"
+                @click="payContact(entry)"
+              >
+                <ContactAvatar class="quickpay-avatar" :entry="entry" />
+                <span>{{ entry.name }}</span>
+              </button>
+            </div>
+          </template>
+
+          <div class="sec-label">{{ $t('Contacts') }}</div>
+          <div class="payee-rows">
             <AddressBookEntry
-              v-for="entry in filteredFavorites"
+              v-for="entry in sortedEntries"
               :key="entry.id"
               :entry="entry"
-              @edit="editEntry"
-              @delete="confirmDeleteEntry"
-              @change-color="changeEntryColor"
+              :unread="unreadOf(entry)"
               @pay="payContact"
-              @toggle-favorite="toggleFavorite"
-              @copy-address="copyAddress"
+              @open="openContact"
             />
           </div>
-        </div>
 
-        <!-- Other Contacts Section -->
-        <div v-if="filteredNonFavorites.length > 0">
-          <div class="section-header">
-            <Icon icon="tabler:star" width="16" height="16" style="color: var(--color-green)" />
-            <span class="section-title">{{ $t('Other Contacts') }}</span>
-            <span class="section-count">{{ filteredNonFavorites.length }}</span>
-          </div>
-          <div class="entries-list">
-            <AddressBookEntry
-              v-for="entry in filteredNonFavorites"
-              :key="entry.id"
-              :entry="entry"
-              @edit="editEntry"
-              @delete="confirmDeleteEntry"
-              @change-color="changeEntryColor"
-              @pay="payContact"
-              @toggle-favorite="toggleFavorite"
-              @copy-address="copyAddress"
-            />
+          <!-- One count, once — and the reminder that contact lists are
+               scoped to the identity they were saved with. -->
+          <div class="count-foot">
+            {{ filteredEntries.length === 1
+              ? $t('1 contact · saved with your identity')
+              : $t('{n} contacts · saved with your identity', { n: filteredEntries.length }) }}
           </div>
         </div>
       </q-scroll-area>
     </div>
 
     <!-- Empty State -->
-    <div v-else-if="searchQuery && entries.length > 0" class="empty-search"
-         :class="$q.dark.isActive ? 'empty_state_dark' : 'empty_state_light'">
-      <Icon icon="tabler:search" :style="{ fontSize: '3rem', color: $q.dark.isActive ? '#B0B0B0' : '#D1D5DB' }" />
-      <div class="empty-title" :class="$q.dark.isActive ? 'empty_title_dark' : 'empty_title_light'">
+    <div v-else-if="searchQuery && entries.length > 0" class="empty-search empty-state-surface">
+      <Icon icon="tabler:search" class="empty-search-icon" />
+      <div class="empty-title">
         {{ $t('No contacts found') }}
       </div>
-      <div class="empty-subtitle" :class="$q.dark.isActive ? 'empty_subtitle_dark' : 'empty_subtitle_light'">
+      <div class="empty-subtitle">
         {{ $t('Try adjusting your search terms') }}
       </div>
       <q-btn
         flat
         :label="$t('Clear Search')"
         @click="clearSearch"
-        :class="$q.dark.isActive ? 'btn_dark' : 'btn_light'"
+        class="clear-search-btn"
         no-caps
       />
     </div>
 
-    <div v-else class="empty-state full-height" :class="$q.dark.isActive ? 'empty_state_dark' : 'empty_state_light'">
-      <div class="empty-illustration">
-        <svg width="120" height="120" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <circle cx="60" cy="60" r="60" :fill="$q.dark.isActive ? '#2A342A' : '#F3F4F6'"/>
-          <path d="M40 45C40 38.3726 45.3726 33 52 33H68C74.6274 33 80 38.3726 80 45V55C80 61.6274 74.6274 67 68 67H52C45.3726 67 40 61.6274 40 55V45Z" :fill="$q.dark.isActive ? '#15DE72' : '#059573'"/>
-          <circle cx="52" cy="48" r="4" fill="white"/>
-          <circle cx="68" cy="48" r="4" fill="white"/>
-          <path d="M48 58C48 60.2091 49.7909 62 52 62H68C70.2091 62 72 60.2091 72 58V55H48V58Z" fill="white"/>
-          <path d="M35 75H85C87.2091 75 89 76.7909 89 79V85C89 87.2091 87.2091 89 85 89H35C32.7909 89 31 87.2091 31 85V79C31 76.7909 32.7909 75 35 75Z" :fill="$q.dark.isActive ? '#B0B0B0' : '#9CA3AF'"/>
-          <circle cx="40" cy="82" r="3" fill="white"/>
-          <path d="M48 80H75V84H48V80Z" fill="white"/>
-        </svg>
-      </div>
-      <div class="empty-title" :class="$q.dark.isActive ? 'empty_title_dark' : 'empty_title_light'">
+    <div v-else class="empty-state full-height empty-state-surface">
+      <img
+        src="/Onboarding wizard spark/storyset-online-friends-bro.svg"
+        class="empty-illustration-img"
+        alt=""
+        aria-hidden="true"
+      />
+      <div class="empty-title">
         {{ $t('No contacts yet') }}
       </div>
-      <div class="empty-subtitle" :class="$q.dark.isActive ? 'empty_subtitle_dark' : 'empty_subtitle_light'">
-        {{ $t('Add Lightning or Spark contacts to get started') }}
+      <div class="empty-subtitle">
+        {{ $t('Save people you pay often for quick access') }}
       </div>
       <q-btn
         unelevated
@@ -133,100 +125,6 @@
         {{ $t('Add Contact') }}
       </q-btn>
     </div>
-
-    <!-- Color Picker Dialog -->
-    <q-dialog v-model="showColorPicker">
-      <q-card class="color-picker-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section>
-          <div class="color-picker-title" :class="$q.dark.isActive ? 'dialog_title_dark' : 'dialog_title_light'">
-            {{ $t('Choose Color for {name}', { name: selectedEntry?.name || '' }) }}
-          </div>
-        </q-card-section>
-
-        <q-card-section class="color-grid">
-          <div
-            v-for="color in colorPalette"
-            :key="color"
-            class="color-option"
-            :class="{ 'selected': selectedEntry?.color === color }"
-            :style="{ backgroundColor: color }"
-            @click="updateEntryColor(color)"
-          >
-            <Icon
-              v-if="selectedEntry?.color === color"
-              icon="tabler:check"
-              class="color-check"
-            />
-          </div>
-        </q-card-section>
-      </q-card>
-    </q-dialog>
-
-    <!-- Delete Confirmation Dialog -->
-    <q-dialog v-model="showDeleteDialog" :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'">
-      <q-card class="delete-confirm-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section class="delete-header">
-          <div class="delete-icon-wrapper">
-            <Icon icon="tabler:trash" width="32" height="32" class="delete-icon"/>
-          </div>
-          <div class="delete-title">{{ $t('Delete Contact') }}</div>
-          <div class="delete-message" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
-            {{ $t('Are you sure you want to delete') }} <strong>{{ entryToDelete?.name }}</strong>{{ $t('?') }}
-          </div>
-        </q-card-section>
-
-        <q-card-actions class="delete-actions">
-          <q-btn
-            flat
-            no-caps
-            :label="$t('Cancel')"
-            @click="showDeleteDialog = false"
-            class="cancel-btn"
-            :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-6'"
-          />
-          <q-btn
-            unelevated
-            no-caps
-            :label="$t('Delete')"
-            @click="executeDeleteEntry"
-            class="delete-action-btn"
-          />
-        </q-card-actions>
-      </q-card>
-    </q-dialog>
-
-    <!-- Clear All Confirmation Dialog -->
-    <q-dialog v-model="showClearAllConfirmDialog" :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'">
-      <q-card class="delete-confirm-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
-        <q-card-section class="delete-header">
-          <div class="delete-icon-wrapper">
-            <Icon icon="tabler:alert-triangle" width="32" height="32" class="delete-icon"/>
-          </div>
-          <div class="delete-title">{{ $t('Clear All Contacts') }}</div>
-          <div class="delete-message" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
-            {{ $t('This will permanently delete all your contacts. This action cannot be undone.') }}
-          </div>
-        </q-card-section>
-
-        <q-card-actions class="delete-actions">
-          <q-btn
-            flat
-            no-caps
-            :label="$t('Cancel')"
-            @click="showClearAllConfirmDialog = false"
-            class="cancel-btn"
-            :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-6'"
-          />
-          <q-btn
-            unelevated
-            no-caps
-            :label="$t('Clear All')"
-            @click="executeClearAll"
-            class="delete-action-btn"
-          />
-        </q-card-actions>
-      </q-card>
-    </q-dialog>
   </div>
 </template>
 
@@ -234,156 +132,63 @@
 import { useAddressBookStore } from '../../stores/addressBook'
 import { mapState, mapActions } from 'pinia'
 import AddressBookEntry from './AddressBookEntry.vue'
+import ContactAvatar from './ContactAvatar.vue'
+import { Icon } from '@iconify/vue'
+import { useChatRuntime } from '../../composables/useChatRuntime'
+import { useMessagesStore } from '../../stores/messages'
 
 export default {
   name: 'AddressBookList',
   components: {
-    AddressBookEntry
+    AddressBookEntry,
+    ContactAvatar,
+    Icon
   },
-  emits: ['add-contact', 'edit-contact', 'pay-contact'],
-  data() {
-    return {
-      showColorPicker: false,
-      selectedEntry: null,
-      showDeleteDialog: false,
-      entryToDelete: null,
-      showClearAllConfirmDialog: false
-    }
+  emits: ['add-contact', 'pay-contact', 'open-contact'],
+  setup() {
+    return { chatAvailable: useChatRuntime().available, messages: useMessagesStore() }
   },
   computed: {
+    /** Threads from people who are not contacts; 0 while the chat is off. */
+    requestCount() {
+      return this.chatAvailable ? this.messages.unknownThreads.length : 0
+    },
+
     ...mapState(useAddressBookStore, [
       'entries',
       'filteredEntries',
       'searchQuery',
-      'colorPalette'
+      'recentlyPaidEntries'
     ]),
 
-    filteredFavorites() {
-      return this.filteredEntries.filter(entry => entry.isFavorite)
-    },
-
-    filteredNonFavorites() {
-      return this.filteredEntries.filter(entry => !entry.isFavorite)
+    /** Favorites first, then the rest — the star keeps its meaning. */
+    sortedEntries() {
+      return [...this.filteredEntries].sort(
+        (a, b) => (b.isFavorite ? 1 : 0) - (a.isFavorite ? 1 : 0)
+      )
     }
   },
   methods: {
     ...mapActions(useAddressBookStore, [
       'setSearchQuery',
-      'clearSearch',
-      'deleteEntry',
-      'updateEntry',
-      'clearAll'
+      'clearSearch'
     ]),
 
-    async toggleFavorite(entry) {
-      const store = useAddressBookStore()
-      await store.toggleFavorite(entry.id)
+    /** Unread chat messages of a contact; only Nostr contacts have a chat. */
+    unreadOf(entry) {
+      return this.chatAvailable && entry.nostr_pubkey ? this.messages.unreadFor(entry.nostr_pubkey) : 0
     },
 
-    editEntry(entry) {
-      this.$emit('edit-contact', entry)
+    openRequests() {
+      this.$router.push({ path: '/identity', query: { sheet: 'messages' } })
     },
 
     payContact(entry) {
       this.$emit('pay-contact', entry)
     },
 
-    copyAddress(entry) {
-      const address = entry.address || entry.lightningAddress || ''
-      if (address) {
-        navigator.clipboard.writeText(address).then(() => {
-          this.$q.notify({
-            type: 'positive',
-            message: this.$t('Address copied'),
-            timeout: 2000
-          })
-        }).catch(() => {
-          this.$q.notify({
-            type: 'negative',
-            message: this.$t('Couldn\'t copy'),
-          })
-        })
-      }
-    },
-
-    confirmDeleteEntry(entry) {
-      this.entryToDelete = entry
-      this.showDeleteDialog = true
-    },
-
-    async executeDeleteEntry() {
-      if (!this.entryToDelete) return
-      try {
-        await this.deleteEntry(this.entryToDelete.id)
-        this.showDeleteDialog = false
-        this.entryToDelete = null
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Contact removed'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        })
-      } catch (error) {
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Couldn\'t delete contact'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        })
-      }
-    },
-
-    changeEntryColor(entry) {
-      this.selectedEntry = entry
-      this.showColorPicker = true
-    },
-
-    async updateEntryColor(color) {
-      if (!this.selectedEntry) return
-
-      try {
-        await this.updateEntry(this.selectedEntry.id, { color })
-        this.showColorPicker = false
-        this.selectedEntry = null
-
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Color updated'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        })
-      } catch (error) {
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Couldn\'t update color'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        })
-      }
-    },
-
-    showClearAllDialog() {
-      this.showClearAllConfirmDialog = true
-    },
-
-    async executeClearAll() {
-      try {
-        await this.clearAll()
-        this.showClearAllConfirmDialog = false
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Contacts cleared'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        })
-      } catch (error) {
-        this.$q.notify({
-          type: 'negative',
-          message: this.$t('Couldn\'t clear contacts'),
-
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-        })
-      }
+    openContact(entry) {
+      this.$emit('open-contact', entry)
     }
   }
 }
@@ -394,103 +199,149 @@ export default {
   height: 100%;
   display: flex;
   flex-direction: column;
+  min-height: 0;
 }
 
 .search-section {
-  padding: 1rem;
+  padding: 1rem 1rem 0.25rem;
+  flex: 0 0 auto;
 }
 
 .entries-container {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
 
-.entries-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 0.5rem 1rem;
-}
-
-.entries-header-dark {
-  color: #666;
-}
-
-.entries-header-light {
-  color: #9CA3AF;
-}
-
-.entries-count {
-  font-family: 'Manrope', sans-serif;
-  font-size: 12px;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.02em;
-}
-
-.clear-all-btn {
-  font-family: 'Manrope', sans-serif;
-  font-size: 12px;
-  font-weight: 500;
-  border-radius: 20px;
-  padding: 4px 12px;
-}
-
-.clear-all-btn-dark {
-  color: #EF4444;
-  border: 1px solid rgba(239, 68, 68, 0.3);
-}
-
-.clear-all-btn-light {
-  color: #DC2626;
-  border: 1px solid rgba(220, 38, 38, 0.3);
-}
-
-.clear-all-btn-dark:hover {
-  background: rgba(239, 68, 68, 0.15);
-  border-color: rgba(239, 68, 68, 0.5);
-}
-
-.clear-all-btn-light:hover {
-  background: rgba(220, 38, 38, 0.1);
-  border-color: rgba(220, 38, 38, 0.5);
-}
-
 .entries-scroll {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .entries-list {
   padding: 0 1rem 0.5rem;
+  display: flex;
+  flex-direction: column;
 }
 
-/* Section Headers */
-.section-header {
+.sec-label {
+  font-family: 'Manrope', sans-serif;
+  font-size: 10.5px;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 14px 2px 8px;
+}
+
+/* The Quick pay shelf: horizontal, snap-scrolled, scrollbarless. It
+   bleeds past the content padding so a partial bubble peeks at the
+   screen edge — the swipe affordance, no chrome needed. */
+.quickpay-shelf {
+  display: flex;
+  gap: 16px;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  margin: 0 -1rem;
+  padding: 2px 1rem 6px;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+}
+
+.quickpay-shelf::-webkit-scrollbar {
+  display: none;
+}
+
+.quickpay-bubble {
+  scroll-snap-align: start;
+  flex: 0 0 auto;
+  width: 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  border: 0;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-family: 'Manrope', sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.quickpay-bubble:active .quickpay-avatar {
+  transform: scale(0.93);
+}
+
+.quickpay-avatar {
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  overflow: hidden;
+  transition: transform 0.12s ease;
+}
+
+.quickpay-bubble span {
+  font-size: 11px;
+  font-weight: 650;
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.msg-requests {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 12px 16px 8px;
-}
-
-.section-title {
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-primary);
-  font-family: 'Manrope', sans-serif;
-}
-
-.section-count {
+  width: 100%;
+  min-height: 44px;
+  margin-top: 10px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 12px;
   background: var(--bg-input);
   color: var(--text-secondary);
-  font-size: 12px;
-  font-weight: 500;
-  padding: 2px 8px;
-  border-radius: 999px;
   font-family: 'Manrope', sans-serif;
+  font-size: 0.8125rem;
+  font-weight: 650;
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
 }
 
-/* Empty States */
+.msg-requests-label { flex: 1; min-width: 0; }
+
+.msg-requests-count {
+  min-width: 20px;
+  height: 18px;
+  padding: 0 6px;
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: var(--text-muted);
+  color: var(--bg-primary);
+  font: 800 10px/1 'Manrope', sans-serif;
+}
+
+.payee-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.count-foot {
+  text-align: center;
+  font-family: 'Manrope', sans-serif;
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 16px 0 10px;
+}
+
+/* Empty States — single CSS-variable-driven classes replace the old
+   dark/light pairs (the dark variant hardcoded #0C0C0C/#F6F6F6/#B0B0B0
+   instead of using theme tokens). */
 .empty-state,
 .empty-search {
   display: flex;
@@ -502,37 +353,34 @@ export default {
   padding: 2rem;
 }
 
-.empty_state_dark {
-  background: #0C0C0C;
+.empty-state-surface {
+  background: var(--bg-primary);
 }
 
-.empty_state_light {
-  background: white;
+.empty-illustration-img {
+  width: 100%;
+  max-width: 180px;
+  height: auto;
+  margin-bottom: 1.25rem;
+  user-select: none;
+  pointer-events: none;
 }
 
-.empty-illustration {
-  margin-bottom: 2rem;
-  opacity: 0.8;
+.empty-search-icon {
+  font-size: 3rem;
+  color: var(--text-muted);
 }
 
-.empty_title_dark {
+.empty-title {
   font-size: 1.25rem;
   font-weight: 600;
-  color: #F6F6F6;
+  color: var(--text-primary);
   margin-bottom: 0.5rem;
   font-family: 'Manrope', sans-serif;
 }
 
-.empty_title_light {
-  font-size: 1.25rem;
-  font-weight: 600;
-  color: #212121;
-  margin-bottom: 0.5rem;
-  font-family: 'Manrope', sans-serif;
-}
-
-.empty_subtitle_dark {
-  color: #B0B0B0;
+.empty-subtitle {
+  color: var(--text-secondary);
   font-size: 0.875rem;
   margin-bottom: 1.5rem;
   font-family: 'Manrope', sans-serif;
@@ -540,60 +388,54 @@ export default {
   line-height: 1.4;
 }
 
-.empty_subtitle_light {
-  color: #6B7280;
-  font-size: 0.875rem;
-  margin-bottom: 1.5rem;
-  font-family: 'Manrope', sans-serif;
-  max-width: 280px;
-  line-height: 1.4;
-}
-
-/* Secondary Buttons */
-.btn_dark {
+/* Secondary Button — "Clear Search" */
+.clear-search-btn {
   border-radius: 20px !important;
-  border: 1px solid #2A382A !important;
-  background: rgba(255, 255, 255, 0.05) !important;
-  color: #FFF !important;
+  border: 1px solid var(--border-card) !important;
+  background: var(--bg-input) !important;
+  color: var(--text-primary) !important;
   font-family: 'Manrope', sans-serif !important;
   font-size: 14px !important;
   font-weight: 500 !important;
 }
 
-.btn_light {
-  border-radius: 20px !important;
-  border: 1px solid #E8E8E8 !important;
-  background: #F6F6F6 !important;
-  color: #212121 !important;
+/* Empty-state Add Contact — unified neutral translucent treatment,
+   identical to the header Add Contact pill and the Copy/Share
+   buttons in the receive flow. No greens; the plus icon carries
+   the intent. */
+.dialog_add_btn_dark,
+.dialog_add_btn_light {
+  border-radius: 10px !important;
+  padding: 10px 18px !important;
   font-family: 'Manrope', sans-serif !important;
   font-size: 14px !important;
   font-weight: 500 !important;
+  letter-spacing: -0.005em !important;
+  transition: background-color 0.18s ease, color 0.18s ease !important;
 }
 
-/* Primary Action Buttons */
 .dialog_add_btn_dark {
-  border-radius: 24px !important;
-  background: linear-gradient(135deg, #15DE72, #059573) !important;
-  color: #0C0C0C !important;
-  font-weight: 600 !important;
-  box-shadow: 0px 4px 8px 0px rgba(61, 61, 61, 0.25) !important;
-  font-family: 'Manrope', sans-serif !important;
+  background: rgba(255, 255, 255, 0.08) !important;
+  color: rgba(255, 255, 255, 0.85) !important;
+}
+
+.dialog_add_btn_dark:hover {
+  background: rgba(255, 255, 255, 0.12) !important;
 }
 
 .dialog_add_btn_light {
-  border-radius: 24px !important;
-  background: linear-gradient(135deg, #15DE72, #059573) !important;
-  color: #0C0C0C !important;
-  font-weight: 600 !important;
-  box-shadow: 0px 4px 8px 0px rgba(159, 159, 159, 0.25) !important;
-  font-family: 'Manrope', sans-serif !important;
+  background: rgba(0, 0, 0, 0.05) !important;
+  color: rgba(0, 0, 0, 0.75) !important;
+}
+
+.dialog_add_btn_light:hover {
+  background: rgba(0, 0, 0, 0.08) !important;
 }
 
 /* Responsive Design */
 @media (max-width: 480px) {
-  .search-section,
-  .entries-header {
-    padding: 0.75rem;
+  .search-section {
+    padding: 0.75rem 0.75rem 0.25rem;
   }
 
   .entries-list {
@@ -606,155 +448,17 @@ export default {
     height: 50vh;
   }
 
-  .empty-illustration svg {
-    width: 80px;
-    height: 80px;
+  .empty-illustration-img {
+    max-width: 140px;
   }
 
-  .empty_title_dark,
-  .empty_title_light {
+  .empty-title {
     font-size: 1.125rem;
   }
 
-  .empty_subtitle_dark,
-  .empty_subtitle_light {
+  .empty-subtitle {
     font-size: 0.8125rem;
     max-width: 240px;
   }
-
-  .color-grid {
-    grid-template-columns: repeat(3, 1fr);
-    gap: 0.75rem;
-  }
-
-  .color-option {
-    width: 40px;
-    height: 40px;
-  }
-
-  .section-header {
-    padding: 10px 12px 6px;
-  }
-}
-
-/* Color Picker */
-.color-picker-card {
-  width: 100%;
-  max-width: 320px;
-  border-radius: 16px;
-}
-
-.color-picker-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 16px;
-  text-align: center;
-}
-
-.color-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr);
-  gap: 1rem;
-  padding: 1rem;
-}
-
-.color-option {
-  width: 48px;
-  height: 48px;
-  border-radius: 50%;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
-}
-
-.color-option:hover {
-  transform: scale(1.1);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
-}
-
-.color-option.selected {
-  transform: scale(1.1);
-  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.3);
-}
-
-.color-check {
-  color: white;
-  font-size: 20px;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3);
-}
-
-/* Delete Confirmation Dialog */
-.delete-confirm-card {
-  width: 100%;
-  max-width: 340px;
-  border-radius: 16px;
-}
-
-.delete-header {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  padding: 1.5rem 1.5rem 0.5rem;
-}
-
-.delete-icon-wrapper {
-  width: 56px;
-  height: 56px;
-  border-radius: 50%;
-  background: rgba(249, 115, 22, 0.12);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  margin-bottom: 1rem;
-}
-
-.delete-icon {
-  color: #F97316;
-}
-
-.delete-title {
-  font-family: 'Manrope', sans-serif;
-  font-size: 18px;
-  font-weight: 700;
-  color: #F97316;
-  margin-bottom: 0.5rem;
-}
-
-.delete-message {
-  font-family: 'Manrope', sans-serif;
-  font-size: 14px;
-  line-height: 1.5;
-}
-
-.delete-message strong {
-  color: #F97316;
-}
-
-.delete-actions {
-  padding: 0.5rem 1.5rem 1.5rem;
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.5rem;
-}
-
-.cancel-btn {
-  font-family: 'Manrope', sans-serif;
-  font-weight: 500;
-  border-radius: 10px;
-}
-
-.delete-action-btn {
-  font-family: 'Manrope', sans-serif;
-  font-weight: 600;
-  border-radius: 10px;
-  background: linear-gradient(135deg, #F97316, #EA580C) !important;
-  color: white !important;
-}
-
-.delete-action-btn:disabled {
-  opacity: 0.4;
 }
 </style>

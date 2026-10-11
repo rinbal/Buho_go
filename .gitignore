@@ -2,10 +2,23 @@
 .thumbs.db
 node_modules
 
+# Local build scripts
+/build-release.sh
+/build-signed-release.sh
+
 # LLM Stuff
 /.claude
+/TX_METADATA_RESEARCH.md
+screenshots
+/RELEASE_NOTES_v*.md
+/STANDARD_RELEASE_NOTES_PROMPT.md
+/Release_Notes
 /Plans WIP
+/Articels
 /cloud_backup.md
+/audit
+/playwright.config.mjs
+.playwright-mcp
 
 # Quasar core related directories
 .quasar
@@ -38,3 +51,12 @@ yarn-error.log*
 .env.local*
 .env
 /CLAUDE.md
+
+# Local map dev screenshots / Playwright artifacts
+map-phase*.png
+.playwright-mcp/
+
+# Stray screenshot drops (German "Bildschirmfoto" / English "Screenshot")
+Bildschirmfoto*.png
+Screenshot*.png
+/*.png

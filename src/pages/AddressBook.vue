@@ -1,30 +1,111 @@
 <template>
-  <q-page :class="$q.dark.isActive ? 'address-book-page-dark' : 'address-book-page-light'">
-    <!-- Header -->
-    <div class="page-header" :class="$q.dark.isActive ? 'page_header_dark' : 'page_header_light'">
+  <q-page class="address-book-page">
+    <!-- Header — same grid-centered, inset-owning visual language as
+         SettingsHubHeader (Identity/Spend/Settings), adapted for a
+         drill-down page: a back chevron instead of the hub's Home icon,
+         since Address Book is reached via push from several places, not
+         a hub tab on the bottom nav. -->
+    <div class="page-header">
       <q-btn
         flat
         round
         dense
+        class="header-side-btn back-btn"
+        :aria-label="$t('Back')"
         @click="$router.back()"
-        :class="$q.dark.isActive ? 'back_btn_dark' : 'back_btn_light'"
       >
-        <Icon icon="tabler:chevron-left" width="18" height="18" />
+        <Icon icon="tabler:chevron-left" width="20" height="20" />
       </q-btn>
-      <div class="header-title" :class="$q.dark.isActive ? 'main_page_title_dark' : 'main_page_title_light'">
+
+      <div class="header-title">
         {{ $t('Address Book') }}
       </div>
-      <q-btn no-caps unelevated class="add-contact-pill-btn" @click="showAddModal">
-        {{ $t('Add Contact') }}
-      </q-btn>
+
+      <div class="header-actions">
+        <!-- Power-user overflow. The only thing here is "restore from
+             Nostr" — every other sync action is automatic (publish on
+             change, recover on identity restore). Rarely tapped, so it
+             sits in the quiet slot next to the title rather than
+             competing with Add Contact for attention. -->
+        <q-btn
+          flat
+          round
+          dense
+          class="header-side-btn overflow-btn"
+          :aria-label="$t('More options')"
+          data-audit="address-book-menu"
+        >
+          <Icon icon="tabler:dots-vertical" width="18" height="18" />
+          <q-menu
+            anchor="bottom right"
+            self="top right"
+            :class="$q.dark.isActive ? 'overflow-menu-dark' : 'overflow-menu-light'"
+          >
+            <q-list style="min-width: 220px">
+              <q-item clickable v-close-popup @click="runRecovery" :disable="isRecovering">
+                <q-item-section avatar style="min-width: 32px;">
+                  <Icon
+                    :icon="isRecovering ? 'tabler:loader-2' : 'tabler:cloud-download'"
+                    width="16"
+                    height="16"
+                    :class="{ 'ab-spin': isRecovering }"
+                    style="color: var(--text-secondary)"
+                  />
+                </q-item-section>
+                <q-item-section>
+                  <q-item-label :class="$q.dark.isActive ? 'menu-label-dark' : 'menu-label-light'">
+                    {{ $t('Restore contacts from Nostr') }}
+                  </q-item-label>
+                  <q-item-label caption>
+                    {{ $t('Pull contacts you saved on another device') }}
+                  </q-item-label>
+                </q-item-section>
+              </q-item>
+
+              <!-- Destructive, so it lives here behind its confirm rather
+                   than as a standing button in the list header. -->
+              <q-item
+                v-if="entries.length > 0"
+                clickable
+                v-close-popup
+                @click="showClearAllConfirmDialog = true"
+              >
+                <q-item-section avatar style="min-width: 32px;">
+                  <Icon icon="tabler:trash" width="16" height="16" style="color: #EF4444" />
+                </q-item-section>
+                <q-item-section>
+                  <q-item-label style="color: #EF4444;">
+                    {{ $t('Clear All') }}
+                  </q-item-label>
+                </q-item-section>
+              </q-item>
+            </q-list>
+          </q-menu>
+        </q-btn>
+
+        <!-- Add Contact — the primary action on this page, so it gets
+             its own visual presence (tinted brand-green circle) instead
+             of matching the neutral overflow button. Placed last/right
+             so it lands in the more reachable, more prominent slot. -->
+        <q-btn
+          flat
+          round
+          dense
+          class="add-contact-btn"
+          :aria-label="$t('Add Contact')"
+          @click="showAddModal"
+        >
+          <Icon icon="tabler:plus" width="20" height="20" />
+        </q-btn>
+      </div>
     </div>
 
     <!-- Content -->
     <div class="page-content full">
       <AddressBookList
         @add-contact="showAddModal"
-        @edit-contact="showEditModal"
-        @pay-contact="showPaymentModal"
+        @pay-contact="payContact"
+        @open-contact="openContact"
       />
     </div>
 
@@ -32,55 +113,113 @@
     <AddressBookModal
       v-model="showModal"
       :entry="selectedEntry"
+      :initial-address="initialContactAddress"
       @saved="handleEntrySaved"
+      @open-existing="handleOpenExisting"
     />
 
-    <!-- Payment Modal -->
-    <PaymentModal
-      v-model="showPayment"
-      :contact="selectedContact"
-      @payment-sent="handlePaymentSent"
-      @bitcoin-payment-requested="handleBitcoinPaymentRequested"
-    />
+    <!-- Clear All Confirmation -->
+    <q-dialog v-model="showClearAllConfirmDialog" :class="$q.dark.isActive ? 'dialog_dark' : 'dialog_light'">
+      <q-card class="delete-confirm-card" :class="$q.dark.isActive ? 'card_dark_style' : 'card_light_style'">
+        <q-card-section class="delete-header">
+          <div class="delete-icon-wrapper">
+            <Icon icon="tabler:alert-triangle" width="32" height="32" class="delete-icon"/>
+          </div>
+          <div class="delete-title">{{ $t('Clear All Contacts') }}</div>
+          <div class="delete-message" :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'">
+            {{ $t('This will permanently delete all your contacts. This action cannot be undone.') }}
+          </div>
+        </q-card-section>
 
-    <!-- Batch Send Modal -->
-    <BatchSendModal
-      v-model="showBatchSend"
-      @batch-completed="handleBatchCompleted"
-    />
+        <q-card-actions class="delete-actions">
+          <q-btn
+            flat
+            no-caps
+            :label="$t('Cancel')"
+            @click="showClearAllConfirmDialog = false"
+            class="cancel-btn"
+            :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-6'"
+          />
+          <q-btn
+            unelevated
+            no-caps
+            :label="$t('Clear All')"
+            @click="executeClearAll"
+            class="delete-action-btn"
+          />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
+
+    <!-- Identity switcher: each identity owns its own contact list,
+         so the entry point lives here next to the restore action. -->
   </q-page>
 </template>
 
 <script>
 import { useAddressBookStore } from '../stores/addressBook'
-import { mapActions } from 'pinia'
+import { usePayContact } from '../composables/usePayContact'
+import { useChatRuntime } from '../composables/useChatRuntime'
+import { contactTapPath } from '../components/chat/threadRows.js'
+import { useIdentityStore } from '../stores/identity'
+import { useTransactionMetadataStore } from '../stores/transactionMetadata'
+import { mapActions, mapState } from 'pinia'
+
+// Nostr contacts get a quiet re-sync the moment the user reaches for
+// them. Locked decision #2: only on tap, never periodic, so a stale
+// avatar / lud16 corrects itself the next time the user opens the
+// payment flow without ever blocking the tap on a network call.
+
 import AddressBookList from '../components/AddressBook/AddressBookList.vue'
 import AddressBookModal from '../components/AddressBook/AddressBookModal.vue'
-import PaymentModal from '../components/PaymentModal.vue'
-import BatchSendModal from '../components/BatchSendModal.vue'
 
 export default {
   name: 'AddressBookPage',
   components: {
     AddressBookList,
     AddressBookModal,
-    PaymentModal,
-    BatchSendModal
   },
   data() {
     return {
       showModal: false,
       selectedEntry: null,
-      showPayment: false,
-      selectedContact: null,
-      showBatchSend: false
+      showClearAllConfirmDialog: false,
     }
   },
+  setup() {
+    return { chatAvailable: useChatRuntime().available }
+  },
+  computed: {
+    // Surfaced for the kebab's disabled state. `isSyncing` is read by
+    // the status component directly off the store.
+    ...mapState(useAddressBookStore, ['isRecovering', 'syncDirty', 'entries']),
+    creatingFromRoute() {
+      return this.$route.query.action === 'create-contact'
+    },
+    initialContactAddress() {
+      return this.creatingFromRoute && typeof this.$route.query.address === 'string'
+        ? this.$route.query.address : ''
+    },
+  },
+  // Automatic publishing is owned by the app-level driver
+  // (useAddressBookSync) so contacts added from ANY surface sync,
+  // not only while this page is mounted. This page keeps just the
+  // explicit actions: manual sync and kebab restore.
   async created() {
     await this.initializeAddressBook()
+    if (this.creatingFromRoute) this.showAddModal()
+  },
+  watch: {
+    // Also supports opening the form while Address Book is already mounted.
+    creatingFromRoute(value) {
+      if (value) this.showAddModal()
+    },
+    showModal(value) {
+      if (!value) this.clearCreationRoute()
+    },
   },
   methods: {
-    ...mapActions(useAddressBookStore, ['initialize']),
+    ...mapActions(useAddressBookStore, ['initialize', 'recoverFromNostr']),
 
     async initializeAddressBook() {
       try {
@@ -91,9 +230,74 @@ export default {
           type: 'negative',
           message: this.$t('Couldn\'t load contacts'),
 
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         })
       }
+    },
+
+    /**
+     * Pull the user's private address book from Nostr and merge.
+     * Always an explicit action (kebab tap), so it always reports a
+     * result — including the calm "nothing to restore" case so the
+     * user isn't left wondering whether the tap did anything.
+     */
+    async runRecovery() {
+      const identityStore = useIdentityStore()
+      if (!identityStore.bootstrapped) {
+        this.$q.notify({
+          type: 'warning',
+          message: this.$t('No identity yet'),
+          caption: this.$t('Set up or restore your BuhoGO identity first.'),
+          timeout: 4000,
+        })
+        return
+      }
+      const result = await this.recoverFromNostr({ identityStore })
+      if (result === null) {
+        // Another sync (the app-level driver's, usually) is already in
+        // flight — that is busy, not broken.
+        this.$q.notify({
+          type: 'info',
+          message: this.$t('Still finishing the last change'),
+          caption: this.$t('Try again in a moment.'),
+          timeout: 3500,
+        })
+        return
+      }
+      if (!result || result.ok === false) {
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t('Couldn\'t restore contacts'),
+          caption: this.$t('Check your connection and try again.'),
+          timeout: 4000,
+        })
+        return
+      }
+      if (!result.hadRemote) {
+        this.$q.notify({
+          type: 'info',
+          message: this.$t('Nothing to restore'),
+          caption: this.$t('No contacts have been synced from this identity yet.'),
+          timeout: 3500,
+        })
+        return
+      }
+      if (result.restored === 0) {
+        this.$q.notify({
+          type: 'positive',
+          message: this.$t('Contacts already up to date'),
+          timeout: 3000,
+        })
+        return
+      }
+      const caption = result.identityOnly > 0
+        ? this.$t('{n} couldn\'t be restored. They have no Lightning address right now.', { n: result.identityOnly })
+        : undefined
+      this.$q.notify({
+        type: 'positive',
+        message: this.$t('Restored {n} contacts', { n: result.restored }),
+        caption,
+        timeout: 4500,
+      })
     },
 
     showAddModal() {
@@ -101,198 +305,219 @@ export default {
       this.showModal = true
     },
 
-    showEditModal(entry) {
-      this.selectedEntry = entry
-      this.showModal = true
+    /** A row tap: push the contact's own page. */
+    openContact(entry) {
+      // A contact with a Nostr identity opens the chat; the contact page
+      // is one tap away from its header. Everyone else opens it directly.
+      this.$router.push(contactTapPath(entry, this.chatAvailable))
     },
 
-    showPaymentModal(contact) {
-      // Bitcoin contacts need the L1 withdrawal flow - navigate directly to Wallet
-      if (contact.addressType === 'bitcoin') {
-        this.navigateToBitcoinWithdrawal(contact)
-        return
+    async executeClearAll() {
+      try {
+        await useAddressBookStore().clearAll()
+        this.showClearAllConfirmDialog = false
+        this.$q.notify({ type: 'positive', message: this.$t('Contacts cleared') })
+      } catch (error) {
+        this.$q.notify({ type: 'negative', message: this.$t('Couldn\'t clear contacts') })
       }
-
-      // Lightning and Spark contacts use PaymentModal
-      this.selectedContact = contact
-      this.showPayment = true
     },
 
-    navigateToBitcoinWithdrawal(contact) {
-      const address = contact.address || contact.lightningAddress
-      this.$router.push({
-        path: '/wallet',
-        query: {
-          action: 'bitcoin_withdrawal',
-          address: address,
-          contactName: contact.name
-        }
-      })
+    /**
+     * Lives in usePayContact so every surface that pays a contact shares
+     * one flow: the identity-only guard, the silent re-sync, and the
+     * last-used stamp all happen there.
+     */
+    payContact(contact) {
+      usePayContact(this).payContact(contact)
     },
 
-    handleEntrySaved() {
+    async handleEntrySaved(entry) {
       this.selectedEntry = null
-      // Modal will close automatically
+      if (!this.creatingFromRoute || !entry?.id) return
+      // Capture before the modal closes and consumes its route parameters.
+      // Never use the active wallet: it can change while creating a contact.
+      const { transaction, wallet } = this.$route.query
+      if (typeof transaction !== 'string' || !transaction || typeof wallet !== 'string' || !wallet) return
+      try {
+        const metadata = useTransactionMetadataStore()
+        await metadata.initialize()
+        await metadata.setContactForTransaction(transaction, wallet, entry.id)
+      } catch {
+        // The contact is already saved. Keep it; the receipt can assign it
+        // again without creating a duplicate or starting a payment.
+        this.$q.notify({ type: 'negative', message: this.$t('Failed to assign contact') })
+      }
     },
 
-    handlePaymentSent() {
-      this.selectedContact = null
-      this.$q.notify({
-        type: 'positive',
-        message: this.$t('Sent'),
-
-        actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
-      })
+    clearCreationRoute() {
+      if (!this.creatingFromRoute) return
+      const query = { ...this.$route.query }
+      for (const key of ['action', 'address', 'transaction', 'wallet']) delete query[key]
+      // Consume on save OR cancel; a later ordinary add must not inherit the
+      // previous receipt's address or assignment. Back still opens the receipt.
+      this.$router.replace({ query })
     },
 
-    handleBitcoinPaymentRequested(paymentData) {
-      // Fallback handler if PaymentModal is opened with a Bitcoin contact
-      this.selectedContact = null
-      this.navigateToBitcoinWithdrawal({
-        name: paymentData.contact?.name,
-        address: paymentData.address
-      })
+    /**
+     * The search/scan flow surfaced an "Open contact" affordance for
+     * a Nostr profile already in the address book. The modal closes
+     * itself before bubbling this up, so we just need to surface the
+     * existing entry — payment is the most useful next action.
+     */
+    handleOpenExisting(entry) {
+      if (!entry) return
+      if (this.creatingFromRoute) return this.handleEntrySaved(entry)
+      this.payContact(entry)
     },
-
-    handleBatchCompleted(results) {
-      const succeeded = results.filter(r => r.status === 'success').length
-      const failed = results.filter(r => r.status === 'failed' || r.status === 'skipped').length
-
-      this.$q.notify({
-        type: failed === 0 ? 'positive' : 'warning',
-        message: failed === 0
-          ? this.$t('{count} payments sent', { count: succeeded })
-          : this.$t('{sent} sent, {failed} failed', { sent: succeeded, failed }),
-        timeout: 3000
-      })
-    }
   }
 }
 </script>
 
 <style scoped>
-/* Base Page Styles */
-.address-book-page-dark {
+/* Base Page Styles — fixed-height flex column: the screen is laid out
+   once and never overflows the safe viewport. Header is a fixed-size
+   flex row; the content below is the single flex child that scrolls
+   internally (see .page-content). This is the same pattern
+   TransactionHistory.vue uses, and it's what makes the header's own
+   safe-area padding (below) actually correct: a `min-height: 100vh`
+   + `position: sticky` page (the old shape) lets the header grow
+   without the surrounding layout ever re-measuring against that
+   growth, which is exactly how a hardcoded `calc(100vh - Npx)`
+   content height drifts wrong on notched Android devices. Flexbox
+   fills "whatever's left" automatically, so there's no magic number
+   to keep in sync with the header's real height. */
+.address-book-page {
   background: var(--bg-secondary);
-  min-height: 100vh;
-  font-family: 'Manrope', sans-serif;
-  overflow-x: hidden;
-  max-width: 100vw;
-}
-
-.address-book-page-light {
-  background: #F6F6F6;
-  min-height: 100vh;
-  font-family: 'Manrope', sans-serif;
-  overflow-x: hidden;
-  max-width: 100vw;
-}
-
-/* Header Styles */
-.page_header_dark {
+  height: 100vh;
   display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  font-family: 'Manrope', sans-serif;
+  max-width: 100vw;
+  /* The header owns the top safe-area inset (see .page-header), so the
+     global .q-page top padding is cancelled here; the bottom inset
+     clears the gesture nav bar below the scrollable content. */
+  padding-top: 0;
+  padding-bottom: var(--safe-bottom, 0px);
+}
+
+/* Header — same grid-centered, inset-owning shell as SettingsHubHeader
+   (Identity/Spend/Settings): grid instead of flex so the title stays
+   truly centered regardless of how wide either side's controls end up.
+   No `position: sticky` needed — the page itself doesn't scroll (see
+   .address-book-page above), so the header is just the first fixed-size
+   row in that column and stays put without it. */
+.page-header {
+  flex: 0 0 auto;
+  z-index: 100;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
-  padding: 1rem;
+  padding: calc(0.875rem + var(--safe-top, 0px)) 1rem 0.875rem;
   background: var(--bg-primary);
   border-bottom: 1px solid var(--border-card);
-  position: sticky;
-  top: var(--safe-top, 0px);
-  z-index: 100;
 }
 
-.page_header_light {
+.header-title {
+  grid-column: 2;
+  justify-self: center;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: 'Manrope', sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-primary);
+}
+
+.back-btn {
+  grid-column: 1;
+  justify-self: start;
+}
+
+/* Right-side header cluster: overflow (rarely used, quiet neutral
+   style) then Add Contact (primary action, its own tinted presence)
+   — swapped from the old + / kebab order so the more useful action
+   lands in the more reachable, more visually prominent slot. */
+.header-actions {
+  grid-column: 3;
+  justify-self: end;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 1rem;
-  background: white;
-  border-bottom: 1px solid #E5E7EB;
-  position: sticky;
-  top: var(--safe-top, 0px);
-  z-index: 100;
+  gap: 4px;
 }
 
-.back_btn_dark,
-.back_btn_light {
+.header-side-btn {
   width: 40px;
   height: 40px;
   border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: background-color 0.15s ease;
+  color: var(--text-secondary);
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
-.back_btn_dark {
-  color: #F6F6F6;
+.header-side-btn:hover {
+  background: var(--bg-input);
+  color: var(--text-primary);
 }
 
-.back_btn_light {
-  color: #6B7280;
+.overflow-btn {
+  width: 36px;
+  height: 36px;
 }
 
-.back_btn_dark:hover {
-  background: var(--border-card);
+/* Add Contact — soft brand-green tint gives the primary action its
+   own visual weight instead of matching the neutral overflow button
+   (same "quiet tint" language as the rest of the app: wallet-hint,
+   seed-callout, quick-chip.active). */
+.add-contact-btn {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand-accent-soft, rgba(21, 222, 114, 0.14));
+  color: var(--brand-accent, #15DE72);
+  transition: background-color 0.15s ease, transform 0.08s ease;
 }
 
-.back_btn_light:hover {
-  background: #F1F5F9;
+.add-contact-btn:hover {
+  background: rgba(21, 222, 114, 0.22);
 }
 
-.main_page_title_dark {
-  color: #F6F6F6;
-  font-size: 1.25rem;
-  font-weight: 600;
-  flex: 1;
-  text-align: center;
-  font-family: 'Manrope', sans-serif;
+.add-contact-btn:active {
+  transform: scale(0.94);
 }
 
-.main_page_title_light {
-  color: #212121;
-  font-size: 1.25rem;
-  font-weight: 600;
-  flex: 1;
-  text-align: center;
-  font-family: 'Manrope', sans-serif;
+.ab-spin {
+  animation: ab-spin 0.9s linear infinite;
 }
 
-/* Add Contact Pill Button */
-.add-contact-pill-btn {
-  background: var(--gradient-green);
-  color: #FFF;
-  border-radius: 999px;
-  padding: 6px 18px;
-  font-size: 13px;
-  font-weight: 500;
-  font-family: 'Manrope', sans-serif;
+@keyframes ab-spin {
+  to { transform: rotate(360deg); }
 }
 
-/* Content */
+/* Content — the single flex child that fills whatever space the header
+   didn't use, and scrolls internally (AddressBookList owns its own
+   internal q-scroll-area sizing via the same flex-fill chain). */
 .page-content {
-  height: calc(100vh - 80px);
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 /* Responsive Design */
 @media (max-width: 480px) {
-  .page_header_dark,
-  .page_header_light {
-    padding: 0.75rem 1rem;
+  .page-header {
+    padding: calc(0.75rem + var(--safe-top, 0px)) 1rem 0.75rem;
   }
 
-  .main_page_title_dark,
-  .main_page_title_light {
-    font-size: 1.125rem;
-  }
-
-  .page-content {
-    height: calc(100vh - 70px);
-  }
-
-  .add-contact-pill-btn {
-    padding: 5px 14px;
-    font-size: 12px;
+  .header-title {
+    font-size: 14px;
   }
 }
 </style>

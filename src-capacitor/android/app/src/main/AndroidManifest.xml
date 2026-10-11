@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <application
         android:allowBackup="true"
@@ -22,7 +23,168 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
+            <!-- Deep links: Lightning + LNURL URI schemes.
+                 Android matches <data android:scheme> case-sensitively for
+                 NFC- and app-originated intents (browser links get normalized,
+                 NFC tags do not), so every scheme is declared in both lower-
+                 and upper-case. Covers a bare bech32 LNURL wrapped as
+                 `lightning:` or `lnurl:`, plus the LUD-17 `lnurlp://` /
+                 `lnurlw://` (Bolt Card) forms. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="lightning" />
+                <data android:scheme="LIGHTNING" />
+                <data android:scheme="lnurl" />
+                <data android:scheme="LNURL" />
+                <data android:scheme="lnurlp" />
+                <data android:scheme="LNURLP" />
+                <data android:scheme="lnurlw" />
+                <data android:scheme="LNURLW" />
+            </intent-filter>
+
+            <!-- Deep link: bitcoin: (BIP21 on-chain / unified QR). Uppercase
+                 BITCOIN: is common in QR codes (alphanumeric-mode density). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="bitcoin" />
+                <data android:scheme="BITCOIN" />
+            </intent-filter>
+
+            <!-- Deep link: nostr: (NIP-21). The profile-share QR encodes
+                 nostr:npub…, so scanning it with the system camera must
+                 offer BuhoGO — the deep-link handler opens that person's
+                 card, which offers both Pay and Save (issue #301). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="nostr" />
+                <data android:scheme="NOSTR" />
+            </intent-filter>
+
+            <!-- App Link: a shared card link opens the card in BuhoGO.
+                 https://go.mybuho.de/p/<name-or-key>
+
+                 Its own filter, not merged with the schemes above: autoVerify
+                 applies to the whole filter, and a filter that also carries
+                 custom schemes fails verification outright. Scoped to /p/ so
+                 BuhoGO never claims the rest of the site — the web wallet has
+                 to keep opening in a browser.
+
+                 Verification reads
+                 https://go.mybuho.de/.well-known/assetlinks.json and needs the
+                 signing certificate of the INSTALLED build listed there. Add a
+                 fingerprint with the "assetlinks" npm script, then deploy the
+                 web build; until the deployed file lists it, these links keep
+                 opening in the browser and nothing reports an error. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="go.mybuho.de" android:pathPrefix="/p/" />
+            </intent-filter>
+
+            <!-- MainActivity itself deliberately declares NO NFC intent
+                 filters: it is the launcher / deep-link activity, and NFC
+                 system dispatch is owned exclusively by NfcDispatchActivity
+                 below. While BuhoGO is in the foreground, reader mode in
+                 MainActivity owns the NFC field instead (system dispatch
+                 never runs), keeping the robust in-app Ndef + IsoDep
+                 fallback read path. -->
+
         </activity>
+
+        <!-- NfcDispatchActivity — BuhoGO's only receiver of system NFC
+             intents (cold start / backgrounded app). Narrow NDEF-only
+             dispatch: BuhoGO appears in Android's NFC app picker exactly
+             when a tapped tag carries a payment or auth URI it can actually
+             handle, and never for an arbitrary tag. Each scheme is declared
+             in lower- AND upper-case for the same reason as the VIEW filters
+             above: NFC intents are matched case-sensitively and tag content
+             is not normalized (some card-programming services write
+             upper-case scheme URIs).
+
+             ACTIVE — cold-start schemes BuhoGO fully supports today:
+               lnurlw   Bolt Card / LNURL-withdraw (tap-to-pay cards, rings)
+               lnurlp   LNURL-pay, incl. card refund/pay links
+               lightning BOLT11 invoices, wrapped LNURLs, BOLT12 recognition
+               lnurl    bech32 LNURL in its URI wrapper
+               bitcoin  BIP21 on-chain / unified (parity with the VIEW filter)
+               keyauth  LUD-04 login tags (flow always ends in a confirm UI)
+
+             FUTURE — add here AND in NfcDispatchActivity's allowlist:
+               lnurlc   once a channel-request flow is implemented
+               custom/proprietary tag schemes as product needs appear
+
+             NEVER — filters that would claim foreign tags (contactless bank
+             cards, transit cards, access badges, random stickers) and
+             re-introduce the old "app opens itself unprompted" behavior:
+               - ACTION_TAG_DISCOVERED: catch-all, deprecated in API 37.
+               - ACTION_TECH_DISCOVERED with IsoDep: matches every Type-4
+                 card including bank cards. Even the narrower IsoDep+Ndef
+                 tech list is dead weight: when a tag's NDEF is readable the
+                 NDEF filter above already wins, and on OEM stacks that fail
+                 to expose NTAG 424 DNA as NDEF the tech list lacks Ndef too,
+                 so the filter would not match exactly where it should help.
+                 Fallback for such devices: open the app, then tap (reader
+                 mode + raw IsoDep handle it).
+               - https:// or text/plain NDEF: far too broad, and newer
+                 Android versions dispatch http(s) NDEF tags as regular VIEW
+                 links anyway, so an NDEF https filter is not future-proof.
+
+             Android 17 note: once targetSdk moves past 36 this activity (and
+             only this one) must additionally declare
+             android:permission="android.permission.DISPATCH_NFC_MESSAGE".
+             Do not add it earlier — the permission does not exist on older
+             platforms and would break dispatch there. -->
+        <activity
+            android:name=".NfcDispatchActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="lightning" />
+                <data android:scheme="LIGHTNING" />
+                <data android:scheme="lnurl" />
+                <data android:scheme="LNURL" />
+                <data android:scheme="lnurlp" />
+                <data android:scheme="LNURLP" />
+                <data android:scheme="lnurlw" />
+                <data android:scheme="LNURLW" />
+                <data android:scheme="bitcoin" />
+                <data android:scheme="BITCOIN" />
+                <data android:scheme="keyauth" />
+                <data android:scheme="KEYAUTH" />
+            </intent-filter>
+        </activity>
+
+        <!-- Google's code-scanner activity (merged in from
+             play-services-code-scanner, which @capacitor-mlkit/barcode-scanning
+             depends on) declares android:screenOrientation="portrait". From
+             Android 16 the platform ignores orientation and resizability
+             restrictions on large screens, and Play reports the declaration as
+             a large-screen usability problem against this app even though the
+             activity belongs to a library.
+
+             BuhoGO scans with the plugin's own camera surface (startScan) and
+             never launches this activity: it belongs to the Google-branded
+             scan() flow, which needs Play services and which BuhoGO does not
+             use (the module availability/install probes that used to touch it
+             are gone as well — see src/utils/nativeScanner.js). It is only
+             here because the library merges it in, so relaxing the lock costs
+             us nothing and lets it follow the device on foldables and tablets. -->
+        <activity
+            android:name="com.google.mlkit.vision.codescanner.internal.GmsBarcodeScanningDelegateActivity"
+            android:screenOrientation="unspecified"
+            tools:replace="android:screenOrientation" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
@@ -41,10 +203,21 @@
 
     <!-- Permissions -->
 
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- Bitcoin map "find near me". Both are runtime-prompted on Android 6+;
+         the map degrades gracefully (centers on a default) if denied. Marked
+         not-required so the app still installs on location-less devices. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
 </manifest>

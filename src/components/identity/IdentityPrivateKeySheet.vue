@@ -1,0 +1,99 @@
+<template>
+  <q-dialog :model-value="modelValue" position="bottom" :persistent="busy" :aria-label="$t('Secret key')" @update:model-value="close">
+    <q-card class="private-key-sheet">
+      <header>
+        <div><span class="private-key-kicker">{{ $t('Secret key') }}</span><h2>{{ name }}</h2></div>
+        <q-btn flat round :disable="busy" :aria-label="$t('Close')" @click="close"><Icon icon="tabler:x" width="20" /></q-btn>
+      </header>
+      <p class="private-key-public">{{ npub.slice(0, 16) }}…{{ npub.slice(-8) }}</p>
+      <div class="private-key-note"><Icon icon="tabler:lock" width="24" /><p>{{ $t('Kept hidden for your privacy. Anyone with this key can use this identity.') }}</p></div>
+      <p>{{ $t('Copy only to an app you trust. Never send it in a message.') }}</p>
+      <p v-if="error" role="alert" class="private-key-error">{{ error }}</p>
+      <p v-if="copied" role="status">{{ $t('Secret key copied') }}</p>
+      <q-btn unelevated no-caps class="private-key-copy" :loading="busy" :label="copied ? $t('Done') : $t('Copy secret key')" @click="copied ? close() : copyKey()" />
+    </q-card>
+  </q-dialog>
+</template>
+
+<script setup>
+import { getCurrentInstance, onBeforeUnmount, ref, watch } from 'vue';
+import { Icon } from '@iconify/vue';
+import { useIdentityStore } from '../../stores/identity';
+import { useWalletStore } from '../../stores/wallet';
+import { isBiometricAvailable, authenticate } from '../../utils/biometric';
+import { copySensitive } from '../../utils/sensitiveClipboard';
+
+// The key to copy: a derived `account`, or an imported identity's `externalId`.
+const props = defineProps({ modelValue: Boolean, account: { type: Number, default: null }, externalId: { type: String, default: null }, name: { type: String, default: '' }, npub: { type: String, default: '' } });
+const emit = defineEmits(['update:modelValue']);
+const { proxy } = getCurrentInstance();
+const t = key => proxy.$t(key);
+const identity = useIdentityStore();
+const wallet = useWalletStore();
+const busy = ref(false);
+const copied = ref(false);
+const error = ref('');
+let revision = 0;
+watch(() => [props.modelValue, props.account, props.externalId, identity.fingerprint], () => { revision++; copied.value = false; error.value = ''; }, { flush: 'sync' });
+onBeforeUnmount(() => { revision++; });
+function close() { if (!busy.value) emit('update:modelValue', false); }
+
+async function copyKey() {
+  if (busy.value || (props.account === null && !props.externalId)) return;
+  const request = revision;
+  const { account, externalId } = props;
+  busy.value = true;
+  error.value = '';
+  const isCurrent = () => request === revision && props.modelValue;
+  const assertCurrent = () => {
+    if (!isCurrent()) throw new DOMException('Identity copy cancelled', 'AbortError');
+  };
+  let failureMessage = 'Clipboard access failed. Please try copying again.';
+  try {
+    // Start clipboard access during the click; supply the key only after
+    // authentication and identity checks have completed.
+    await copySensitive(async () => {
+      assertCurrent();
+      if (wallet.biometricsEnabled) {
+        const { available } = await isBiometricAvailable();
+        assertCurrent();
+        if (available && !await authenticate({ reason: t('Copy secret key'), title: 'BuhoGO', subtitle: props.name, useFallback: true })) {
+          failureMessage = 'Unlock was not completed. Try again when you are ready.';
+          throw new Error('Authentication cancelled');
+        }
+      }
+      assertCurrent();
+      // Only a local reference: never render or cache nsec in component/store state.
+      let nsec;
+      try {
+        ({ nsec } = externalId ? await identity.revealExternalSecret(externalId) : await identity.revealNostrSecret(account));
+      } catch (error) {
+        failureMessage = 'Secret key could not be accessed. Please try again.';
+        throw error;
+      }
+      assertCurrent();
+      return nsec;
+    });
+    if (isCurrent()) copied.value = true;
+    // The best-effort clipboard wipe intentionally survives closing this sheet.
+  } catch {
+    if (isCurrent()) error.value = t(failureMessage);
+  } finally {
+    busy.value = false;
+  }
+}
+</script>
+
+<style scoped>
+.private-key-sheet { width: 100%; max-width: 520px; max-height: 90dvh; overflow-y: auto; padding: 24px 24px max(24px, env(safe-area-inset-bottom)); border-radius: 24px 24px 0 0; background: var(--bg-card); color: var(--text-primary); }
+.private-key-sheet header { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.private-key-kicker { color: var(--text-secondary); font-size: 13px; }
+.private-key-sheet h2 { font: 700 22px/1.3 'Manrope', sans-serif; margin: 4px 0; overflow-wrap: anywhere; }
+.private-key-sheet p { color: var(--text-secondary); font-size: 14px; line-height: 1.5; }
+.private-key-public { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.private-key-note { display: flex; gap: 12px; padding: 16px; background: var(--bg-input); border-radius: 16px; margin: 20px 0; }
+.private-key-note svg { flex-shrink: 0; }
+.private-key-note p { margin: 0; color: var(--text-primary); }
+.private-key-copy { width: 100%; min-height: 48px; border-radius: 14px; background: var(--text-primary); color: var(--bg-card); }
+.private-key-error { color: var(--color-red) !important; }
+</style>

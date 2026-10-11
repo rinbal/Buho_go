@@ -4,5 +4,18 @@
   "webDir": "www",
   "server": {
     "androidScheme": "https"
-  }
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": false
+    },
+    "LocalNotifications": {
+      "smallIcon": "ic_stat_notification",
+      "iconColor": "#059573"
+    }
+  },
+  "packageClassList": [
+    "AppPlugin",
+    "PreferencesPlugin"
+  ]
 }

@@ -1,9 +1,17 @@
 /**
  * WalletProvider - Abstract base class for wallet implementations
  *
- * This provides a unified interface for both Spark and NWC wallets.
- * All wallet providers must implement these methods.
+ * This provides a unified interface across every BuhoGO backend — Spark,
+ * NWC, LNbits, and Arkade. All wallet providers must implement these methods;
+ * backend-specific fast paths (Spark `sp1`, Arkade `ark1`) are exposed as
+ * optional methods that default to a no-op / throw here and are overridden by
+ * the relevant subclass.
  */
+
+import {
+  isSparkAddress as isSparkAddressPredicate,
+  isArkadeAddress as isArkadeAddressPredicate,
+} from '../utils/addressUtils.js';
 
 export class WalletProvider {
   constructor(walletId, walletData) {
@@ -138,19 +146,48 @@ export class WalletProvider {
    * @returns {boolean}
    */
   static isSparkAddress(address) {
-    if (!address || typeof address !== 'string') return false;
-    const normalized = address.toLowerCase().trim();
+    return isSparkAddressPredicate(address);
+  }
 
-    // New format prefixes (Bech32m encoded)
-    // spark1 - mainnet, sparkrt1 - regtest, sparkt1 - testnet, sparks1 - signet, sparkl1 - local
-    const newPrefixes = ['spark1', 'sparkrt1', 'sparkt1', 'sparks1', 'sparkl1'];
+  // ==========================================
+  // Arkade-specific methods (optional for the others)
+  // ==========================================
 
-    // Legacy format prefixes (still supported)
-    // sp1 - mainnet, tsp1 - testnet, sprt1 - regtest
-    const legacyPrefixes = ['sp1', 'tsp1', 'sprt1'];
+  /**
+   * Check if this is an Arkade wallet
+   * @returns {boolean}
+   */
+  isArkade() {
+    return false;
+  }
 
-    return newPrefixes.some(prefix => normalized.startsWith(prefix)) ||
-           legacyPrefixes.some(prefix => normalized.startsWith(prefix));
+  /**
+   * Get Arkade address (Arkade wallets only)
+   * @returns {Promise<string|null>}
+   */
+  async getArkadeAddress() {
+    return null;
+  }
+
+  /**
+   * Transfer to an Arkade address (Arkade wallets only) — the instant,
+   * near-zero-fee ark1 → ark1 fast path.
+   * @param {Object} params
+   * @param {string} params.arkadeAddress - Recipient Arkade address (ark1.../tark1...)
+   * @param {number} params.amount - Amount in sats
+   * @returns {Promise<{id: string, status: string}>}
+   */
+  async transferToArkadeAddress({ arkadeAddress, amount }) {
+    throw new Error('Arkade-to-Arkade transfers are only available for Arkade wallets');
+  }
+
+  /**
+   * Check if a string is a valid Arkade address (ark1.../tark1...)
+   * @param {string} address
+   * @returns {boolean}
+   */
+  static isArkadeAddress(address) {
+    return isArkadeAddressPredicate(address);
   }
 
   // ==========================================

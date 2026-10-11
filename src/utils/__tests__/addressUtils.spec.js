@@ -1,0 +1,389 @@
+/**
+ * addressUtils — destination recognition + URI unwrapping tests.
+ *
+ * Coverage focus:
+ *   - the predicate family (Spark / invoice / LNURL / Bitcoin / Lightning
+ *     address) accepts the shapes the rest of the app relies on
+ *   - normalizePaymentAddress unwraps the QR URI conventions (BIP21
+ *     `bitcoin:`, `lightning:`) down to a bare identifier, and leaves
+ *     everything else untouched
+ *
+ * Run directly with Node:
+ *   node src/utils/__tests__/addressUtils.spec.js
+ */
+
+import { strict as assert } from 'node:assert';
+import { bech32m } from 'bech32';
+import * as bech32Module from 'bech32';
+import {
+  canonicalLnurl,
+  lnurlToUrl,
+  lnurlDomain,
+  isSilentPaymentAddress,
+  isSparkAddress,
+  isArkadeAddress,
+  isBolt12Offer,
+  isLightningInvoice,
+  isLnurl,
+  isBitcoinAddress,
+  isLightningAddress,
+  normalizePaymentAddress,
+  stripWrapperScheme,
+  splitAddressForDisplay,
+  nativeRailsFromBip21,
+  invoiceAmountMsat,
+} from '../addressUtils.js';
+
+// A real LNURL-withdraw voucher (LNbits) reported from the field. It must be
+// recognized whether bare, `lightning:`-wrapped, or `lnurl:`-wrapped — the
+// last of which previously fell through to "Unsupported link format".
+const FIELD_LNURL =
+  'LNURL1DP68GURN8GHJ7MRWVF5HGUEWVFHHXTNPVSHHW6T5DPJ8YCTH9ASHQ6F0WCCJ7MRWW4EXCT6VTFG8QAN5XSUHZAT5VDXN2CTJF4ZX6A34FSHKKCTZTF6HGUP4GA8RWVN00FE42SMZVFFXK3S6XM7HC';
+
+let passed = 0;
+let failed = 0;
+
+function test(name, fn) {
+  try {
+    fn();
+    console.log(`  ✓ ${name}`);
+    passed += 1;
+  } catch (err) {
+    console.error(`  ✗ ${name}`);
+    console.error(`    ${err.message}`);
+    failed += 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Predicates (smoke coverage — the unwrapper leans on these)
+// ---------------------------------------------------------------------------
+
+test('isBitcoinAddress: accepts bech32 + base58, rejects junk', () => {
+  assert.equal(isBitcoinAddress('bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq'), true);
+  assert.equal(isBitcoinAddress('1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa'), true);
+  assert.equal(isBitcoinAddress('not-an-address'), false);
+});
+
+test('isLightningAddress: user@domain only', () => {
+  assert.equal(isLightningAddress('alice@example.com'), true);
+  assert.equal(isLightningAddress('bc1qsomething'), false);
+});
+
+const SILENT_PAYMENT_ADDR =
+  'sp1qqgf49ckkg60unm3zzzz8zdza696xtp3aj5ylg8q0lv2yku6t67xlsqhmr246e2v72gaz3cvzfnydckq6ca2w8wsvaj60mrqu07a6h5y9xcxygql9';
+
+test('isSilentPaymentAddress: recognizes BIP-352, never Spark', () => {
+  assert.equal(isSilentPaymentAddress(SILENT_PAYMENT_ADDR), true);
+  // The prefix collides with legacy Spark; the payload decides.
+  assert.equal(isSparkAddress(SILENT_PAYMENT_ADDR), false);
+  // A short legacy-style spark string is not a silent payment.
+  assert.equal(isSilentPaymentAddress('sp1abcdef'), false);
+  assert.equal(isSparkAddress('sp1abcdef'), true);
+  // A corrupted checksum is neither.
+  const corrupted = SILENT_PAYMENT_ADDR.slice(0, -1) + 'q';
+  assert.equal(isSilentPaymentAddress(corrupted), false);
+  assert.equal(isSilentPaymentAddress(null), false);
+});
+
+test('isSparkAddress: new + legacy prefixes', () => {
+  assert.equal(isSparkAddress('spark1abcdef'), true);
+  assert.equal(isSparkAddress('sp1abcdef'), true);
+  assert.equal(isSparkAddress('bc1qabc'), false);
+});
+
+test('isArkadeAddress: ark1 / tark1, case-insensitive, no cross-type collisions', () => {
+  assert.equal(isArkadeAddress('ark1qabcdef'), true);
+  assert.equal(isArkadeAddress('tark1qabcdef'), true);
+  assert.equal(isArkadeAddress('ARK1QABCDEF'), true);
+  assert.equal(isArkadeAddress('  ark1qabcdef  '), true);
+  // Must not swallow Spark / invoice / on-chain / junk.
+  assert.equal(isArkadeAddress('spark1abcdef'), false);
+  assert.equal(isArkadeAddress('sp1abcdef'), false);
+  assert.equal(isArkadeAddress('lnbc10n1pjxyz'), false);
+  assert.equal(isArkadeAddress('bc1qabc'), false);
+  assert.equal(isArkadeAddress('arkade'), false);
+  assert.equal(isArkadeAddress(null), false);
+  // And Spark must not swallow Arkade.
+  assert.equal(isSparkAddress('ark1qabcdef'), false);
+});
+
+test('isLightningInvoice / isLnurl: tolerate lightning: wrapper', () => {
+  assert.equal(isLightningInvoice('lightning:lnbc10n1pjxyz'), true);
+  assert.equal(isLnurl('lightning:lnurl1dp68'), true);
+});
+
+const VALID_BOLT12_OFFER = bech32m.encode('lno', [1, 2, 3, 4, 5, 6], 4096);
+
+test('isBolt12Offer: requires a valid Bech32m offer, including its checksum', () => {
+  assert.equal(isBolt12Offer(VALID_BOLT12_OFFER), true);
+  assert.equal(isBolt12Offer(`LIGHTNING:${VALID_BOLT12_OFFER.toUpperCase()}`), true);
+  assert.equal(isBolt12Offer(`${VALID_BOLT12_OFFER.slice(0, -1)}q`), false);
+  assert.equal(isBolt12Offer(`lNo${VALID_BOLT12_OFFER.slice(3)}`), false);
+  assert.equal(isBolt12Offer('lnbc10n1pjxyz'), false);
+  assert.equal(isBolt12Offer('lno1incomplete'), false);
+});
+
+test('isLnurl: tolerates the lnurl: wrapper in any case (field regression)', () => {
+  assert.equal(isLnurl(FIELD_LNURL), true);              // bare
+  assert.equal(isLnurl(`lnurl:${FIELD_LNURL}`), true);   // lnurl: wrapper
+  assert.equal(isLnurl(`LNURL:${FIELD_LNURL}`), true);   // uppercase scheme
+  assert.equal(isLnurl(`lightning:${FIELD_LNURL}`), true);
+});
+
+// ---------------------------------------------------------------------------
+// stripWrapperScheme — the single unwrap primitive every path now shares
+// ---------------------------------------------------------------------------
+
+test('stripWrapperScheme: removes lightning: / lnurl: case-insensitively', () => {
+  assert.equal(stripWrapperScheme('lightning:lnbc10n1pjxyz'), 'lnbc10n1pjxyz');
+  assert.equal(stripWrapperScheme(`lnurl:${FIELD_LNURL}`), FIELD_LNURL);
+  assert.equal(stripWrapperScheme(`LNURL:${FIELD_LNURL}`), FIELD_LNURL);
+  assert.equal(stripWrapperScheme('  lightning:lnbc1  '), 'lnbc1'); // trims both sides
+});
+
+test('stripWrapperScheme: leaves bare payloads and LUD-17 schemes untouched', () => {
+  assert.equal(stripWrapperScheme(FIELD_LNURL), FIELD_LNURL);
+  // LUD-17 schemes ARE the type — they must survive, not get clipped to `//…`.
+  assert.equal(stripWrapperScheme('lnurlw://lnbits.bos.ad/x'), 'lnurlw://lnbits.bos.ad/x');
+  assert.equal(stripWrapperScheme('lnurlp://v1.lnbits.de/lnurlp/3RXhUU'), 'lnurlp://v1.lnbits.de/lnurlp/3RXhUU');
+  // The authority-style `lnurl://` alias must not lose its `//host`.
+  assert.equal(stripWrapperScheme('lnurl://host/x'), 'lnurl://host/x');
+});
+
+test('stripWrapperScheme: non-strings → empty string', () => {
+  assert.equal(stripWrapperScheme(null), '');
+  assert.equal(stripWrapperScheme(undefined), '');
+  assert.equal(stripWrapperScheme(42), '');
+});
+
+// ---------------------------------------------------------------------------
+// normalizePaymentAddress — BIP21
+// ---------------------------------------------------------------------------
+
+test('BIP21: strips scheme + query, yields the on-chain address', () => {
+  const addr = 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq';
+  assert.equal(
+    normalizePaymentAddress(`bitcoin:${addr}?amount=0.001&label=Coffee`),
+    addr,
+  );
+  // and the unwrapped value is still recognized as a Bitcoin address
+  assert.equal(isBitcoinAddress(normalizePaymentAddress(`bitcoin:${addr}`)), true);
+});
+
+test('BIP21: case-insensitive scheme', () => {
+  const addr = '1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa';
+  assert.equal(normalizePaymentAddress(`BITCOIN:${addr}`), addr);
+});
+
+test('BIP21: percent-escapes in params do not corrupt the address', () => {
+  const addr = 'bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq';
+  assert.equal(
+    normalizePaymentAddress(`bitcoin:${addr}?label=Bob%20%26%20Co`),
+    addr,
+  );
+});
+
+test('BIP21: lightning-only QR has no on-chain address → empty', () => {
+  // bitcoin:?lightning=… is a unified QR with no fallback address; we return
+  // '' so the caller treats it as "nothing to save".
+  assert.equal(normalizePaymentAddress('bitcoin:?lightning=lnbc10n1pjxyz'), '');
+});
+
+// ---------------------------------------------------------------------------
+// normalizePaymentAddress — lightning: + passthrough
+// ---------------------------------------------------------------------------
+
+test('lightning: scheme is stripped', () => {
+  assert.equal(normalizePaymentAddress('lightning:lnbc10n1pjxyz'), 'lnbc10n1pjxyz');
+});
+
+test('lightning: wrapper around an LNURL unwraps to a recognized LNURL', () => {
+  const wrapped = 'lightning:LNURL1DP68GURN8GHJ7A339EKXUCNFW3EJUER99AKXUATJD3CZ7V6JTP5924GV0MDHZ';
+  const bare = normalizePaymentAddress(wrapped);
+  assert.equal(bare, 'LNURL1DP68GURN8GHJ7A339EKXUCNFW3EJUER99AKXUATJD3CZ7V6JTP5924GV0MDHZ');
+  assert.equal(isLnurl(bare), true);
+});
+
+test('LUD-17 lnurlp:// passes through untouched and is recognized', () => {
+  const lud17 = 'lnurlp://v1.lnbits.de/lnurlp/3RXhUU';
+  assert.equal(normalizePaymentAddress(lud17), lud17);
+  assert.equal(isLnurl(lud17), true);
+});
+
+test('lnurl: wrapper around an LNURL unwraps to a recognized LNURL', () => {
+  const bare = normalizePaymentAddress(`lnurl:${FIELD_LNURL}`);
+  assert.equal(bare, FIELD_LNURL);
+  assert.equal(isLnurl(bare), true);
+});
+
+// ---------------------------------------------------------------------------
+// normalizePaymentAddress — http(s) LNURL fallback URL (LNbits / Fossa ATMs)
+// ---------------------------------------------------------------------------
+
+const ATM_LNURL =
+  'LNURL1DP68GURN8GHJ7V33D45K7TNNWPSKXEF0VEHHXUMP9ASHQ6F0WCCJ7MRWW4EXCTMX89G9YWPLWQ742VJXWDJYW4NTTQCJ6U6ND9HKX42PG5MX2J3SWA6NZCT02P8NSUMG2YM55D3EW4FHZVNH85CF52CD';
+
+test('http fallback URL: extracts the uppercase LNURL from ?lightning=', () => {
+  const url = `https://21mio.space/fossa/atm?lightning=${ATM_LNURL}`;
+  const bare = normalizePaymentAddress(url);
+  assert.equal(bare, ATM_LNURL);
+  assert.equal(isLnurl(bare), true);
+});
+
+test('http fallback URL: case-insensitive param key, extra params ignored', () => {
+  const url = `https://example.com/atm?foo=bar&LIGHTNING=${ATM_LNURL}&x=1`;
+  assert.equal(normalizePaymentAddress(url), ATM_LNURL);
+});
+
+test('http fallback URL: carries a BOLT11 invoice too', () => {
+  const url = 'https://pay.example.com/x?lightning=lnbc10n1pjxyz';
+  assert.equal(normalizePaymentAddress(url), 'lnbc10n1pjxyz');
+});
+
+test('http fallback URL: no lightning param → left untouched (passthrough)', () => {
+  const url = 'https://example.com/just/a/page?foo=bar';
+  assert.equal(normalizePaymentAddress(url), url);
+});
+
+test('http fallback URL: junk lightning param is not extracted', () => {
+  const url = 'https://example.com/atm?lightning=not-a-lnurl';
+  // Falls through to passthrough — the param isn't a usable destination.
+  assert.equal(normalizePaymentAddress(url), url);
+});
+
+test('passthrough: bare address / npub / nostr URI returned trimmed, untouched', () => {
+  assert.equal(normalizePaymentAddress('  alice@example.com  '), 'alice@example.com');
+  assert.equal(normalizePaymentAddress('spark1abcdef'), 'spark1abcdef');
+  assert.equal(normalizePaymentAddress('nostr:npub1xyz'), 'nostr:npub1xyz');
+});
+
+test('defensive: non-strings and empties → empty string', () => {
+  assert.equal(normalizePaymentAddress(null), '');
+  assert.equal(normalizePaymentAddress(undefined), '');
+  assert.equal(normalizePaymentAddress(42), '');
+  assert.equal(normalizePaymentAddress('   '), '');
+});
+
+test('splitAddressForDisplay: a Lightning address keeps its domain', () => {
+  assert.deepEqual(
+    splitAddressForDisplay('grandtapir425@coinsnap.app'),
+    { head: 'grandtapir425', tail: '@coinsnap.app' }
+  );
+  // Only the last @ separates; a local part may legally contain one.
+  assert.deepEqual(
+    splitAddressForDisplay('a@b@example.com'),
+    { head: 'a@b', tail: '@example.com' }
+  );
+});
+
+test('splitAddressForDisplay: an opaque token keeps its last characters', () => {
+  const npub = 'npub1' + 'q'.repeat(30) + 'abcd1234';
+  assert.deepEqual(splitAddressForDisplay(npub), {
+    head: npub.slice(0, -8),
+    tail: 'abcd1234',
+  });
+});
+
+test('splitAddressForDisplay: prose and short labels shorten at the end instead', () => {
+  assert.equal(splitAddressForDisplay('Pratik Patel'), null);
+  assert.equal(splitAddressForDisplay('Payment sent'), null);
+  assert.equal(splitAddressForDisplay('rainyba'), null);
+  // Short enough to render whole — no need to carve it up.
+  assert.equal(splitAddressForDisplay('bc1qshort'), null);
+  // A memo that happens to hold an address is still prose.
+  assert.equal(splitAddressForDisplay('pay me at alice@example.com'), null);
+});
+
+test('splitAddressForDisplay: defensive against empties and non-strings', () => {
+  assert.equal(splitAddressForDisplay(null), null);
+  assert.equal(splitAddressForDisplay(undefined), null);
+  assert.equal(splitAddressForDisplay('   '), null);
+  assert.equal(splitAddressForDisplay('@nolocalpart.com'), null);
+  assert.equal(splitAddressForDisplay('nodomain@'), null);
+});
+
+test('nativeRailsFromBip21: valid spark/ark params surface, junk is dropped', () => {
+  assert.deepEqual(
+    nativeRailsFromBip21({ params: { spark: 'spark1pgssqabc', ark: 'ark1qqelabc' } }),
+    { spark: 'spark1pgssqabc', ark: 'ark1qqelabc' }
+  );
+  // A stray value that is not an address of the right family never hijacks.
+  assert.deepEqual(
+    nativeRailsFromBip21({ params: { spark: 'bc1qnotspark', ark: 'lnbc1notark' } }),
+    { spark: null, ark: null }
+  );
+  assert.deepEqual(nativeRailsFromBip21({ params: {} }), { spark: null, ark: null });
+  assert.deepEqual(nativeRailsFromBip21(null), { spark: null, ark: null });
+});
+
+// ---------------------------------------------------------------------------
+// LUD-11 services: one stored form for an LNURL
+// ---------------------------------------------------------------------------
+
+test('canonicalLnurl: every carrier of the same link canonicalizes to one lowercase bech32', () => {
+  const url = 'https://coffee.example/Api/LNURLp/Corner?ref=Menu';
+  const { bech32 } = bech32Module;
+  const encoded = bech32.encode('lnurl', bech32.toWords(new TextEncoder().encode(url)), 16384);
+  const canonical = canonicalLnurl(encoded);
+  assert.equal(canonical, encoded.toLowerCase());
+  assert.equal(canonicalLnurl(encoded.toUpperCase()), canonical);
+  assert.equal(canonicalLnurl(`lightning:${encoded.toUpperCase()}`), canonical);
+  assert.equal(canonicalLnurl(`lnurl:${encoded}`), canonical);
+  assert.equal(canonicalLnurl('lnurlp://coffee.example/Api/LNURLp/Corner?ref=Menu'), canonical);
+  assert.equal(canonicalLnurl(url), canonical);
+  // Idempotent, and the case-sensitive path survives the round trip.
+  assert.equal(canonicalLnurl(canonical), canonical);
+  assert.equal(lnurlToUrl(canonical), url);
+});
+
+test('canonicalLnurl: refuses what does not decode or is not a safe endpoint', () => {
+  assert.equal(canonicalLnurl(''), null);
+  assert.equal(canonicalLnurl(null), null);
+  assert.equal(canonicalLnurl('alice@example.com'), null);
+  assert.equal(canonicalLnurl('lnurl1notreallybech32'), null);
+  assert.equal(canonicalLnurl('http://coffee.example/pay'), null);
+  assert.equal(canonicalLnurl('https://user:pw@coffee.example/pay'), null);
+  assert.equal(canonicalLnurl('https://coffee.example/pay#frag'), null);
+  const { bech32 } = bech32Module;
+  const insecure = bech32.encode('lnurl', bech32.toWords(new TextEncoder().encode('http://coffee.example/pay')), 16384);
+  assert.equal(canonicalLnurl(insecure), null);
+  // A bad checksum is not "close enough".
+  const good = bech32.encode('lnurl', bech32.toWords(new TextEncoder().encode('https://coffee.example/pay')), 16384);
+  assert.equal(canonicalLnurl(good.slice(0, -1) + (good.endsWith('q') ? 'p' : 'q')), null);
+});
+
+test('lnurlToUrl: Tor hosts may use http, LUD-17 keeps the path and query', () => {
+  const onion = 'lnurlp://' + 'a'.repeat(56) + '.onion/pay?x=1';
+  assert.equal(lnurlToUrl(onion), 'http://' + 'a'.repeat(56) + '.onion/pay?x=1');
+  assert.equal(lnurlToUrl('lnurlw://cash.example/withdraw?k1=A%2BB'), 'https://cash.example/withdraw?k1=A%2BB');
+});
+
+test('lnurlDomain: the host behind any carrier, empty when it does not decode', () => {
+  const { bech32 } = bech32Module;
+  const encoded = bech32.encode('lnurl', bech32.toWords(new TextEncoder().encode('https://coffee.example/pay')), 16384);
+  assert.equal(lnurlDomain(encoded), 'coffee.example');
+  assert.equal(lnurlDomain('lnurlp://kiosk.example/x'), 'kiosk.example');
+  assert.equal(lnurlDomain('nope'), '');
+});
+
+test('invoiceAmountMsat: reads the amount from the human-readable part', () => {
+  assert.equal(invoiceAmountMsat('lnbc10u1pjabcdefgh'), 1_000_000);          // 1,000 sats
+  assert.equal(invoiceAmountMsat('LNBC20U1PJABCDEF'), 2_000_000);            // 2,000 sats
+  assert.equal(invoiceAmountMsat('lightning:lnbc100m1pjxyz'), 10_000_000_000); // 10,000,000 sats
+  assert.equal(invoiceAmountMsat('lnbc2500n1pjxyz'), 250_000);               // 250 sats
+  assert.equal(invoiceAmountMsat('lnbc10p1pjxyz'), 1);                       // 1 msat
+  assert.equal(invoiceAmountMsat('lnbcrt5u1pjxyz'), 500_000);
+  assert.equal(invoiceAmountMsat('lntbs3m1pjxyz'), 300_000_000);
+});
+
+test('invoiceAmountMsat: amountless, odd pico amounts and non-invoices are null', () => {
+  assert.equal(invoiceAmountMsat('lnbc1pjabcdefgh'), null);
+  assert.equal(invoiceAmountMsat('lnbc15p1pjxyz'), null);
+  assert.equal(invoiceAmountMsat('maria@mybuho.de'), null);
+  assert.equal(invoiceAmountMsat(''), null);
+  assert.equal(invoiceAmountMsat(null), null);
+});
+
+console.log(`\n  ${passed} passed, ${failed} failed`);
+if (failed > 0) process.exit(1);

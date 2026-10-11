@@ -23,7 +23,8 @@ const DEFAULT_CONFIG = {
   maxInterval: 6000,         // Max 6 seconds between checks (more real-time feel)
   backoffMultiplier: 1.25,   // Gentle backoff
   maxAttempts: 35,           // Stop after ~3 minutes
-  expiryBuffer: 60           // Stop checking 60 seconds before expiry
+  expiryBuffer: 60,          // Stop checking 60 seconds before expiry
+  maxConsecutiveErrors: 8    // Bail out if lookups keep throwing (e.g. wallet disconnected)
 };
 
 /**
@@ -40,6 +41,9 @@ export class PaymentMonitor {
     this.invoice = null;
     this.provider = null;
     this.onStatusChange = null;
+    this.consecutiveErrors = 0;
+    this.revision = 0;
+    this.checking = false;
   }
 
   /**
@@ -51,9 +55,7 @@ export class PaymentMonitor {
    * @returns {Promise<void>}
    */
   async start({ invoice, provider, onStatusChange }) {
-    if (this.isMonitoring) {
-      this.stop();
-    }
+    this.stop();
 
     if (!invoice?.payment_hash) {
       throw new Error('Invoice must have a payment_hash');
@@ -69,6 +71,7 @@ export class PaymentMonitor {
     this.isMonitoring = true;
     this.attemptCount = 0;
     this.currentInterval = this.config.initialInterval;
+    this.consecutiveErrors = 0;
 
     // Notify that monitoring has started
     this._notifyStatus(PaymentStatus.PENDING, {
@@ -84,6 +87,8 @@ export class PaymentMonitor {
    * Stop monitoring
    */
   stop() {
+    this.revision++;
+    this.checking = false;
     this.isMonitoring = false;
     if (this.timeoutId) {
       clearTimeout(this.timeoutId);
@@ -106,6 +111,7 @@ export class PaymentMonitor {
   _scheduleNextCheck() {
     if (!this.isMonitoring) return;
 
+    clearTimeout(this.timeoutId);
     this.timeoutId = setTimeout(() => {
       this._checkPayment();
     }, this.currentInterval);
@@ -115,19 +121,15 @@ export class PaymentMonitor {
    * Check payment status
    * @private
    */
+  checkNow() { return this._checkPayment(); }
+
   async _checkPayment() {
-    if (!this.isMonitoring) return;
+    if (!this.isMonitoring || this.checking) return;
+    clearTimeout(this.timeoutId);
+    const revision = this.revision;
+    const isCurrent = () => this.isMonitoring && revision === this.revision;
 
     this.attemptCount++;
-
-    // Check if invoice has expired
-    if (this._isExpired()) {
-      this._notifyStatus(PaymentStatus.EXPIRED, {
-        message: 'Invoice has expired'
-      });
-      this.stop();
-      return;
-    }
 
     // Check if max attempts reached
     if (this.attemptCount >= this.config.maxAttempts) {
@@ -139,8 +141,16 @@ export class PaymentMonitor {
       return;
     }
 
+    this.checking = true;
     try {
-      const result = await this.provider.lookupInvoice(this.invoice.payment_hash);
+      // Prefer a backend-native invoice ID (e.g. Spark's receive request UUID)
+      // when available, since it maps directly to getLightningReceiveRequest.
+      // Falls back to payment_hash, which providers may resolve via a
+      // transfer-list scan.
+      const lookupKey = this.invoice.invoice_id || this.invoice.payment_hash;
+      const result = await this.provider.lookupInvoice(lookupKey);
+      if (!isCurrent()) return;
+      this.consecutiveErrors = 0;
 
       if (result.paid) {
         // Payment confirmed
@@ -149,6 +159,16 @@ export class PaymentMonitor {
           preimage: result.preimage,
           amount: result.amount || this.invoice.amount,
           attempt: this.attemptCount
+        });
+        this.stop();
+        return;
+      }
+
+      // Expiry prevents new payments; it does not prove this invoice was
+      // unpaid. Always check settlement first, including after backgrounding.
+      if (this._isExpired()) {
+        this._notifyStatus(PaymentStatus.EXPIRED, {
+          message: 'Invoice has expired'
         });
         this.stop();
         return;
@@ -171,7 +191,21 @@ export class PaymentMonitor {
       this._scheduleNextCheck();
 
     } catch (error) {
+      if (!isCurrent()) return;
       console.warn('Payment check failed:', error.message);
+      this.consecutiveErrors++;
+
+      // Persistent failures (wallet disconnected, network down, etc.) should
+      // not poll forever — surface as ERROR and stop so callers can recover.
+      if (this.consecutiveErrors >= this.config.maxConsecutiveErrors) {
+        this._notifyStatus(PaymentStatus.ERROR, {
+          message: error.message || 'Payment monitoring failed',
+          attempt: this.attemptCount,
+          error: error.message
+        });
+        this.stop();
+        return;
+      }
 
       // Don't stop on transient errors, just continue polling
       this._notifyStatus(PaymentStatus.PENDING, {
@@ -187,6 +221,8 @@ export class PaymentMonitor {
       );
 
       this._scheduleNextCheck();
+    } finally {
+      if (revision === this.revision) this.checking = false;
     }
   }
 

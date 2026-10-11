@@ -1,7 +1,11 @@
 /**
  * Fiat Rates Service
- * Handles fetching and caching of Bitcoin fiat exchange rates from Mempool API
+ * Handles fetching and caching of Bitcoin fiat exchange rates. Mempool's
+ * /prices endpoint is the primary source; currencies it omits come from
+ * Alby's per-currency endpoint. Which currency uses which is declared once
+ * in fiatCurrencies.js.
  */
+import { FIAT_SYMBOLS, MEMPOOL_RATE_CURRENCIES, ALBY_RATE_CURRENCIES } from './fiatCurrencies.js'
 
 export class FiatRatesService {
   constructor() {
@@ -158,31 +162,32 @@ export class FiatRatesService {
       }
 
       // Convert to our expected format (rates per BTC)
-      this.rates = {
-        USD: data.USD || 0,
-        EUR: data.EUR || 0,
-        GBP: data.GBP || 0,
-        CAD: data.CAD || 0,
-        CHF: data.CHF || 0,
-        AUD: data.AUD || 0,
-        JPY: data.JPY || 0,
-        time: data.time || Math.floor(Date.now() / 1000)
-      };
-
-      // Fetch ZAR rate from Alby (Mempool doesn't include ZAR)
-      try {
-        const zarResponse = await fetch('https://getalby.com/api/rates/zar.json', {
-          timeout: 5000
-        });
-        if (zarResponse.ok) {
-          const zarData = await zarResponse.json();
-          if (zarData && zarData.rate_float) {
-            this.rates.ZAR = zarData.rate_float;
-          }
-        }
-      } catch (zarError) {
-        console.warn('Failed to fetch ZAR rate from Alby:', zarError.message);
+      const previous = this.rates || {};
+      this.rates = { time: data.time || Math.floor(Date.now() / 1000) };
+      for (const code of MEMPOOL_RATE_CURRENCIES) {
+        this.rates[code] = data[code] || 0;
       }
+
+      // Currencies the Mempool /prices endpoint doesn't return come from
+      // Alby's per-currency endpoint. Fetched in parallel; one failure never
+      // blocks the others or the rest of the rates.
+      // A failed Alby call keeps the last real rate instead of dropping the
+      // currency until the next refresh (a BRL balance read R$0,00).
+      await Promise.all(ALBY_RATE_CURRENCIES.map(async (code) => {
+        if (previous[code] > 0) this.rates[code] = previous[code];
+        try {
+          const res = await fetch(`https://getalby.com/api/rates/${code.toLowerCase()}.json`, {
+            timeout: 5000
+          });
+          if (!res.ok) return;
+          const data = await res.json();
+          if (data && typeof data.rate_float === 'number') {
+            this.rates[code] = data.rate_float;
+          }
+        } catch (err) {
+          console.warn(`Failed to fetch ${code} rate from Alby:`, err.message);
+        }
+      }));
 
       this.lastUpdate = new Date();
       this.ratesAvailable = true;
@@ -298,25 +303,16 @@ export class FiatRatesService {
    * Format fiat amount with currency symbol
    */
   formatFiatAmount(amount, currency) {
-    const symbols = {
-      USD: '$',
-      EUR: '€',
-      GBP: '£',
-      CAD: 'C$',
-      CHF: 'CHF ',
-      AUD: 'A$',
-      JPY: '¥',
-      ZAR: 'R'
-    };
-    
-    const symbol = symbols[currency.toUpperCase()] || currency.toUpperCase() + ' ';
-    
-    // Format based on currency
-    if (currency.toUpperCase() === 'JPY') {
-      return symbol + Math.round(amount).toLocaleString();
-    } else {
-      return symbol + amount.toFixed(2);
-    }
+    const code = currency.toUpperCase();
+    const symbol = FIAT_SYMBOLS[code] || code + ' ';
+
+    // JPY has no minor unit, so render it without decimals. Grouped in
+    // every currency: a large amount must stay readable, never 248640555.00.
+    const digits = code === 'JPY' ? 0 : 2;
+    return symbol + Number(amount || 0).toLocaleString('en-US', {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+    });
   }
 
   /**

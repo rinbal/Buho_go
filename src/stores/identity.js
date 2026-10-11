@@ -1,0 +1,1729 @@
+/**
+ * Identity Store
+ *
+ * The BuhoGO Identity is a single self-sovereign cryptographic identity
+ * generated and stored locally. It is intentionally *not* coupled to any
+ * payment stream (Spark, NWC, LNBits) — the wallet you pay with is not
+ * the identity you log in with.
+ *
+ * Today this powers LUD-04 (LNURL-auth) and Nostr (NIP-06). Tomorrow the
+ * same seed can derive NIP-05 identifiers, BIP-353 codes, and anything
+ * else derivable from a BIP-39 seed — all from one 12-word backup the
+ * user already learned how to handle from their Spark wallet.
+ *
+ * Single-seed invariant:
+ *   - There is exactly *one* BuhoGO identity per install. Wiping it wipes
+ *     every derived key on this device, including the Nostr key.
+ *   - Generating a new identity (`regenerate`) produces a fresh BIP-39
+ *     seed and therefore a fresh Nostr keypair. The old Nostr key is
+ *     forgotten here and unrecoverable without its old recovery phrase.
+ *   - Restoring from a recovery phrase (`importMnemonic`) brings back
+ *     both the LUD-04 sign-in keys and the Nostr key, because both are
+ *     deterministic functions of the seed.
+ *   - The Nostr "rotate" action (`rotateNostrIdentity`) only bumps the
+ *     NIP-06 account index — it does *not* change the BuhoGO seed.
+ *     Account-index rotation is device-local: it isn't recoverable from
+ *     the seed phrase alone, so a fresh restore lands the user back on
+ *     account 0 (the canonical NIP-06 account every other Nostr client
+ *     also defaults to).
+ *
+ * Storage model:
+ *   - Encrypted mnemonic at `buhoGO_identity_seed_v1` (envelope from
+ *     `utils/deviceCrypto`, same scheme as the Spark seed).
+ *   - Metadata (backup status, connected sites) at `buhoGO_identity_v1`.
+ *   - Both keyed off the same device key as the wallet store, so a single
+ *     bootstrap secret protects everything we keep on disk.
+ *
+ * Design notes:
+ *   - Identity is created lazily (on first LUD-04 attempt or first visit
+ *     to the Identity Profile settings section). We never force a user
+ *     through identity onboarding before they need it.
+ *   - Signing does *not* re-prompt biometrics on every callback. App-level
+ *     biometric lock (if enabled) already gated entry to the app.
+ *   - The mnemonic is decrypted, used, and dropped — never held on the
+ *     store after a call returns.
+ */
+
+import { defineStore } from 'pinia';
+import { encryptString, decryptString } from '../utils/deviceCrypto.js';
+import {
+  generateIdentityMnemonic,
+  isValidIdentityMnemonic,
+  normaliseMnemonic,
+  deriveLinkingKey,
+  deriveNostrIdentity,
+  signLud04Challenge,
+  computeIdentityFingerprint,
+  bytesToHex,
+  hexToBytes,
+} from '../utils/identityCrypto.js';
+import {
+  buildPointerEvent,
+  fetchPointer,
+  publishPointer,
+  sanitizeRoster,
+} from '../utils/nostrIdentityPointer.js';
+import { fetchOwnWriteRelays } from '../utils/nostrContactsDoc.js';
+import { DEFAULT_RELAYS } from '../utils/nostrRelays.js';
+import { createSecretKeySigner, nip19 } from 'nostr-core';
+import { sanitizeExternalIdentities, verifiedSigner } from '../utils/externalIdentity.js';
+import { adoptBunker, bunkerSigner, closeSigner, extensionSigner } from '../services/identitySigners.js';
+
+const STORAGE_KEYS = Object.freeze({
+  METADATA: 'buhoGO_identity_v1',
+  SEED_ENVELOPE: 'buhoGO_identity_seed_v1',
+  /** + identity id: an imported secret key, or a remote signer pairing key, encrypted. */
+  EXTERNAL_ENVELOPE_PREFIX: 'buhoGO_identity_external_',
+});
+
+function noRawKeyError() {
+  const err = new Error('This identity signs through another app');
+  err.code = 'IDENTITY_NO_RAW_KEY';
+  return err;
+}
+
+/** Schema version for the metadata blob. Bump on breaking change. */
+const METADATA_VERSION = 1;
+
+/** Maximum number of connected sites we keep locally. */
+const MAX_CONNECTED_SITES = 200;
+
+/**
+ * Upper bound (exclusive) for the NIP-06 account index. Matches BIP-32's
+ * hardened-derivation threshold — anything ≥ 2^31 would collide with the
+ * hardened-index encoding and isn't a valid value for the `<account>` field
+ * in `m/44'/1237'/<account>'/0/0`.
+ */
+const NOSTR_MAX_ACCOUNT = 2 ** 31;
+
+/**
+ * Defensive parser for the persisted `nip05Handles` array. Returns a fresh
+ * normalised array on success, or `null` if the input is missing/malformed
+ * so the caller can fall through to the legacy-shape migration.
+ *
+ * - Drops entries with a missing or non-string `handle`.
+ * - Coerces `isFree` / `isActive` to booleans.
+ * - At most one entry stays `isActive: true` (first-wins) so a hand-edited
+ *   localStorage blob can't put us in a "two actives" invalid state.
+ */
+function sanitiseNip05Handles(raw) {
+  if (!Array.isArray(raw)) return null;
+  let sawActive = false;
+  const cleaned = [];
+  for (const entry of raw) {
+    if (!entry || typeof entry.handle !== 'string' || !entry.handle) continue;
+    const isActive = !sawActive && !!entry.isActive;
+    if (isActive) sawActive = true;
+    cleaned.push({
+      handle: entry.handle,
+      rotationSecret:
+        typeof entry.rotationSecret === 'string' ? entry.rotationSecret : null,
+      isFree: !!entry.isFree,
+      isActive,
+      addressId: typeof entry.addressId === 'string' ? entry.addressId : null,
+      createdAt: Number.isFinite(entry.createdAt) ? entry.createdAt : 0,
+      expiresAt: Number.isFinite(entry.expiresAt) ? entry.expiresAt : null,
+    });
+  }
+  // If nothing was marked active but the user does have handles, promote
+  // the first one. Keeps the "must always have an active" invariant alive.
+  if (cleaned.length > 0 && !sawActive) cleaned[0].isActive = true;
+  return cleaned;
+}
+
+/**
+ * One-time migration from the old single-handle persisted shape
+ * (`nip05Handle` + `nip05RotationSecret`) into the new array shape. Returns
+ * an empty array when the legacy fields are also absent — i.e. a never-
+ * registered identity.
+ */
+function legacyToHandleArray(parsed) {
+  const legacyHandle = typeof parsed?.nip05Handle === 'string' ? parsed.nip05Handle : null;
+  if (!legacyHandle) return [];
+  return [{
+    handle: legacyHandle,
+    rotationSecret:
+      typeof parsed.nip05RotationSecret === 'string' ? parsed.nip05RotationSecret : null,
+    isFree: true,
+    isActive: true,
+    addressId: null,
+    createdAt: 0,
+    expiresAt: null,
+  }];
+}
+
+/**
+ * Defensive parser for the persisted pending username claims, keyed by the
+ * pubkey each claim was bought for. Age alone cannot prove an invoice unpaid:
+ * payment may have completed while this device was offline.
+ */
+function sanitisePendingClaims(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [pubkey, claim] of Object.entries(raw)) {
+    if (!/^[0-9a-f]{64}$/.test(pubkey)) continue;
+    if (!claim || typeof claim.handle !== 'string' || !claim.handle) continue;
+    if (typeof claim.paymentHash !== 'string' || !claim.paymentHash) continue;
+    const createdAt = Number.isFinite(claim.createdAt) ? claim.createdAt : 0;
+    out[pubkey] = {
+      handle: claim.handle,
+      paymentHash: claim.paymentHash,
+      invoice: typeof claim.invoice === 'string' ? claim.invoice : null,
+      addressId: typeof claim.addressId === 'string' ? claim.addressId : null,
+      rotationSecret: typeof claim.rotationSecret === 'string' ? claim.rotationSecret : null,
+      years: Number.isInteger(claim.years) && claim.years > 0 ? claim.years : 1,
+      amountSats: Number.isFinite(claim.amountSats) ? claim.amountSats : null,
+      createdAt,
+      paidAt: Number.isFinite(claim.paidAt) ? claim.paidAt : null,
+      failedAt: Number.isFinite(claim.failedAt) ? claim.failedAt : null,
+      usernameRevision: Number.isSafeInteger(claim.usernameRevision) ? claim.usernameRevision : null,
+    };
+  }
+  return out;
+}
+
+/**
+ * Removed-account indices from storage: integers that are still roster
+ * members, deduped and sorted. Anything else is dropped, so a corrupt entry
+ * can only ever show an identity, never hide one that does not exist.
+ *
+ * @param {unknown} value
+ * @param {Array<{ i: number }>} roster
+ * @returns {number[]}
+ */
+function sanitizeRemovedAccounts(value, roster) {
+  if (!Array.isArray(value)) return [];
+  const known = new Set(roster.map((a) => a.i));
+  return [...new Set(value.filter((i) => Number.isInteger(i) && known.has(i)))].sort((a, b) => a - b);
+}
+
+export const useIdentityStore = defineStore('identity', {
+  state: () => ({
+    /** True once we've loaded any persisted state from disk. */
+    hydrated: false,
+    /** True iff an identity seed exists on disk. */
+    bootstrapped: false,
+    /** True after the user verifies they wrote the seed down. */
+    backupConfirmed: false,
+    /** Cached, derived fingerprint of the identity. 16 hex chars or null. */
+    fingerprint: null,
+    /** Local-only record of sites the user has authenticated to. */
+    connectedSites: [],
+    /** Sticky banner dismissal — undefined or epoch-ms. */
+    backupBannerDismissedUntil: null,
+    /**
+     * Nostr NIP-06 account index for the active identity. Defaults to 0;
+     * incremented by `rotateNostrIdentity()` to forget the previous key
+     * without rotating the whole BuhoGO identity. Persists across reloads
+     * so the same npub keeps showing up.
+     */
+    nostrAccountIndex: 0,
+    /** Cached x-only Nostr pubkey (64 hex chars) or null until first derive. */
+    nostrPubkeyHex: null,
+    /** Cached NIP-19 `npub1...` for the current account, or null. */
+    nostrNpub: null,
+    /**
+     * This phone's record of usernames bought for the current Nostr key
+     * (`name@mybuho.de`): handle, rotation secret, address id, date bought,
+     * and the end date when this phone saw the payment (`expiresAt`, epoch
+     * ms, null when unknown).
+     *
+     * A record only. The username a person uses lives in their published
+     * profile (`profile.username`), which is what every screen reads, so a
+     * restore or a second phone needs nothing from here. Older installs
+     * also hold the retired free `name.123456` handle; it stays as history
+     * and is never shown.
+     *
+     * Cleared on `rotateNostrIdentity` because every handle is bound to
+     * the previous pubkey.
+     */
+    nip05Handles: [],
+    /**
+     * Epoch-ms the Profile intro carousel was first dismissed, or null
+     * if the user has never opened ProfilePage. Used to show the intro
+     * exactly once. Reset to null by `reset()` so a fresh identity sees
+     * the intro again.
+     */
+    profileIntroSeenAt: null,
+    /**
+     * Every NIP-06 account this identity is known to use, sorted by
+     * index: [{ i, label?, createdAt? }]. Always contains account 0.
+     * "Create another identity" appends here; the roster is what the
+     * Change-identity sheet lists and what the published pointer
+     * carries so a fresh restore can find every identity again from
+     * the same 12 words.
+     */
+    nostrKnownAccounts: [],
+    /**
+     * True while the published pointer is known to lag local state (a
+     * create/switch whose publish did not land). The Change-identity
+     * sheet surfaces a retry; a stale pointer only costs restore
+     * accuracy on OTHER devices, so nothing blocks on it locally.
+     */
+    pointerDirty: false,
+    /**
+     * Per-account stash of NIP-05 handles keyed by account index.
+     * Handles are bound to a pubkey, so switching identities must not
+     * drag them along — the active account's handles live in
+     * `nip05Handles` (every existing consumer keeps working) and the
+     * inactive accounts' handles wait here for the switch back.
+     */
+    nostrAccountNip05: {},
+    /**
+     * Roster accounts removed from this phone's list, sorted. A removal
+     * hides an identity, it never deletes one: the account stays in the
+     * roster (so its index is never handed out again) and in the published
+     * pointer (so a restore of the 12 words brings it back), and its keys,
+     * usernames and contacts are untouched. Local to this phone.
+     */
+    nostrRemovedAccounts: [],
+    /**
+     * Identities brought from another app (utils/externalIdentity.js):
+     * [{ id, kind: 'secretKey'|'nip07'|'nip46', pubkeyHex, npub, label,
+     * createdAt, nip05Handles, bunker? }]. Not derived from the 12 words,
+     * so never in the roster or the restore pointer. Secrets live in their
+     * own encrypted envelopes, never here.
+     */
+    externalIdentities: [],
+    /** The external identity in use, or null when a derived one is. */
+    activeExternalId: null,
+    /**
+     * Username purchases still waiting to finish, keyed by the pubkey they
+     * were bought for: { [pubkeyHex]: { handle, paymentHash, invoice,
+     * addressId, rotationSecret, years, amountSats, createdAt, paidAt,
+     * failedAt } }. Keyed
+     * rather than single so a claim started on one identity waits, intact,
+     * while another identity is active.
+     */
+    pendingNip05Claims: {},
+    /**
+     * In-flight pointer discovery, or null. Single-flight so the
+     * restore flow can await the same lookup `importMnemonic`'s
+     * caller kicked off. Never persisted.
+     */
+    _pointerResolve: null,
+  }),
+
+  getters: {
+    /** The external identity in use, or null. */
+    activeExternal(state) {
+      return state.externalIdentities.find((e) => e.id === state.activeExternalId) || null;
+    },
+
+    /**
+     * What the identity in use can do. `rawKey`: its secret key is on this
+     * phone (the Social Bucket needs it). `needsApproval`: every signature
+     * asks another app, so nothing signs in the background.
+     */
+    identityCapabilities(state) {
+      const kind = state.externalIdentities.find((e) => e.id === state.activeExternalId)?.kind || 'derived';
+      const signerApp = kind === 'nip07' || kind === 'nip46';
+      return { kind, rawKey: !signerApp, needsApproval: signerApp };
+    },
+
+    /** True if there's an identity *and* the user has confirmed backup. */
+    isReady(state) {
+      return state.bootstrapped && state.backupConfirmed;
+    },
+
+    /** Shape used by the connected-sites list UI. */
+    connectedSitesSorted(state) {
+      return [...state.connectedSites].sort(
+        (a, b) => (b.lastUsedAt || 0) - (a.lastUsedAt || 0),
+      );
+    },
+
+    /** The currently-active NIP-05 entry, or null. */
+    nip05ActiveEntry(state) {
+      return state.nip05Handles.find((h) => h.isActive) || null;
+    },
+
+    /** End date (epoch ms) this phone knows for a bought name, or null. */
+    usernameExpiresAt(state) {
+      return (handle) => state.nip05Handles.find((h) => h.handle === handle)?.expiresAt ?? null;
+    },
+
+    /** The pending username claim for the active identity, or null. */
+    pendingNip05Claim(state) {
+      return (state.nostrPubkeyHex && state.pendingNip05Claims[state.nostrPubkeyHex]) || null;
+    },
+
+    /** True iff the backup banner should be shown right now. */
+    shouldShowBackupBanner(state) {
+      if (!state.bootstrapped) return false;
+      if (state.backupConfirmed) return false;
+      const until = state.backupBannerDismissedUntil;
+      if (until && Date.now() < until) return false;
+      return true;
+    },
+  },
+
+  actions: {
+    // -------------------------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------------------------
+
+    /**
+     * Read persisted state from localStorage. Idempotent. Should be called
+     * once on app boot and any time we suspect external mutation (storage
+     * events, etc.).
+     */
+    async hydrate() {
+      if (this.hydrated) return;
+
+      try {
+        const raw = localStorage.getItem(STORAGE_KEYS.METADATA);
+        if (raw) {
+          const parsed = JSON.parse(raw);
+          if (parsed?.version === METADATA_VERSION) {
+            this.backupConfirmed = !!parsed.backupConfirmed;
+            this.fingerprint = parsed.fingerprint ?? null;
+            this.connectedSites = Array.isArray(parsed.connectedSites)
+              ? parsed.connectedSites.slice(0, MAX_CONNECTED_SITES)
+              : [];
+            this.backupBannerDismissedUntil =
+              parsed.backupBannerDismissedUntil ?? null;
+            // Nostr fields are optional — older metadata blobs predate
+            // them, so fall back to defaults without invalidating the
+            // rest of the persisted state. The account index is clamped
+            // to a valid BIP-32 non-hardened range so a hand-edited
+            // localStorage value can't break key derivation.
+            const persistedAcct = parsed.nostrAccountIndex;
+            this.nostrAccountIndex =
+              Number.isInteger(persistedAcct) &&
+              persistedAcct >= 0 &&
+              persistedAcct < NOSTR_MAX_ACCOUNT
+                ? persistedAcct
+                : 0;
+            this.nostrPubkeyHex = parsed.nostrPubkeyHex ?? null;
+            this.nostrNpub = parsed.nostrNpub ?? null;
+            // NIP-05 handles. New shape is an array; older blobs (before
+            // the marketplace landed) persisted a single `nip05Handle` +
+            // `nip05RotationSecret`. Migrate transparently — the single
+            // handle becomes the only entry, marked free + active, so the
+            // boot orchestrator's idempotent path treats the user as
+            // "already registered" rather than racing to re-register.
+            this.nip05Handles = sanitiseNip05Handles(parsed.nip05Handles)
+              ?? legacyToHandleArray(parsed);
+            this.profileIntroSeenAt = parsed.profileIntroSeenAt ?? null;
+            // Multi-identity fields are newer than the metadata schema;
+            // older blobs simply lack them. The roster is re-seeded from
+            // the active index so a pre-roster install that already
+            // rotated still lists its current identity.
+            this.nostrKnownAccounts = sanitizeRoster(
+              parsed.nostrKnownAccounts,
+              this.nostrAccountIndex,
+            );
+            this.nostrRemovedAccounts = sanitizeRemovedAccounts(
+              parsed.nostrRemovedAccounts,
+              this.nostrKnownAccounts,
+            );
+            this.externalIdentities = sanitizeExternalIdentities(parsed.externalIdentities);
+            const active = this.externalIdentities.find((e) => e.id === parsed.activeExternalId);
+            this.activeExternalId = active ? active.id : null;
+            if (parsed.activeExternalId && !active) {
+              // The identity in use is gone: fall back to the derived one,
+              // re-derived on demand by loadNostrIdentity().
+              this.nostrPubkeyHex = null;
+              this.nostrNpub = null;
+            } else if (active) {
+              this.nostrPubkeyHex = active.pubkeyHex;
+              this.nostrNpub = active.npub;
+            }
+            this.pointerDirty = !!parsed.pointerDirty;
+            this.pendingNip05Claims = sanitisePendingClaims(parsed.pendingNip05Claims);
+            this.nostrAccountNip05 = {};
+            if (parsed.nostrAccountNip05 && typeof parsed.nostrAccountNip05 === 'object') {
+              for (const [key, value] of Object.entries(parsed.nostrAccountNip05)) {
+                const idx = Number.parseInt(key, 10);
+                const handles = sanitiseNip05Handles(value);
+                if (Number.isInteger(idx) && idx >= 0 && handles) {
+                  this.nostrAccountNip05[idx] = handles;
+                }
+              }
+            }
+          }
+        }
+
+        const envelope = localStorage.getItem(STORAGE_KEYS.SEED_ENVELOPE);
+        this.bootstrapped = !!envelope;
+      } catch (err) {
+        // Corrupted persisted state should not block the app; surface in
+        // logs and fall through with defaults so the user can still set up
+        // a fresh identity from Settings.
+        console.warn('[identity] hydrate failed, using defaults:', err);
+      }
+
+      this.hydrated = true;
+    },
+
+    /** Internal: persist the non-secret state to disk. */
+    _persistMetadata() {
+      const payload = {
+        version: METADATA_VERSION,
+        backupConfirmed: this.backupConfirmed,
+        fingerprint: this.fingerprint,
+        connectedSites: this.connectedSites.slice(0, MAX_CONNECTED_SITES),
+        backupBannerDismissedUntil: this.backupBannerDismissedUntil,
+        nostrAccountIndex: this.nostrAccountIndex,
+        nostrPubkeyHex: this.nostrPubkeyHex,
+        nostrNpub: this.nostrNpub,
+        nip05Handles: this.nip05Handles.map((h) => ({ ...h })),
+        profileIntroSeenAt: this.profileIntroSeenAt,
+        nostrKnownAccounts: this.nostrKnownAccounts.map((a) => ({ ...a })),
+        nostrRemovedAccounts: [...this.nostrRemovedAccounts],
+        externalIdentities: this.externalIdentities.map((e) => ({
+          ...e,
+          nip05Handles: e.nip05Handles.map((h) => ({ ...h })),
+          ...(e.bunker ? { bunker: { ...e.bunker, relays: [...e.bunker.relays] } } : {}),
+        })),
+        activeExternalId: this.activeExternalId,
+        pointerDirty: this.pointerDirty,
+        pendingNip05Claims: Object.fromEntries(
+          Object.entries(this.pendingNip05Claims).map(([key, claim]) => [key, { ...claim }]),
+        ),
+        nostrAccountNip05: Object.fromEntries(
+          Object.entries(this.nostrAccountNip05).map(
+            ([i, handles]) => [i, handles.map((h) => ({ ...h }))],
+          ),
+        ),
+      };
+      localStorage.setItem(STORAGE_KEYS.METADATA, JSON.stringify(payload));
+    },
+
+    /**
+     * Internal: derive the public Nostr identity (npub + hex pubkey) and
+     * cache it on the store. Called from any action that already holds
+     * the mnemonic in scope so we never re-decrypt just to compute a
+     * pubkey. Throws on derivation failure — callers decide whether to
+     * propagate or swallow.
+     *
+     * @param {string} mnemonic
+     */
+    _cacheNostrPublic(mnemonic) {
+      const { publicKeyHex, npub } = deriveNostrIdentity(
+        mnemonic,
+        this.nostrAccountIndex,
+      );
+      this.nostrPubkeyHex = publicKeyHex;
+      this.nostrNpub = npub;
+    },
+
+    /**
+     * Internal: try to cache the Nostr public material but never throw.
+     * Used by identity-bootstrap flows (`ensureIdentity`, `importMnemonic`)
+     * so a Nostr-derivation failure can't take down the whole identity —
+     * LUD-04 sign-in keeps working, and the dialog can call
+     * `loadNostrIdentity()` later to retry.
+     *
+     * @param {string} mnemonic
+     */
+    _tryCacheNostrPublic(mnemonic) {
+      try {
+        this._cacheNostrPublic(mnemonic);
+      } catch (err) {
+        console.warn(
+          '[identity] Nostr cache failed at bootstrap, leaving null:',
+          err,
+        );
+        this.nostrPubkeyHex = null;
+        this.nostrNpub = null;
+      }
+    },
+
+    // -------------------------------------------------------------------
+    // Seed lifecycle
+    // -------------------------------------------------------------------
+
+    /**
+     * Make sure an identity seed exists. Generates a new one if not. Safe
+     * to call repeatedly; only the first call mutates state.
+     */
+    async ensureIdentity() {
+      await this.hydrate();
+      if (this.bootstrapped) return;
+
+      const mnemonic = generateIdentityMnemonic();
+      const envelope = await encryptString(mnemonic);
+      localStorage.setItem(STORAGE_KEYS.SEED_ENVELOPE, envelope);
+
+      this.bootstrapped = true;
+      this.backupConfirmed = false;
+      this.fingerprint = computeIdentityFingerprint(mnemonic);
+      this.nostrAccountIndex = 0;
+      this.nostrKnownAccounts = [{ i: 0, createdAt: Date.now() }];
+      this.nostrRemovedAccounts = [];
+      this.pointerDirty = false;
+      this.nostrAccountNip05 = {};
+      // Nostr cache is best-effort here: a derivation failure must not
+      // prevent the user from getting a working LUD-04 identity.
+      this._tryCacheNostrPublic(mnemonic);
+      this._persistMetadata();
+    },
+
+    /**
+     * Import an externally-supplied mnemonic. Replaces any existing
+     * identity, *including* its connected-sites list, because the new seed
+     * produces different linking keys and any previously linked site no
+     * longer recognises this user.
+     *
+     * @param {string}  mnemonic
+     * @param {boolean} [markBackedUp=true]  - imported seeds are assumed
+     *   to already have a backup (the user just typed it).
+     */
+    async importMnemonic(mnemonic, markBackedUp = true) {
+      const normalised = normaliseMnemonic(mnemonic);
+      if (!isValidIdentityMnemonic(normalised)) {
+        const err = new Error('Invalid recovery phrase');
+        err.code = 'IDENTITY_INVALID_MNEMONIC';
+        throw err;
+      }
+
+      const envelope = await encryptString(normalised);
+      localStorage.setItem(STORAGE_KEYS.SEED_ENVELOPE, envelope);
+
+      // Imported identities are independent of the phrase and stay; the
+      // restored phrase's first identity becomes the one in use.
+      if (this.activeExternalId) {
+        this._stashActiveHandles();
+        this.activeExternalId = null;
+        this.nip05Handles = [];
+      }
+      this.bootstrapped = true;
+      this.backupConfirmed = !!markBackedUp;
+      this.fingerprint = computeIdentityFingerprint(normalised);
+      this.connectedSites = [];
+      this.backupBannerDismissedUntil = null;
+      // Restored identity lands on the canonical NIP-06 account 0 first —
+      // fast, deterministic, works offline, and matches what any other
+      // Nostr client derives from the same words. Identities created via
+      // the account-index climb are recovered afterwards by the restore
+      // orchestrator awaiting `resolveActiveNostrAccount()`, which reads
+      // the published pointer and silently upgrades the active account.
+      // Best-effort cache: a derivation failure must not block the restore.
+      this.nostrAccountIndex = 0;
+      this.nostrKnownAccounts = [{ i: 0, createdAt: Date.now() }];
+      this.nostrRemovedAccounts = [];
+      this.pointerDirty = false;
+      this.nostrAccountNip05 = {};
+      this.pendingNip05Claims = {};
+      this._tryCacheNostrPublic(normalised);
+      this._persistMetadata();
+    },
+
+    /**
+     * Return the decrypted mnemonic. Throws if no identity exists. The
+     * caller is responsible for wiping the returned string from any
+     * component state when it's done with it.
+     *
+     * @returns {Promise<string>}
+     */
+    async getMnemonic() {
+      const envelope = localStorage.getItem(STORAGE_KEYS.SEED_ENVELOPE);
+      if (!envelope) {
+        const err = new Error('No identity seed');
+        err.code = 'IDENTITY_NOT_BOOTSTRAPPED';
+        throw err;
+      }
+      return decryptString(envelope);
+    },
+
+    /**
+     * Mark the seed as backed up. Called after the verification step
+     * succeeds in the seed-phrase dialog.
+     */
+    async confirmBackup() {
+      const previous = this.backupConfirmed;
+      const dismissed = this.backupBannerDismissedUntil;
+      this.backupConfirmed = true;
+      this.backupBannerDismissedUntil = null;
+      try {
+        this._persistMetadata();
+      } catch (error) {
+        this.backupConfirmed = previous;
+        this.backupBannerDismissedUntil = dismissed;
+        throw error;
+      }
+    },
+
+    /**
+     * Dismiss the backup banner for a window (default 4 hours, matching
+     * the wallet seed backup banner). The banner re-appears once expired.
+     *
+     * @param {number} [hours=4]
+     */
+    dismissBackupBanner(hours = 4) {
+      this.backupBannerDismissedUntil = Date.now() + hours * 60 * 60 * 1000;
+      this._persistMetadata();
+    },
+
+    /**
+     * Destroy the local identity entirely. Used by the "Reset Identity"
+     * action and on full app wipe. Does NOT remove the device key —
+     * that's shared with the wallet store and must outlive identity.
+     */
+    async reset() {
+      for (const external of this.externalIdentities) {
+        closeSigner(external.id);
+        localStorage.removeItem(STORAGE_KEYS.EXTERNAL_ENVELOPE_PREFIX + external.id);
+      }
+      this.externalIdentities = [];
+      this.activeExternalId = null;
+      localStorage.removeItem(STORAGE_KEYS.SEED_ENVELOPE);
+      localStorage.removeItem(STORAGE_KEYS.METADATA);
+      this.bootstrapped = false;
+      this.backupConfirmed = false;
+      this.fingerprint = null;
+      this.connectedSites = [];
+      this.backupBannerDismissedUntil = null;
+      this.nostrAccountIndex = 0;
+      this.nostrPubkeyHex = null;
+      this.nostrNpub = null;
+      this.nip05Handles = [];
+      this.profileIntroSeenAt = null;
+      this.nostrKnownAccounts = [];
+      this.nostrRemovedAccounts = [];
+      this.pointerDirty = false;
+      this.nostrAccountNip05 = {};
+      this.pendingNip05Claims = {};
+      this._pointerResolve = null;
+    },
+
+    /**
+     * Record a username this identity owns, after the ownership check has
+     * confirmed it: a new purchase, or a name the person already owned and
+     * switched back to. The record becomes the active entry; an existing
+     * entry keeps its rotation secret unless a new one is given.
+     *
+     * Bookkeeping only. The profile's `nip05` is what the app shows; the
+     * caller writes that separately (`profile.setUsername`).
+     *
+     * @param {{ handle: string, rotationSecret?: string|null, addressId?: string|null, expiresAt?: number|null }} info
+     */
+    recordOwnedHandle({ handle, rotationSecret = null, addressId = null, expiresAt = null } = {}) {
+      const value = String(handle || '').trim().toLowerCase();
+      if (!value) return;
+      if (!this.nip05Handles.some((h) => h.handle === value)) {
+        this.nip05Handles.push({
+          handle: value,
+          rotationSecret: null,
+          isFree: false,
+          isActive: false,
+          addressId: null,
+          createdAt: Date.now(),
+          expiresAt: null,
+        });
+      }
+      // Match by handle, not identity: the array holds reactive proxies.
+      for (const entry of this.nip05Handles) {
+        entry.isActive = entry.handle === value;
+        if (!entry.isActive) continue;
+        if (rotationSecret) entry.rotationSecret = rotationSecret;
+        if (addressId) entry.addressId = addressId;
+        if (Number.isFinite(expiresAt)) entry.expiresAt = expiresAt;
+      }
+      this._persistMetadata();
+    },
+
+    /**
+     * Remember a username purchase that has a payment code but is not
+     * finished yet, for the active identity. Survives closing the sheet and
+     * restarting the app; the profile sync lifecycle finishes it.
+     *
+     * @param {{ handle: string, paymentHash: string, invoice?: string, addressId?: string|null, rotationSecret?: string|null, years?: number, amountSats?: number }} claim
+     */
+    setPendingNip05Claim(claim) {
+      if (!this.nostrPubkeyHex || !claim?.handle || !claim?.paymentHash) return;
+      if (this.pendingNip05Claim) {
+        if (this.pendingNip05Claim.paymentHash !== claim.paymentHash) throw new Error('A username purchase is still pending');
+        return;
+      }
+      this.pendingNip05Claims = {
+        ...this.pendingNip05Claims,
+        [this.nostrPubkeyHex]: {
+          handle: claim.handle,
+          paymentHash: claim.paymentHash,
+          invoice: claim.invoice || null,
+          addressId: claim.addressId || null,
+          rotationSecret: claim.rotationSecret || null,
+          years: Number.isInteger(claim.years) && claim.years > 0 ? claim.years : 1,
+          amountSats: Number.isFinite(claim.amountSats) ? claim.amountSats : null,
+          createdAt: Date.now(),
+          paidAt: null,
+          failedAt: null,
+          usernameRevision: Number.isSafeInteger(claim.usernameRevision) ? claim.usernameRevision : null,
+        },
+      };
+      this._persistMetadata();
+    },
+
+    /**
+     * Update the active identity's pending claim (for example `paidAt` once
+     * the payment went through, or `failedAt` when the name went to someone
+     * else first). No-op without a pending claim.
+     */
+    updatePendingNip05Claim(patch, { pubkey = this.nostrPubkeyHex, paymentHash } = {}) {
+      const current = this.pendingNip05Claims[pubkey];
+      if (!current || paymentHash && current.paymentHash !== paymentHash) return;
+      this.pendingNip05Claims = {
+        ...this.pendingNip05Claims,
+        [pubkey]: { ...current, ...patch },
+      };
+      this._persistMetadata();
+    },
+
+    /** Forget the active identity's pending claim. */
+    clearPendingNip05Claim() {
+      if (!this.pendingNip05Claim) return;
+      const next = { ...this.pendingNip05Claims };
+      delete next[this.nostrPubkeyHex];
+      this.pendingNip05Claims = next;
+      this._persistMetadata();
+    },
+
+    /**
+     * Mark the Profile intro carousel as seen so it does not re-appear
+     * on subsequent visits. Idempotent: re-calling is a no-op once set.
+     */
+    markProfileIntroSeen() {
+      if (this.profileIntroSeenAt) return;
+      this.profileIntroSeenAt = Date.now();
+      this._persistMetadata();
+    },
+
+    /**
+     * Wipe the current identity and immediately generate a fresh one in
+     * the same call. Used by the "Generate new identity" destructive
+     * action — guarantees the user always lands with an identity in
+     * place, no in-between "no identity at all" state where the UI
+     * would dead-end on a missing fingerprint.
+     */
+    async regenerate() {
+      await this.reset();
+      await this.ensureIdentity();
+    },
+
+    // -------------------------------------------------------------------
+    // LUD-04 signing
+    // -------------------------------------------------------------------
+
+    /**
+     * Produce the proof bundle for a LUD-04 challenge.
+     *
+     * Caller passes the parsed challenge (from `utils/lud4.parseLud04Url`);
+     * we decrypt the mnemonic, derive the linking key for the given
+     * domain, sign the k1, and return everything the callback URL needs.
+     *
+     * The decrypted mnemonic is *never* assigned to component state — it
+     * lives only as a local var during this call.
+     *
+     * @param {{ domain: string, k1: Uint8Array }} challenge
+     * @returns {Promise<{ sigDerHex: string, linkingPubHex: string }>}
+     */
+    async signLud04(challenge) {
+      const { domain, k1 } = challenge;
+      if (typeof domain !== 'string' || !domain) {
+        throw new TypeError('challenge.domain is required');
+      }
+      if (!(k1 instanceof Uint8Array) || k1.length !== 32) {
+        throw new TypeError('challenge.k1 must be a 32-byte Uint8Array');
+      }
+
+      if (!this.bootstrapped) {
+        await this.ensureIdentity();
+      }
+
+      const mnemonic = await this.getMnemonic();
+      try {
+        const linking = deriveLinkingKey(mnemonic, domain);
+        const sig = signLud04Challenge(k1, linking.privateKey);
+
+        // Recompute the fingerprint on the off-chance it wasn't cached
+        // (e.g. when state was rebuilt from corrupted metadata). Cheap
+        // and idempotent.
+        if (!this.fingerprint) {
+          this.fingerprint = computeIdentityFingerprint(mnemonic);
+          this._persistMetadata();
+        }
+
+        return {
+          sigDerHex: bytesToHex(sig),
+          linkingPubHex: bytesToHex(linking.publicKey),
+        };
+      } finally {
+        // Best-effort wipe — JS strings are immutable so the engine still
+        // holds copies, but at least we drop our reference.
+        // eslint-disable-next-line no-param-reassign, no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    // -------------------------------------------------------------------
+    // Nostr (NIP-06) keys
+    //
+    // Public material (`nostrPubkeyHex`, `nostrNpub`) is cached on the
+    // store and persisted, so the UI can render the user's npub without
+    // touching the encrypted mnemonic. Private material (`nsec`,
+    // `privateKeyHex`) is *never* persisted and only returned from a
+    // dedicated action — caller decides how long to hold it.
+    // -------------------------------------------------------------------
+
+    /**
+     * Make sure the cached Nostr public material is populated for the
+     * current identity. Idempotent. Useful from existing-user flows where
+     * `bootstrapped` is true (metadata is hydrated) but the cache predates
+     * the Nostr feature.
+     *
+     * @returns {Promise<{ pubkeyHex: string, npub: string } | null>}
+     *   `null` if no identity exists yet.
+     */
+    async loadNostrIdentity() {
+      if (!this.bootstrapped) return null;
+      if (this.nostrPubkeyHex && this.nostrNpub) {
+        return { pubkeyHex: this.nostrPubkeyHex, npub: this.nostrNpub };
+      }
+
+      const mnemonic = await this.getMnemonic();
+      try {
+        this._cacheNostrPublic(mnemonic);
+        this._persistMetadata();
+        return { pubkeyHex: this.nostrPubkeyHex, npub: this.nostrNpub };
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    /**
+     * Reveal the current Nostr secret key. Decrypts the mnemonic, derives
+     * the NIP-06 keypair for the active account, and returns the secret
+     * key in both raw and bech32 forms. The decrypted mnemonic and the
+     * returned secret material are never assigned to store state.
+     *
+     * Caller is responsible for:
+     *   1. Gating this call behind biometric/PIN (App Lock).
+     *   2. Wiping local references when the reveal UI closes.
+     *
+     * @returns {Promise<{ privateKeyHex: string, nsec: string }>}
+     */
+    async revealNostrSecret(account = this.nostrAccountIndex) {
+      if (!this.bootstrapped) {
+        const err = new Error('No identity seed');
+        err.code = 'IDENTITY_NOT_BOOTSTRAPPED';
+        throw err;
+      }
+      // Pin the requested roster entry before decrypting. Exporting an inactive
+      // identity must not switch the user's profile, contacts or signer.
+      if (!this.nostrKnownAccounts.some(entry => entry.i === account)) {
+        throw new Error('Unknown identity account');
+      }
+      const fingerprint = this.fingerprint;
+      const mnemonic = await this.getMnemonic();
+      try {
+        if (fingerprint !== this.fingerprint || !this.nostrKnownAccounts.some(entry => entry.i === account)) {
+          throw new Error('Identity changed');
+        }
+        const { privateKey, nsec } = deriveNostrIdentity(
+          mnemonic,
+          account,
+        );
+        try {
+          return { privateKeyHex: bytesToHex(privateKey), nsec };
+        } finally {
+          privateKey.fill(0);
+        }
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    /**
+     * Internal: return the raw 32-byte schnorr secret key bytes for the
+     * current Nostr account. Used by `profileStore.publish()` to sign
+     * kind:0 / kind:10002 events; not surfaced to user-facing UI and
+     * deliberately not gated by an extra biometric prompt — the app-
+     * level lock already covered entry to the app, and the byte buffer
+     * is meant to be consumed and wiped within a single call.
+     *
+     * The returned array is freshly allocated on every call; callers
+     * SHOULD `secretKey.fill(0)` once they no longer need it. We never
+     * cache these bytes on the store and never persist them.
+     *
+     * @returns {Promise<Uint8Array>}  32 bytes
+     */
+    async getNostrSecretKeyBytes() {
+      const external = this.activeExternal;
+      if (external) {
+        if (external.kind !== 'secretKey') throw noRawKeyError();
+        return this._readExternalSecret(external.id);
+      }
+      if (!this.bootstrapped) {
+        const err = new Error('No identity seed');
+        err.code = 'IDENTITY_NOT_BOOTSTRAPPED';
+        throw err;
+      }
+      const mnemonic = await this.getMnemonic();
+      try {
+        const { privateKey } = deriveNostrIdentity(
+          mnemonic,
+          this.nostrAccountIndex,
+        );
+        return privateKey;
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    /**
+     * Rotate to a fresh Nostr key while keeping the BuhoGO identity (the
+     * BIP-39 seed) unchanged. Bumps the NIP-06 account index by one and
+     * recomputes the cached pubkey/npub.
+     *
+     * Old keys are *not* unrecoverable — anyone with the recovery phrase
+     * can re-derive them — but the UI forgets them, so the user has a
+     * single canonical Nostr identity at any time. This is the right
+     * trade-off for the "forget my Nostr key" intent: cryptographic
+     * destruction would require burning the whole identity.
+     *
+     * @returns {Promise<{ pubkeyHex: string, npub: string, account: number }>}
+     */
+    async rotateNostrIdentity() {
+      if (!this.bootstrapped) {
+        const err = new Error('No identity seed');
+        err.code = 'IDENTITY_NOT_BOOTSTRAPPED';
+        throw err;
+      }
+
+      const currentAccount = Number.isInteger(this.nostrAccountIndex)
+        ? this.nostrAccountIndex
+        : 0;
+      const nextAccount = currentAccount + 1;
+      if (nextAccount >= NOSTR_MAX_ACCOUNT) {
+        // Practically unreachable (2^31 rotations), but a hard wall is
+        // better than a silent BIP-32 collision once we ever do hit it.
+        const err = new Error('Nostr account index exhausted');
+        err.code = 'NOSTR_ACCOUNT_EXHAUSTED';
+        throw err;
+      }
+
+      const mnemonic = await this.getMnemonic();
+      try {
+        const { publicKeyHex, npub } = deriveNostrIdentity(mnemonic, nextAccount);
+
+        // Persist-then-commit: write to disk first, only mutate the
+        // reactive state once the metadata is durable. If localStorage
+        // throws (quota exceeded, etc.), the user stays on the old key
+        // instead of seeing a "new" npub that vanishes on next reload.
+        const prev = {
+          account: this.nostrAccountIndex,
+          pubkey: this.nostrPubkeyHex,
+          npub: this.nostrNpub,
+          nip05Handles: this.nip05Handles.map((h) => ({ ...h })),
+          knownAccounts: this.nostrKnownAccounts.map((a) => ({ ...a })),
+        };
+        this.nostrAccountIndex = nextAccount;
+        this.nostrPubkeyHex = publicKeyHex;
+        this.nostrNpub = npub;
+        // Every handle maps the *previous* pubkey, so the new key starts
+        // with an empty record. Names bought under the old key stay valid
+        // server-side but are no longer this app's to manage.
+        this.nip05Handles = [];
+        // Rotation is the forget-my-key flow, but the account still
+        // joins the roster: the index is in use, and the Change-identity
+        // sheet must never offer a "next" index that collides with it.
+        this.nostrKnownAccounts = sanitizeRoster(
+          [...this.nostrKnownAccounts, { i: nextAccount, createdAt: Date.now() }],
+          nextAccount,
+        );
+        // This dormant path publishes no pointer itself; flag the lag
+        // so the Change-identity sheet's retry surface picks it up.
+        const prevPointerDirty = this.pointerDirty;
+        this.pointerDirty = true;
+        try {
+          this._persistMetadata();
+        } catch (persistErr) {
+          this.nostrAccountIndex = prev.account;
+          this.nostrPubkeyHex = prev.pubkey;
+          this.nostrNpub = prev.npub;
+          this.nip05Handles = prev.nip05Handles;
+          this.nostrKnownAccounts = prev.knownAccounts;
+          this.pointerDirty = prevPointerDirty;
+          throw persistErr;
+        }
+
+        return { pubkeyHex: publicKeyHex, npub, account: nextAccount };
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    // -------------------------------------------------------------------
+    // Multiple identities — the account-index climb
+    //
+    // Another identity NEVER means another mnemonic. It is the next
+    // NIP-06 account under the SAME 12 words, so the one recovery
+    // phrase the user already backed up covers every identity forever.
+    // The roster (`nostrKnownAccounts`) plus the published pointer
+    // (utils/nostrIdentityPointer.js) make the climb restorable on a
+    // fresh device; without the pointer a restore would silently land
+    // on account 0 and lose sight of everything above it.
+    // -------------------------------------------------------------------
+
+    /**
+     * Internal: park the active account's NIP-05 handles and load the
+     * target account's. Handles are bound to a pubkey — they must not
+     * travel across a switch, and they must still be there when the
+     * user switches back.
+     */
+    _stashAndLoadNip05(toAccount) {
+      this._stashActiveHandles();
+      this.nip05Handles = (this.nostrAccountNip05[toAccount] || []).map((h) => ({ ...h }));
+    },
+
+    /** Park the identity in use's handles with it: a derived account or an external record. */
+    _stashActiveHandles() {
+      const handles = this.nip05Handles.map((h) => ({ ...h }));
+      const external = this.activeExternal;
+      if (external) external.nip05Handles = handles;
+      else this.nostrAccountNip05[this.nostrAccountIndex] = handles;
+    },
+
+    /**
+     * Create the next identity: derive at the lowest index above every
+     * roster entry, make it active, and publish the pointer so the new
+     * identity survives a fresh restore.
+     *
+     * Pointer publish failure never rolls the creation back — the new
+     * identity is real the moment the metadata is durable; the pointer
+     * only affects OTHER devices' restores, so it degrades to
+     * `pointerDirty` plus a retry surface in the sheet.
+     *
+     * @param {{
+     *   label?:   string,
+     *   pointer?: object,   // injection for tests / relay overrides —
+     *                       // forwarded to republishNostrPointer()
+     * }} [opts]
+     * @returns {Promise<{ pubkeyHex: string, npub: string, account: number }>}
+     */
+    async createAnotherNostrIdentity({ label, pointer } = {}) {
+      if (!this.bootstrapped) {
+        const err = new Error('No identity seed');
+        err.code = 'IDENTITY_NOT_BOOTSTRAPPED';
+        throw err;
+      }
+
+      const highest = this.nostrKnownAccounts.reduce(
+        (max, a) => Math.max(max, a.i),
+        this.nostrAccountIndex,
+      );
+      const nextAccount = highest + 1;
+      if (nextAccount >= NOSTR_MAX_ACCOUNT) {
+        const err = new Error('Nostr account index exhausted');
+        err.code = 'NOSTR_ACCOUNT_EXHAUSTED';
+        throw err;
+      }
+
+      const mnemonic = await this.getMnemonic();
+      try {
+        const { publicKeyHex, npub } = deriveNostrIdentity(mnemonic, nextAccount);
+
+        // Persist-then-commit, same contract as rotateNostrIdentity: if
+        // localStorage rejects, the user stays on the old identity
+        // instead of seeing a new npub that vanishes on reload.
+        const prev = {
+          account: this.nostrAccountIndex,
+          pubkey: this.nostrPubkeyHex,
+          npub: this.nostrNpub,
+          nip05Handles: this.nip05Handles.map((h) => ({ ...h })),
+          knownAccounts: this.nostrKnownAccounts.map((a) => ({ ...a })),
+          accountNip05: { ...this.nostrAccountNip05 },
+          activeExternalId: this.activeExternalId,
+        };
+        this._stashAndLoadNip05(nextAccount);
+        this.activeExternalId = null;
+        this.nostrAccountIndex = nextAccount;
+        this.nostrPubkeyHex = publicKeyHex;
+        this.nostrNpub = npub;
+        const entry = { i: nextAccount, createdAt: Date.now() };
+        if (typeof label === 'string' && label.trim()) entry.label = label.trim();
+        this.nostrKnownAccounts = sanitizeRoster(
+          [...this.nostrKnownAccounts, entry],
+          nextAccount,
+        );
+        // The published pointer lags local truth until the publish
+        // below lands — flag it now so a crash in between still shows
+        // the retry surface on next launch.
+        this.pointerDirty = true;
+        try {
+          this._persistMetadata();
+        } catch (persistErr) {
+          this.nostrAccountIndex = prev.account;
+          this.nostrPubkeyHex = prev.pubkey;
+          this.nostrNpub = prev.npub;
+          this.nip05Handles = prev.nip05Handles;
+          this.nostrKnownAccounts = prev.knownAccounts;
+          this.nostrAccountNip05 = prev.accountNip05;
+          this.activeExternalId = prev.activeExternalId;
+          throw persistErr;
+        }
+
+        await this.republishNostrPointer(pointer);
+        return { pubkeyHex: publicKeyHex, npub, account: nextAccount };
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    /**
+     * Switch the active identity to another roster account. Cheap and
+     * reversible by design — no confirmation ceremony belongs here.
+     *
+     * @param {number} account  a roster index (from `nostrKnownAccounts`)
+     * @param {{ pointer?: object }} [opts]
+     * @returns {Promise<{ pubkeyHex: string, npub: string, account: number }>}
+     */
+    async switchNostrIdentity(account, { pointer } = {}) {
+      if (!this.bootstrapped) {
+        const err = new Error('No identity seed');
+        err.code = 'IDENTITY_NOT_BOOTSTRAPPED';
+        throw err;
+      }
+      if (!this.nostrKnownAccounts.some((a) => a.i === account)) {
+        const err = new Error('Unknown identity account');
+        err.code = 'NOSTR_ACCOUNT_UNKNOWN';
+        throw err;
+      }
+      if (account === this.nostrAccountIndex && !this.activeExternalId) {
+        return {
+          pubkeyHex: this.nostrPubkeyHex,
+          npub: this.nostrNpub,
+          account,
+        };
+      }
+
+      const mnemonic = await this.getMnemonic();
+      try {
+        const { publicKeyHex, npub } = deriveNostrIdentity(mnemonic, account);
+
+        const external = this.activeExternal;
+        const prev = {
+          account: this.nostrAccountIndex,
+          pubkey: this.nostrPubkeyHex,
+          npub: this.nostrNpub,
+          nip05Handles: this.nip05Handles.map((h) => ({ ...h })),
+          accountNip05: { ...this.nostrAccountNip05 },
+          activeExternalId: this.activeExternalId,
+          externalHandles: external?.nip05Handles,
+        };
+        this._stashAndLoadNip05(account);
+        this.activeExternalId = null;
+        this.nostrAccountIndex = account;
+        this.nostrPubkeyHex = publicKeyHex;
+        this.nostrNpub = npub;
+        this.pointerDirty = true;
+        try {
+          this._persistMetadata();
+        } catch (persistErr) {
+          this.nostrAccountIndex = prev.account;
+          this.nostrPubkeyHex = prev.pubkey;
+          this.nostrNpub = prev.npub;
+          this.nip05Handles = prev.nip05Handles;
+          this.nostrAccountNip05 = prev.accountNip05;
+          this.activeExternalId = prev.activeExternalId;
+          if (external) external.nip05Handles = prev.externalHandles;
+          throw persistErr;
+        }
+
+        await this.republishNostrPointer(pointer);
+        return { pubkeyHex: publicKeyHex, npub, account };
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    /**
+     * Remove an identity from this phone's list. Nothing is deleted (see
+     * `nostrRemovedAccounts`), so the identity in use cannot be removed:
+     * switch away first. Idempotent; persist-then-commit like the other
+     * roster actions.
+     *
+     * @param {number} account  a roster index other than the active one
+     */
+    removeNostrIdentityFromDevice(account) {
+      if (!this.nostrKnownAccounts.some((a) => a.i === account)) {
+        const err = new Error('Unknown identity account');
+        err.code = 'NOSTR_ACCOUNT_UNKNOWN';
+        throw err;
+      }
+      if (account === this.nostrAccountIndex && !this.activeExternalId) {
+        const err = new Error('The identity in use cannot be removed');
+        err.code = 'NOSTR_ACCOUNT_ACTIVE';
+        throw err;
+      }
+      if (this.nostrRemovedAccounts.includes(account)) return;
+
+      const prev = this.nostrRemovedAccounts;
+      this.nostrRemovedAccounts = [...prev, account].sort((a, b) => a - b);
+      try {
+        this._persistMetadata();
+      } catch (persistErr) {
+        this.nostrRemovedAccounts = prev;
+        throw persistErr;
+      }
+    },
+
+    /**
+     * Put a removed identity back on this phone's list (the Undo of a
+     * removal). Idempotent; persist-then-commit.
+     *
+     * @param {number} account
+     */
+    restoreNostrIdentityToDevice(account) {
+      if (!this.nostrRemovedAccounts.includes(account)) return;
+      const prev = this.nostrRemovedAccounts;
+      this.nostrRemovedAccounts = prev.filter((i) => i !== account);
+      try {
+        this._persistMetadata();
+      } catch (persistErr) {
+        this.nostrRemovedAccounts = prev;
+        throw persistErr;
+      }
+    },
+
+    // -------------------------------------------------------------------
+    // Identities from another app (utils/externalIdentity.js)
+    // -------------------------------------------------------------------
+
+    /** External identities for the list: [{ id, kind, pubkeyHex, npub, label, active }]. */
+    listExternalIdentities() {
+      return this.externalIdentities.map((e) => ({
+        id: e.id, kind: e.kind, pubkeyHex: e.pubkeyHex, npub: e.npub, label: e.label, active: e.id === this.activeExternalId,
+      }));
+    },
+
+    /**
+     * Keep an identity from another app on this phone. Not made active:
+     * switching goes through the address book like every switch.
+     *
+     * A key that is already here is not added twice: the answer names the
+     * existing identity (a derived account or an earlier import) instead.
+     *
+     * @param {{ kind: 'secretKey'|'nip07'|'nip46', pubkeyHex: string,
+     *   secretKey?: Uint8Array, clientKey?: Uint8Array,
+     *   bunker?: { remotePubkey: string, relays: string[] },
+     *   connection?: object }} input
+     *   `secretKey` / `clientKey` are encrypted here; the caller wipes them.
+     *   `connection`: a remote signer already paired, kept for reuse.
+     * @returns {Promise<{ key: number|string, added: boolean }>}
+     *   key: a derived account number, or the external identity id.
+     */
+    async addExternalIdentity({ kind, pubkeyHex, secretKey, clientKey, bunker, connection }) {
+      const pubkey = String(pubkeyHex || '').toLowerCase();
+      const existing = this.externalIdentities.find((e) => e.pubkeyHex === pubkey);
+      if (existing) return { key: existing.id, added: false };
+      const derived = (await this.listNostrIdentities()).find((row) => row.pubkeyHex === pubkey);
+      if (derived) return { key: derived.account, added: false };
+
+      const id = `x${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const secret = kind === 'secretKey' ? secretKey : kind === 'nip46' ? clientKey : null;
+      if (secret) {
+        localStorage.setItem(STORAGE_KEYS.EXTERNAL_ENVELOPE_PREFIX + id, await encryptString(bytesToHex(secret)));
+      }
+      const record = sanitizeExternalIdentities([{ id, kind, pubkeyHex: pubkey, bunker, createdAt: Date.now() }])[0];
+      if (!record) {
+        localStorage.removeItem(STORAGE_KEYS.EXTERNAL_ENVELOPE_PREFIX + id);
+        throw new Error('Invalid identity');
+      }
+      this.externalIdentities = [...this.externalIdentities, record];
+      try {
+        this._persistMetadata();
+      } catch (persistErr) {
+        this.externalIdentities = this.externalIdentities.filter((e) => e.id !== id);
+        localStorage.removeItem(STORAGE_KEYS.EXTERNAL_ENVELOPE_PREFIX + id);
+        throw persistErr;
+      }
+      if (connection) adoptBunker(id, connection);
+      return { key: id, added: true };
+    },
+
+    /** Make an external identity the one in use. Persist-then-commit. */
+    switchToExternalIdentity(id) {
+      const target = this.externalIdentities.find((e) => e.id === id);
+      if (!target) {
+        const err = new Error('Unknown identity');
+        err.code = 'NOSTR_ACCOUNT_UNKNOWN';
+        throw err;
+      }
+      if (this.activeExternalId === id) return { pubkeyHex: target.pubkeyHex, npub: target.npub };
+      const prev = {
+        activeExternalId: this.activeExternalId,
+        pubkey: this.nostrPubkeyHex,
+        npub: this.nostrNpub,
+        nip05Handles: this.nip05Handles.map((h) => ({ ...h })),
+        accountNip05: { ...this.nostrAccountNip05 },
+      };
+      this._stashActiveHandles();
+      this.activeExternalId = id;
+      this.nostrPubkeyHex = target.pubkeyHex;
+      this.nostrNpub = target.npub;
+      this.nip05Handles = target.nip05Handles.map((h) => ({ ...h }));
+      try {
+        this._persistMetadata();
+      } catch (persistErr) {
+        this.activeExternalId = prev.activeExternalId;
+        this.nostrPubkeyHex = prev.pubkey;
+        this.nostrNpub = prev.npub;
+        this.nip05Handles = prev.nip05Handles;
+        this.nostrAccountNip05 = prev.accountNip05;
+        throw persistErr;
+      }
+      return { pubkeyHex: target.pubkeyHex, npub: target.npub };
+    },
+
+    /**
+     * Take an external identity off this phone: its stored secret key or
+     * signer pairing is deleted. Not the identity in use.
+     */
+    deleteExternalIdentity(id) {
+      if (id === this.activeExternalId) {
+        const err = new Error('The identity in use cannot be removed');
+        err.code = 'NOSTR_ACCOUNT_ACTIVE';
+        throw err;
+      }
+      const prev = this.externalIdentities;
+      if (!prev.some((e) => e.id === id)) return;
+      this.externalIdentities = prev.filter((e) => e.id !== id);
+      try {
+        this._persistMetadata();
+      } catch (persistErr) {
+        this.externalIdentities = prev;
+        throw persistErr;
+      }
+      closeSigner(id);
+      localStorage.removeItem(STORAGE_KEYS.EXTERNAL_ENVELOPE_PREFIX + id);
+    },
+
+    /** An imported secret key, for the secret key sheet: { nsec }. */
+    async revealExternalSecret(id) {
+      const external = this.externalIdentities.find((e) => e.id === id);
+      if (!external || external.kind !== 'secretKey') throw noRawKeyError();
+      const secretKey = await this._readExternalSecret(id);
+      try {
+        return { nsec: nip19.nsecEncode(secretKey) };
+      } finally {
+        secretKey.fill(0);
+      }
+    },
+
+    /** Decrypt an external identity's stored key bytes (secret key or pairing key). */
+    async _readExternalSecret(id) {
+      const envelope = localStorage.getItem(STORAGE_KEYS.EXTERNAL_ENVELOPE_PREFIX + id);
+      if (!envelope) throw noRawKeyError();
+      return hexToBytes(await decryptString(envelope));
+    },
+
+    /**
+     * A NostrCore Signer for the identity in use, and the release that
+     * wipes any key bytes it holds. Every signature, encryption and
+     * decryption for the identity goes through here; a signer outside
+     * BuhoGO is checked on every answer (verifiedSigner).
+     *
+     * @returns {Promise<{ signer: import('nostr-core').Signer, release: () => void }>}
+     */
+    async acquireSigner() {
+      const external = this.activeExternal;
+      if (!external || external.kind === 'secretKey') {
+        const secretKey = await this.getNostrSecretKeyBytes();
+        return { signer: createSecretKeySigner(secretKey), release: () => secretKey.fill(0) };
+      }
+      const signer = external.kind === 'nip07'
+        ? extensionSigner()
+        : await bunkerSigner(external.id, external.bunker, () => this._readExternalSecret(external.id));
+      return { signer: verifiedSigner(signer, external.pubkeyHex), release: () => {} };
+    },
+
+    /**
+     * Derive the display material for every roster identity in one
+     * mnemonic decrypt. Read-only — nothing is cached or persisted;
+     * the Change-identity sheet calls this when it opens.
+     *
+     * @returns {Promise<Array<{
+     *   account: number, npub: string, pubkeyHex: string, label: string | null,
+     *   active: boolean,
+     * }>>}
+     */
+    async listNostrIdentities() {
+      if (!this.bootstrapped) return [];
+      const mnemonic = await this.getMnemonic();
+      try {
+        // The identity in use always lists, even one removed earlier and
+        // made active again by a restore.
+        const inUse = this.activeExternalId ? null : this.nostrAccountIndex;
+        const listed = this.nostrKnownAccounts.filter(
+          (entry) => entry.i === inUse || !this.nostrRemovedAccounts.includes(entry.i),
+        );
+        return listed.map((entry) => {
+          let npub = '';
+          let pubkeyHex = '';
+          try {
+            const derived = deriveNostrIdentity(mnemonic, entry.i);
+            npub = derived.npub;
+            pubkeyHex = derived.publicKeyHex;
+          } catch { /* row renders without an npub rather than not at all */ }
+
+          return {
+            account: entry.i,
+            npub,
+            pubkeyHex,
+            label: entry.label || null,
+            active: entry.i === inUse,
+          };
+        });
+      } finally {
+        // eslint-disable-next-line no-unused-vars
+        const _drop = mnemonic;
+      }
+    },
+
+    /**
+     * Publish the pointer from current local truth (active account +
+     * roster), signed by the account-0 key. Clears `pointerDirty` on
+     * an accepted publish, sets it on failure. Never throws for
+     * network reasons — a stale pointer is a retryable condition, not
+     * an error state.
+     *
+     * @param {{
+     *   pool?:      any,
+     *   relays?:    readonly string[],
+     *   timeoutMs?: number,
+     *   fetcher?:   typeof fetchPointer,    // injected in tests
+     *   publisher?: typeof publishPointer,  // injected in tests
+     * }} [opts]
+     * @returns {Promise<{ ok: boolean, acceptedRelay: string | null }>}
+     */
+    async republishNostrPointer({ pool, relays, timeoutMs, fetcher, publisher } = {}) {
+      if (!this.bootstrapped) return { ok: false, acceptedRelay: null };
+      const doFetch = typeof fetcher === 'function' ? fetcher : fetchPointer;
+      const doPublish = typeof publisher === 'function' ? publisher : publishPointer;
+
+      let secretKey0 = null;
+      try {
+        const mnemonic = await this.getMnemonic();
+        const account0 = deriveNostrIdentity(mnemonic, 0);
+        secretKey0 = account0.privateKey;
+        const pubkey0 = account0.publicKeyHex;
+
+        // The pointer's relay home is account 0's: that is the key a
+        // fresh restore derives first and queries with.
+        let relaySet = relays;
+        if (!Array.isArray(relaySet) || relaySet.length === 0) {
+          const own = await fetchOwnWriteRelays({ pool, pubkey: pubkey0, timeoutMs });
+          relaySet = [...new Set([...DEFAULT_RELAYS, ...own])];
+        }
+
+        // Replaceable event: strictly outbid whatever is out there so
+        // this publish wins even against a skewed clock. The fetched
+        // pointer is more than a clock floor — its roster may know
+        // identities this device does not (created elsewhere, never
+        // hydrated here). Publishing only the local roster would
+        // orphan them for every future restore, so the rosters merge
+        // and the store learns the union too. The ACTIVE index stays
+        // local: this publish exists to broadcast the user's latest
+        // action on this device.
+        let floorCreatedAt = 0;
+        try {
+          const existing = await doFetch({
+            pool, relays: relaySet, pubkey0, secretKey0, timeoutMs,
+          });
+          if (existing) {
+            floorCreatedAt = existing.eventCreatedAt;
+            this.nostrKnownAccounts = sanitizeRoster(
+              [...this.nostrKnownAccounts, ...existing.accounts],
+              this.nostrAccountIndex,
+            );
+          }
+        } catch { /* best-effort floor; now() still wins the common case */ }
+
+        const event = buildPointerEvent({
+          secretKey0,
+          pubkey0,
+          active: this.nostrAccountIndex,
+          accounts: this.nostrKnownAccounts,
+          createdAt: Math.max(Math.floor(Date.now() / 1000), floorCreatedAt + 1),
+        });
+        const fanout = doPublish({ pool, relays: relaySet, event, timeoutMs });
+        const firstAccept = await fanout.firstAccept;
+
+        this.pointerDirty = !firstAccept;
+        this._persistMetadata();
+        return { ok: !!firstAccept, acceptedRelay: firstAccept ? firstAccept.relay : null };
+      } catch (err) {
+        console.warn('[identity] pointer publish failed:', err);
+        this.pointerDirty = true;
+        try { this._persistMetadata(); } catch { /* keep the in-memory flag */ }
+        return { ok: false, acceptedRelay: null };
+      } finally {
+        if (secretKey0) secretKey0.fill(0);
+      }
+    },
+
+    /**
+     * Discover the active identity from the published pointer — the
+     * restore path's account-climb recovery. Lands silently on the
+     * pointer's account when it is above the current one and merges
+     * its roster; finding nothing means account 0 stays, which is
+     * exactly today's behavior and always safe.
+     *
+     * Single-flight: the restore orchestrators (ProfilePage's phrase
+     * restore and the cloud-backup Drive restore) await this BEFORE
+     * contact recovery so contacts are pulled for the right identity,
+     * and a second caller during that window shares the same lookup.
+     *
+     * @param {{
+     *   pool?:      any,
+     *   relays?:    readonly string[],
+     *   timeoutMs?: number,
+     *   fetcher?:   typeof fetchPointer,   // injected in tests
+     * }} [opts]
+     * @returns {Promise<{ found: boolean, active: number, upgraded: boolean }>}
+     */
+    async resolveActiveNostrAccount({ pool, relays, timeoutMs = 4000, fetcher } = {}) {
+      if (!this.bootstrapped) {
+        return { found: false, active: this.nostrAccountIndex, upgraded: false };
+      }
+      if (this._pointerResolve) return this._pointerResolve;
+
+      const doFetch = typeof fetcher === 'function' ? fetcher : fetchPointer;
+      const run = (async () => {
+        let secretKey0 = null;
+        try {
+          const mnemonic = await this.getMnemonic();
+          const account0 = deriveNostrIdentity(mnemonic, 0);
+          secretKey0 = account0.privateKey;
+
+          // Query the same relay set the publish targets (defaults
+          // union account 0's NIP-65 write relays) — a pointer that
+          // only landed on the user's own relays must still be found
+          // by a restore. Skipped for injected fetchers: a stub
+          // ignores relays and the NIP-65 lookup would hit the
+          // network from unit tests.
+          let relaySet = relays;
+          if ((!Array.isArray(relaySet) || relaySet.length === 0) && doFetch === fetchPointer) {
+            const own = await fetchOwnWriteRelays({
+              pool, pubkey: account0.publicKeyHex, timeoutMs,
+            });
+            relaySet = [...new Set([...DEFAULT_RELAYS, ...own])];
+          }
+
+          const pointer = await doFetch({
+            pool,
+            relays: relaySet,
+            pubkey0: account0.publicKeyHex,
+            secretKey0,
+            timeoutMs,
+          });
+          if (!pointer) {
+            return { found: false, active: this.nostrAccountIndex, upgraded: false };
+          }
+
+          this.nostrKnownAccounts = sanitizeRoster(
+            [...this.nostrKnownAccounts, ...pointer.accounts],
+            Math.max(pointer.active, this.nostrAccountIndex),
+          );
+          let upgraded = false;
+          if (pointer.active > this.nostrAccountIndex) {
+            const derived = deriveNostrIdentity(mnemonic, pointer.active);
+            this._stashAndLoadNip05(pointer.active);
+            this.nostrAccountIndex = pointer.active;
+            this.nostrPubkeyHex = derived.publicKeyHex;
+            this.nostrNpub = derived.npub;
+            upgraded = true;
+          }
+          this._persistMetadata();
+          return { found: true, active: this.nostrAccountIndex, upgraded };
+        } catch (err) {
+          // Discovery is strictly additive; any failure means "stay
+          // where we are", never a broken restore.
+          console.warn('[identity] pointer discovery failed:', err);
+          return { found: false, active: this.nostrAccountIndex, upgraded: false };
+        } finally {
+          if (secretKey0) secretKey0.fill(0);
+        }
+      })();
+
+      this._pointerResolve = run;
+      try {
+        return await run;
+      } finally {
+        this._pointerResolve = null;
+      }
+    },
+
+    // -------------------------------------------------------------------
+    // Connected-sites bookkeeping
+    // -------------------------------------------------------------------
+
+    /**
+     * Record (or update) a site the user has authenticated to. Stored
+     * locally only; the site itself is the source of truth for whether
+     * this identity is actually still linked on their end.
+     *
+     * @param {{ domain: string, action: string, linkingPubHex: string }} info
+     */
+    recordConnectedSite({ domain, action, linkingPubHex }) {
+      if (!domain) return;
+      const now = Date.now();
+      const existingIdx = this.connectedSites.findIndex(
+        s => s.domain === domain,
+      );
+
+      if (existingIdx >= 0) {
+        const existing = this.connectedSites[existingIdx];
+        this.connectedSites[existingIdx] = {
+          ...existing,
+          lastUsedAt: now,
+          lastAction: action || existing.lastAction,
+          linkingPubHex: linkingPubHex || existing.linkingPubHex,
+          useCount: (existing.useCount || 1) + 1,
+        };
+      } else {
+        this.connectedSites = [
+          {
+            domain,
+            firstLinkedAt: now,
+            lastUsedAt: now,
+            lastAction: action || 'login',
+            linkingPubHex: linkingPubHex || null,
+            useCount: 1,
+          },
+          ...this.connectedSites,
+        ].slice(0, MAX_CONNECTED_SITES);
+      }
+
+      this._persistMetadata();
+    },
+
+    /**
+     * Remove a site from the local list. The site server is unaware of
+     * this action — the UI should make clear that this is a local-only
+     * forget.
+     *
+     * @param {string} domain
+     */
+    removeConnectedSite(domain) {
+      if (!domain) return;
+      const before = this.connectedSites.length;
+      this.connectedSites = this.connectedSites.filter(
+        s => s.domain !== domain,
+      );
+      if (this.connectedSites.length !== before) {
+        this._persistMetadata();
+      }
+    },
+  },
+});

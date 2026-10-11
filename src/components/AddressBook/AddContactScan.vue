@@ -1,0 +1,624 @@
+<template>
+  <div class="scan-pane">
+    <p
+      v-if="!detected"
+      class="scan-lede"
+      :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'"
+    >
+      {{ $t('Point your camera at a Nostr profile, or a Lightning, Spark, or Bitcoin address.') }}
+    </p>
+
+    <!-- Camera frame. The <video> element is mounted via v-if (not
+         v-show) so qr-scanner attaches to a fresh node and never has
+         to fight a display:none style — same pattern AddSiteSheet
+         and SendModal use, so the scanner lifecycle matches the rest
+         of the app. -->
+    <div
+      v-if="!detected"
+      class="scan-frame"
+      :class="$q.dark.isActive ? 'scan-frame-dark' : 'scan-frame-light'"
+    >
+      <video
+        v-if="showCamera && !cameraError"
+        ref="videoEl"
+        class="scan-video"
+        playsinline
+      />
+
+      <div
+        v-if="!showCamera && !cameraError"
+        class="scan-overlay"
+      >
+        <q-spinner-dots size="36px" color="grey-6" />
+      </div>
+
+      <div
+        v-if="cameraError"
+        class="scan-overlay scan-error"
+        :class="$q.dark.isActive ? 'text-grey-4' : 'text-grey-7'"
+      >
+        <Icon icon="tabler:camera-off" width="28" height="28" />
+        <p>{{ cameraError }}</p>
+      </div>
+
+    </div>
+
+    <!-- A successful scan replaces the camera rather than leaving a stopped,
+         empty video frame above the result. While the identifier/profile is
+         resolving, keep the feedback compact so the contact remains the sole
+         focus as soon as it is ready. -->
+    <div
+      v-else-if="!profileEvent"
+      class="scan-feedback"
+      :class="[
+        $q.dark.isActive ? 'scan-feedback--dark' : 'scan-feedback--light',
+        resultError ? 'scan-feedback--error' : '',
+      ]"
+      role="status"
+      aria-live="polite"
+    >
+      <div v-if="!resultError" class="scan-status scan-status--progress">
+        <q-spinner size="20px" />
+        <span>{{ $t('Looking up the profile…') }}</span>
+      </div>
+      <div v-else class="scan-status scan-status--error">
+        <Icon icon="tabler:alert-circle" width="20" height="20" />
+        <span>{{ resultError }}</span>
+      </div>
+    </div>
+
+    <NostrContactPreview
+      v-else
+      class="scan-preview"
+      :pubkey="resolved.pubkey"
+      :npub="resolved.npub"
+      :profile="parsedProfile"
+      :nip05-verified="null"
+      :existing-entry="existingEntry"
+      :saving="isSaving"
+      @save="onSave"
+      @open-existing="onOpenExisting"
+      @copy-npub="onCopyNpub"
+    />
+
+    <!-- Footer actions. "Scan again" shows as soon as a code has stopped
+         the scanner; "Paste instead" is always offered as the escape
+         hatch (the parent tab control reuses it to flip to Search). -->
+    <div class="scan-actions">
+      <button
+        v-if="detected"
+        type="button"
+        class="scan-secondary-btn"
+        @click="restart"
+      >
+        <Icon icon="tabler:refresh" width="14" height="14" />
+        <span>{{ $t('Scan again') }}</span>
+      </button>
+      <button
+        v-else
+        type="button"
+        class="scan-secondary-btn"
+        @click="$emit('switch-to-search')"
+      >
+        <Icon icon="tabler:keyboard" width="14" height="14" />
+        <span>{{ $t('Paste instead') }}</span>
+      </button>
+    </div>
+
+    <!-- Native MLKit scanner (iOS/Android). Continuous: keeps scanning until a
+         recognized identifier/address resolves (onDetect closes it) or the user
+         dismisses back to search. Teleports to <body>. -->
+    <ScannerOverlay
+      v-if="nativeScannerActive"
+      :active="nativeScannerActive"
+      :title="$t('Scan QR Code')"
+      :prompt="$t('Point your camera at a Nostr profile, or a Lightning, Spark, or Bitcoin address.')"
+      continuous
+      @scanned="onDetect"
+      @close="$emit('switch-to-search')"
+    />
+  </div>
+</template>
+
+<script>
+import { isAddressRequest } from '../../utils/lud23.js';
+import { Icon } from '@iconify/vue';
+import QrScanner from 'qr-scanner';
+import { createQrScanner } from '../../utils/qrScanner';
+import { isNativeScannerAvailable } from '../../utils/nativeScanner';
+import ScannerOverlay from '../ScannerOverlay.vue';
+import { useAddressBookStore } from '../../stores/addressBook';
+import { mapActions } from 'pinia';
+import { classifyIdentifier, lookupIdentifier } from '../../utils/nostrLookup.js';
+import { normalizePaymentAddress } from '../../utils/addressUtils.js';
+import { fetchProfile, parseProfileContent } from '../../utils/nostrFetch.js';
+import { copyToClipboard } from 'quasar';
+import NostrContactPreview from './NostrContactPreview.vue';
+import { parseProfileLink } from '../../utils/profileLink.js';
+
+export default {
+  name: 'AddContactScan',
+
+  components: { Icon, NostrContactPreview, ScannerOverlay },
+
+  props: {
+    /**
+     * The Scan tab owns hardware (camera). The parent toggles
+     * `active` based on which tab is selected so the stream only
+     * runs while the user is looking at it. The same prop drives
+     * teardown when the parent dialog closes.
+     */
+    active: { type: Boolean, default: false },
+  },
+
+  emits: ['saved', 'open-existing', 'switch-to-search', 'detected-address', 'address-request'],
+
+  data() {
+    return {
+      showCamera: false,
+      nativeScannerActive: false,
+      cameraError: '',
+      qrScanner: null,
+      detected: false,
+      // Result state mirrors AddContactSearch so the preview can
+      // render identically regardless of how we got here.
+      resolved: null,
+      profileEvent: null,
+      resultError: '',
+      isSaving: false,
+      currentToken: 0,
+    };
+  },
+
+  computed: {
+    parsedProfile() {
+      return this.profileEvent ? parseProfileContent(this.profileEvent) : {};
+    },
+
+    existingEntry() {
+      if (!this.resolved) return null;
+      const store = useAddressBookStore();
+      return store.findContactByPubkey(this.resolved.pubkey);
+    },
+  },
+
+  watch: {
+    active(isActive) {
+      if (isActive) this.startCamera();
+      else this.teardown();
+    },
+  },
+
+  mounted() {
+    if (this.active) this.startCamera();
+  },
+
+  beforeUnmount() {
+    this.teardown();
+  },
+
+  methods: {
+    ...mapActions(useAddressBookStore, ['addNostrContact']),
+
+    async startCamera() {
+      this.resetResult();
+      this.cameraError = '';
+      // Native (iOS/Android): mount the MLKit ScannerOverlay. Web/PWA keeps the
+      // in-page qr-scanner video.
+      if (isNativeScannerAvailable()) {
+        this.detected = false;
+        this.nativeScannerActive = true;
+        return;
+      }
+      try {
+        const hasCamera = await QrScanner.hasCamera();
+        if (!hasCamera) {
+          this.cameraError = this.$t('No camera found on this device.');
+          return;
+        }
+        this.showCamera = true;
+        await this.$nextTick();
+        await this.startQrScanner();
+      } catch (error) {
+        console.error('[AddContactScan] camera init error:', error);
+        this.handleCameraError(error);
+      }
+    },
+
+    async startQrScanner() {
+      try {
+        const videoEl = this.$refs.videoEl;
+        if (!videoEl) throw new Error('Video element not found');
+
+        this.qrScanner = createQrScanner(
+          videoEl,
+          (result) => {
+            const text = typeof result === 'string' ? result : (result?.data || result?.text || '');
+            this.onDetect(text);
+          },
+          {
+            returnDetailedScanResult: true,
+            highlightScanRegion: true,
+            highlightCodeOutline: true,
+            preferredCamera: 'environment',
+          },
+        );
+        await this.qrScanner.start();
+      } catch (err) {
+        console.error('[AddContactScan] start error:', err);
+        this.handleCameraError(err);
+      }
+    },
+
+    handleCameraError(error) {
+      if (error?.name === 'NotAllowedError') {
+        this.cameraError = this.$t('Camera permission denied. Allow access in settings or paste an identifier instead.');
+      } else if (error?.name === 'NotFoundError') {
+        this.cameraError = this.$t('No camera found on this device.');
+      } else if (error?.name === 'NotSupportedError' || /secure context|https/i.test(error?.message || '')) {
+        this.cameraError = this.$t('Camera needs a secure connection. Paste an identifier instead.');
+      } else {
+        this.cameraError = this.$t("Couldn't open the camera. Try pasting an identifier instead.");
+      }
+      this.showCamera = false;
+    },
+
+    stopScanner() {
+      this.nativeScannerActive = false;
+      if (this.qrScanner) {
+        try {
+          this.qrScanner.stop();
+          this.qrScanner.destroy();
+        } catch { /* already torn down */ }
+        this.qrScanner = null;
+      }
+    },
+
+    teardown() {
+      this.stopScanner();
+      this.showCamera = false;
+      this.detected = false;
+      this.resetResult();
+    },
+
+    resetResult() {
+      this.resolved = null;
+      this.profileEvent = null;
+      this.resultError = '';
+    },
+
+    async restart() {
+      this.detected = false;
+      this.resetResult();
+      await this.startCamera();
+    },
+
+    /**
+     * Route a scanned QR payload to the right add-contact flow.
+     *
+     * 1. Nostr identifier (npub / nprofile / hex) → resolve the
+     *    profile in place and offer the preview-card save.
+     * 2. Lightning address / Spark / Bitcoin / LNURL (after unwrapping
+     *    BIP21 `bitcoin:` and `lightning:` QR URIs) → hand the bare value
+     *    up to the parent, which flips to the manual "Enter" form with the
+     *    address pre-filled so the user just adds a name + note.
+     * 3. A shared BuhoGO profile link → the identifier inside it, then step 1.
+     *    The card itself uses `nostr:npub…`, but links received elsewhere
+     *    should still land in the same add-contact flow.
+     * 4. Anything else (BOLT11 invoice, other URLs, a bare NIP-05 that
+     *    isn't a Lightning address) → keep scanning; it isn't a contact
+     *    destination we can save.
+     *
+     * Ordering matters: `classifyIdentifier` reports `user@domain`
+     * as `nip05`, which we deliberately skip in step 1 so step 2's
+     * Lightning-address check can claim it instead.
+     */
+    onDetect(text) {
+      if (this.detected || !text) return;
+      if (isAddressRequest(text)) {
+        this.detected = true; this.stopScanner(); this.showCamera = false;
+        this.$emit('address-request', text); return;
+      }
+      // Honor and strip the NIP-21 `nostr:` scheme up front so a
+      // `nostr:npub…` / `nostr:nprofile…` QR is treated exactly like the
+      // bare identifier. (`lightning:` / `bitcoin:` are unwrapped further
+      // down via normalizePaymentAddress.) The resolver also strips it, so
+      // this is belt-and-suspenders — it just removes the prefix as a
+      // variable across every downstream branch.
+      const trimmed = text.trim().replace(/^nostr:/i, '');
+
+      // A shared profile link resolves to the identifier it points at, just
+      // like the direct NIP-21 identity printed on the card.
+      const fromLink = parseProfileLink(trimmed);
+      if (fromLink) {
+        this.detected = true;
+        this.stopScanner();
+        this.showCamera = false;
+        this.resolveAndFetch(fromLink);
+        return;
+      }
+
+      const kind = classifyIdentifier(trimmed);
+      if (kind && kind !== 'nip05') {
+        this.detected = true;
+        this.stopScanner();
+        this.showCamera = false;
+        this.resolveAndFetch(trimmed);
+        return;
+      }
+
+      const candidate = normalizePaymentAddress(trimmed);
+      const paymentType = useAddressBookStore().detectAddressType(candidate);
+      if (paymentType) {
+        this.detected = true;
+        this.stopScanner();
+        this.showCamera = false;
+        this.$emit('detected-address', candidate);
+        return;
+      }
+    },
+
+    async resolveAndFetch(text) {
+      this.currentToken += 1;
+      const token = this.currentToken;
+      this.resetResult();
+
+      try {
+        const result = await lookupIdentifier(text);
+        if (token !== this.currentToken) return;
+        this.resolved = result;
+      } catch (err) {
+        if (token !== this.currentToken) return;
+        this.resultError = this.$t('That QR code is not a Nostr identifier.');
+        console.warn('[AddContactScan] lookup failed:', err);
+        return;
+      }
+
+      const store = useAddressBookStore();
+      const existing = store.findContactByPubkey(this.resolved.pubkey);
+      if (existing) {
+        // Render from the stored snapshot so the existing-state
+        // preview can fire without a network hit.
+        this.profileEvent = existing.nostr_event || {
+          kind: 0,
+          pubkey: this.resolved.pubkey,
+          content: JSON.stringify(existing.nostr_profile || {}),
+          created_at: 0,
+          tags: [],
+        };
+        return;
+      }
+
+      try {
+        const opts = {};
+        if (Array.isArray(this.resolved.relays) && this.resolved.relays.length > 0) {
+          opts.relays = this.resolved.relays;
+        }
+        const event = await fetchProfile(this.resolved.pubkey, opts);
+        if (token !== this.currentToken) return;
+        if (!event) {
+          this.resultError = this.$t("We couldn't find a Nostr profile for this identifier yet.");
+          return;
+        }
+        this.profileEvent = event;
+      } catch (err) {
+        if (token !== this.currentToken) return;
+        this.resultError = this.$t('Something went wrong. Please try again.');
+        console.warn('[AddContactScan] fetch failed:', err);
+      }
+    },
+
+    async onSave() {
+      if (!this.resolved || !this.profileEvent || this.isSaving) return;
+      this.isSaving = true;
+      try {
+        const entry = await this.addNostrContact({
+          pubkey: this.resolved.pubkey,
+          npub: this.resolved.npub,
+          event: this.profileEvent,
+          relayHints: this.resolved.relays || [],
+          // A person without a Lightning address is still a person. The entry
+          // carries an empty address and every payment path already gates on
+          // `isEntryPayable`; a later refresh promotes them once they publish.
+          allowWithoutLightningAddress: true,
+        });
+        this.$q.notify({
+          type: 'positive',
+          message: this.$t('Contact added'),
+        });
+        this.$emit('saved', entry);
+        this.teardown();
+      } catch (err) {
+        const msg = err?.message || '';
+        if (msg.includes('Lightning address')) {
+          this.$q.notify({
+            type: 'negative',
+            message: this.$t('No Lightning address'),
+            caption: this.$t('This profile cannot receive payments yet.'),
+            timeout: 4000,
+          });
+        } else if (msg.includes('already')) {
+          this.$q.notify({
+            type: 'warning',
+            message: this.$t('Already in your address book'),
+            timeout: 3000,
+          });
+        } else {
+          this.$q.notify({
+            type: 'negative',
+            message: this.$t("Couldn't save contact"),
+            caption: msg || this.$t('Please try again'),
+            timeout: 4000,
+          });
+        }
+      } finally {
+        this.isSaving = false;
+      }
+    },
+
+    onOpenExisting(entry) {
+      this.$emit('open-existing', entry);
+    },
+
+    async onCopyNpub(npub) {
+      try {
+        await copyToClipboard(npub);
+        this.$q.notify({
+          type: 'positive',
+          message: this.$t('Copied'),
+          timeout: 1500,
+        });
+      } catch {
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t("Couldn't copy"),
+          timeout: 2000,
+        });
+      }
+    },
+  },
+};
+</script>
+
+<style scoped>
+.scan-pane {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.scan-lede {
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 0;
+}
+
+.scan-frame {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  max-height: 320px;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.05);
+  border: 1px solid var(--border-card);
+}
+
+.scan-frame-dark {
+  background: #0C0C0C;
+}
+
+.scan-video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.scan-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding: 1rem;
+  text-align: center;
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+}
+
+.scan-error p {
+  margin: 0;
+  max-width: 240px;
+  line-height: 1.4;
+}
+
+.scan-feedback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 112px;
+  padding: 1rem 1.25rem;
+  border: 1px solid var(--border-card);
+  border-radius: var(--radius-lg);
+}
+
+.scan-feedback--light {
+  background: rgba(120, 120, 120, 0.04);
+  color: var(--text-secondary);
+}
+
+.scan-feedback--dark {
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--text-secondary);
+}
+
+.scan-feedback--error {
+  border-color: rgba(239, 68, 68, 0.24);
+}
+
+.scan-status {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.scan-status--error {
+  color: #C2413A;
+}
+
+.scan-feedback--dark .scan-status--error {
+  color: #FFB4AA;
+}
+
+.scan-preview {
+  animation: scan-preview-in 0.18s ease-out;
+}
+
+@keyframes scan-preview-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scan-preview {
+    animation: none;
+  }
+}
+
+.scan-actions {
+  display: flex;
+  justify-content: center;
+}
+
+.scan-secondary-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.5rem 0.9rem;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  border: 1px solid var(--border-card);
+  color: var(--text-secondary);
+  font-family: 'Manrope', sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.scan-secondary-btn:hover {
+  background: rgba(120, 120, 120, 0.06);
+}
+</style>

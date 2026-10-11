@@ -1,6 +1,34 @@
 <template>
   <div class="mnemonic-display">
-    <!-- Warning Banner -->
+    <!--
+      Header row above the grid. Carries the consumer-supplied
+      `header` slot on the left (typically a countdown chip) and the
+      blur toggle on the right when `allowBlur` is true. Hidden when
+      both slots are empty so we don't render a stray empty bar.
+    -->
+    <div
+      v-if="hasHeaderSlot || allowBlur"
+      class="mnemonic-display-header"
+    >
+      <div class="mnemonic-display-header-slot">
+        <slot name="header" />
+      </div>
+      <button
+        v-if="allowBlur"
+        class="toggle-btn"
+        :class="$q.dark.isActive ? 'toggle-btn-dark' : 'toggle-btn-light'"
+        @click="toggleBlur"
+      >
+        <Icon :icon="internalBlurred ? 'tabler:eye' : 'tabler:eye-off'" width="14" height="14" />
+        {{ internalBlurred ? $t('Show') : $t('Hide') }}
+      </button>
+    </div>
+
+    <!--
+      Optional top warning, off by default. Kept for legacy callers
+      that opted into the bundled banner; new flows should add their
+      own warning below the grid so wording stays in the consumer.
+    -->
     <div v-if="showWarning" class="display-warning">
       <div class="display-warning-icon">
         <Icon icon="tabler:alert-triangle" width="18" height="18" />
@@ -19,28 +47,10 @@
         :class="$q.dark.isActive ? 'word-item-dark' : 'word-item-light'"
       >
         <span class="word-number">{{ index + 1 }}</span>
-        <span class="word-text" :class="[blurred ? 'blurred' : '', $q.dark.isActive ? 'word-text-dark' : 'word-text-light']">
+        <span class="word-text" :class="[internalBlurred ? 'blurred' : '', $q.dark.isActive ? 'word-text-dark' : 'word-text-light']">
           {{ word }}
         </span>
       </div>
-    </div>
-
-    <!-- Blur Toggle -->
-    <div v-if="allowBlur" class="blur-toggle">
-      <button
-        class="toggle-btn"
-        :class="$q.dark.isActive ? 'toggle-btn-dark' : 'toggle-btn-light'"
-        @click="blurred = !blurred"
-      >
-        <Icon :icon="blurred ? 'tabler:eye' : 'tabler:eye-off'" width="16" height="16" />
-        {{ blurred ? $t('Show words') : $t('Hide words') }}
-      </button>
-    </div>
-
-    <!-- Bottom Warning -->
-    <div class="display-bottom-warning">
-      <Icon icon="tabler:shield-lock" width="16" height="16" />
-      <span>{{ $t('Store in a safe place. Never share online.') }}</span>
     </div>
   </div>
 </template>
@@ -66,19 +76,48 @@ export default {
       type: Boolean,
       default: false
     },
+    // Seed value for the blur state. When the parent updates this prop
+    // reactively (e.g. after a timeout), the component re-syncs its
+    // internal blur state via the watcher below. Combined with the
+    // `update:blurred` emit, this gives parents full control without
+    // the footguns of a nullable controlled prop.
     initialBlurred: {
       type: Boolean,
       default: false
-    }
+    },
   },
-  emits: ['copied'],
+  emits: ['copied', 'update:blurred'],
   data() {
     return {
-      blurred: this.initialBlurred,
+      internalBlurred: this.initialBlurred,
       copied: false
     }
   },
+  computed: {
+    /**
+     * True when the consumer has supplied a `header` slot. Used to
+     * decide whether to render the header bar at all — without
+     * this, an empty row of padding would appear in flows that
+     * only want the words grid + toggle.
+     */
+    hasHeaderSlot() {
+      return Boolean(this.$slots.header);
+    },
+  },
+  watch: {
+    initialBlurred(next) {
+      // Parent drove the blur state externally (e.g. auto-hide timer
+      // re-blurring the phrase). Mirror it locally so the user's own
+      // toggle keeps working from whatever the new baseline is.
+      this.internalBlurred = next;
+    },
+  },
   methods: {
+    toggleBlur() {
+      const next = !this.internalBlurred;
+      this.internalBlurred = next;
+      this.$emit('update:blurred', next);
+    },
     async copyWords() {
       try {
         const mnemonicString = this.words.join(' ');
@@ -90,7 +129,6 @@ export default {
           type: 'positive',
           message: this.$t('Seed phrase copied'),
           caption: this.$t('Clear your clipboard after pasting'),
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
 
         setTimeout(() => {
@@ -101,7 +139,6 @@ export default {
         this.$q.notify({
           type: 'negative',
           message: this.$t('Couldn\'t copy'),
-          actions: [{ icon: 'close', color: 'white', round: true, flat: true }]
         });
       }
     }
@@ -162,8 +199,8 @@ export default {
 }
 
 .word-item-light {
-  background: #FFFFFF;
-  border-color: #E5E7EB;
+  background: var(--bg-card);
+  border-color: var(--border-card);
 }
 
 .word-number {
@@ -186,7 +223,7 @@ export default {
 }
 
 .word-text-light {
-  color: #1F2937;
+  color: var(--text-primary);
 }
 
 .word-text.blurred {
@@ -194,48 +231,58 @@ export default {
   user-select: none;
 }
 
-/* Blur Toggle */
-.blur-toggle {
+/*
+  Header bar above the words grid. Slot on the left for an
+  optional consumer chip (typically a countdown), toggle on the
+  right when allowBlur is true. Tight one-line bar so the words
+  stay the visual anchor.
+*/
+.mnemonic-display-header {
   display: flex;
-  justify-content: center;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.mnemonic-display-header-slot {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
 }
 
 .toggle-btn {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   border: none;
   background: none;
-  padding: 6px 12px;
-  border-radius: 8px;
+  padding: 4px 10px;
+  border-radius: 999px;
   font-family: 'Manrope', sans-serif;
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 600;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
+  flex-shrink: 0;
+  transition: background-color 0.15s ease;
 }
 
 .toggle-btn-dark {
-  color: rgba(255, 255, 255, 0.5);
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.toggle-btn-dark:hover {
+  background: rgba(255, 255, 255, 0.08);
 }
 
 .toggle-btn-light {
-  color: #6B7280;
+  color: var(--text-primary);
 }
 
-/* Bottom Warning — matches verify bottom warning */
-.display-bottom-warning {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.5rem;
-  padding: 0.625rem;
-  border-radius: 10px;
-  background: rgba(239, 68, 68, 0.06);
-  color: #EF4444;
-  font-family: 'Manrope', sans-serif;
-  font-size: 12px;
-  font-weight: 500;
+.toggle-btn-light:hover {
+  background: rgba(15, 23, 42, 0.06);
 }
 
 /* Responsive */

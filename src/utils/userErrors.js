@@ -1,161 +1,482 @@
 /**
  * User-Friendly Error Messages
  *
- * Maps technical errors to user-friendly messages.
- * NEVER show technical terms to users like:
- * - SDK, API, provider, mnemonic, UTXO, LNURL, BOLT, etc.
+ * Payment error pipeline. Two contracts:
  *
- * All messages should be understandable by non-technical users.
+ *   buildPaymentError(error, ctx, $t)
+ *     Full error descriptor used by the payment error dialog. Returns
+ *       { title, reason, technical }
+ *     where `reason` is the upstream prose when it passes a safety
+ *     filter (LUD-06 `reason`, NWC `error.message`, LNbits `detail`,
+ *     etc.), or a curated generic when the raw text is unsafe (stack
+ *     traces, TypeError, gRPC service paths, hex blobs).
+ *
+ *   getUserFriendlyError / getUserFriendlyErrorMessage
+ *     Backwards-compatible wrappers used by existing toast call sites.
+ *     Same passthrough behaviour, shape kept for caller convenience.
+ *
+ * Design rule: the LUD-06 `reason` field is the protocol-blessed
+ * user-facing string from the server. We pass it through verbatim
+ * unless it looks like a JS stack trace, gRPC path, or hex blob.
  */
 
+const REASON_MAX_LENGTH = 280;
+
 /**
- * Map a technical error to a user-friendly message
- * @param {Error|string} error - The error object or message
- * @param {string} context - Context: 'payment', 'receive', 'claim', 'withdraw', 'general'
- * @param {Function} $t - Translation function (optional)
- * @returns {{ title: string, description: string }}
+ * Mainstream-first copy for a BOLT12 offer. The technical term appears in the
+ * explanation, not the headline, so the same dialog works for people who have
+ * never encountered Lightning request formats before.
+ */
+export function getUnsupportedBolt12OfferCopy($t = null) {
+  const t = typeof $t === 'function' ? $t : ((value) => value);
+  return {
+    title: t("This payment request isn't supported yet"),
+    reason: t('This is a specific type of Lightning payment request. BuhoGO cannot pay BOLT12 offers yet, so no money was sent. Ask the recipient for a Lightning invoice or Lightning address instead.'),
+  };
+}
+
+/**
+ * Copy for a scanned/pasted BIP-352 Silent Payment address. Recognized so
+ * the error can name the format, but not payable: deriving the one-time
+ * output address needs sender-side BIP-352 support none of our rails have.
+ */
+export function getUnsupportedSilentPaymentCopy($t = null) {
+  const t = typeof $t === 'function' ? $t : ((value) => value);
+  return {
+    title: t("This payment request isn't supported yet"),
+    reason: t('This is a Silent Payment address. BuhoGO cannot pay these yet, so no money was sent. Ask the recipient for a Lightning address, an invoice, or a regular Bitcoin address instead.'),
+  };
+}
+
+/**
+ * Build a structured payment-error descriptor.
+ *
+ * The `reasonSource` discriminates how `reason` was produced so the UI
+ * can decide whether to attribute the text to a third party:
+ *
+ *   'upstream' — server prose passed the safety filter and is rendered
+ *                verbatim. The dialog shows this in a quoted block with
+ *                an attribution label (see `reasonAttribution`).
+ *   'curated'  — we synthesised the text (insufficient-funds breakdown,
+ *                tech-jargon translation). BuhoGO is speaking.
+ *   'fallback' — generic "Please try again." when the raw is unsafe.
+ *                BuhoGO is speaking.
+ *
+ * @param {Error|string} error
+ * @param {object} ctx
+ * @param {string} [ctx.context]    'payment' | 'withdraw' | 'transfer' |
+ *                                  'receive' | 'connect' | 'kiosk' |
+ *                                  'claim' | 'identity' | 'link' |
+ *                                  'earn' | 'l1' | 'general'
+ * @param {string} [ctx.walletType] 'spark' | 'lnbits' | 'nwc' | etc.
+ * @param {string} [ctx.route]      Free-form route label,
+ *                                  e.g. 'LNURL-pay → invoice fetch'
+ * @param {number} [ctx.amountSats]
+ * @param {string} [ctx.title]      Pre-translated headline override. Use
+ *                                  sparingly: the title is the dialog's
+ *                                  identity, and overriding it weakens the
+ *                                  "same modal everywhere" recognition the
+ *                                  contexts are designed to produce. Only
+ *                                  pass this when the context family can't
+ *                                  produce a sensible title (e.g. wallet
+ *                                  restore where "Couldn't connect" would
+ *                                  be misleading).
+ * @param {string} [ctx.reason]     Pre-translated user-facing reason from a
+ *                                  call site that has domain knowledge the
+ *                                  central translators don't (e.g. Spark
+ *                                  UTXO state). When set, it replaces the
+ *                                  inferred reason and is treated as
+ *                                  'curated' (no upstream attribution),
+ *                                  since BuhoGO authored the text. The
+ *                                  raw error still populates `technical`.
+ * @param {Function} [$t]           Translation function ($t bound).
+ * @returns {{
+ *   title: string,
+ *   reason: string,
+ *   reasonSource: 'upstream'|'curated'|'fallback',
+ *   reasonAttribution: string|null,
+ *   technical: {
+ *     raw: string, walletType: string|null, route: string|null,
+ *     timestamp: string, amountSats: number|null
+ *   }
+ * }}
+ */
+export function buildPaymentError(error, ctx = {}, $t = null) {
+  const t = $t || ((s) => s);
+  const raw = extractRaw(error);
+  const context = ctx.context || 'general';
+
+  const title = (typeof ctx.title === 'string' && ctx.title.trim())
+    ? ctx.title.trim()
+    : titleForContext(context, t);
+
+  let reason;
+  let reasonSource;
+  // Caller-supplied override wins. Lets domain-specific translators
+  // (e.g. L1BitcoinReceive's UTXO-state interpreter) deliver friendly
+  // prose that the central helpers don't know how to produce, while the
+  // title still comes from the unified context map so users see the
+  // same headline for the same kind of failure across the app.
+  if (typeof ctx.reason === 'string' && ctx.reason.trim()) {
+    reason = ctx.reason.trim();
+    reasonSource = 'curated';
+  } else {
+    const byCode = translateErrorCode(error, t);
+    const breakdown = expandInsufficientFunds(raw, ctx.amountSats, t);
+    const translated = translateTechJargon(raw, t);
+    if (byCode) {
+      reason = byCode;
+      reasonSource = 'curated';
+    } else if (breakdown) {
+      reason = breakdown;
+      reasonSource = 'curated';
+    } else if (translated) {
+      reason = translated;
+      reasonSource = 'curated';
+    } else if (isUserSafeMessage(raw)) {
+      reason = truncate(raw.trim(), REASON_MAX_LENGTH);
+      reasonSource = 'upstream';
+    } else {
+      reason = t('Please try again.');
+      reasonSource = 'fallback';
+    }
+  }
+
+  // Attribution is only meaningful when BuhoGO is forwarding third-party
+  // text. Curated and fallback reasons are written by us and need no
+  // label — adding one would falsely suggest the recipient said it.
+  const reasonAttribution = reasonSource === 'upstream'
+    ? attributionForContext(context, t)
+    : null;
+
+  return {
+    title,
+    reason,
+    reasonSource,
+    reasonAttribution,
+    technical: {
+      raw,
+      walletType: ctx.walletType || null,
+      route: ctx.route || null,
+      timestamp: new Date().toISOString(),
+      amountSats: typeof ctx.amountSats === 'number' ? ctx.amountSats : null,
+    },
+  };
+}
+
+/**
+ * Backwards-compatible wrapper returning { title, description }.
+ * `description` is the same upstream-passthrough string used by the
+ * payment error dialog, so toast call sites that surface
+ * caption: description now show the real reason too.
  */
 export function getUserFriendlyError(error, context = 'general', $t = null) {
-  const t = $t || ((s) => s); // Use translation function or passthrough
-  const errorStr = error?.message || error?.toString() || '';
-  const errorLower = errorStr.toLowerCase();
-
-  // === Balance/Amount Issues ===
-  if (errorLower.includes('insufficient') ||
-      errorLower.includes('not enough') ||
-      errorLower.includes('exceeds') ||
-      errorLower.includes('balance')) {
-    return {
-      title: t('Not enough funds'),
-      description: t('Please check your balance and try a smaller amount.')
-    };
-  }
-
-  // === Invalid Amount ===
-  if (errorLower.includes('invalid amount') ||
-      errorLower.includes('amount must be')) {
-    return {
-      title: t('Invalid amount'),
-      description: t('Please enter a valid amount.')
-    };
-  }
-
-  // === Address Issues ===
-  if (errorLower.includes('invalid address') ||
-      errorLower.includes('address')) {
-    return {
-      title: t('Invalid address'),
-      description: t('Please check the address and try again.')
-    };
-  }
-
-  // === Invoice Issues ===
-  if (errorLower.includes('invoice') ||
-      errorLower.includes('expired')) {
-    return {
-      title: t('Payment request expired'),
-      description: t('Please request a new payment link.')
-    };
-  }
-
-  // === Network/Connection Issues ===
-  if (errorLower.includes('network') ||
-      errorLower.includes('timeout') ||
-      errorLower.includes('connection') ||
-      errorLower.includes('fetch') ||
-      errorLower.includes('offline')) {
-    return {
-      title: t('Connection problem'),
-      description: t('Please check your internet and try again.')
-    };
-  }
-
-  // === Wallet Locked / PIN Required ===
-  if (errorLower.includes('not unlocked') ||
-      errorLower.includes('pin') ||
-      errorLower.includes('locked')) {
-    return {
-      title: t('Wallet locked'),
-      description: t('Please unlock your wallet to continue.')
-    };
-  }
-
-  // === Wallet Not Ready ===
-  if (errorLower.includes('not connected') ||
-      errorLower.includes('provider') ||
-      errorLower.includes('not supported')) {
-    return {
-      title: t('Wallet not ready'),
-      description: t('Please make sure your wallet is set up correctly.')
-    };
-  }
-
-  // === Deposit Not Ready (Bitcoin L1) ===
-  if (errorLower.includes('confirmation') ||
-      errorLower.includes('not confirmed') ||
-      errorLower.includes('pending')) {
-    return {
-      title: t('Still confirming'),
-      description: t('Please wait a few more minutes.')
-    };
-  }
-
-  // === Deposit Not Found (Bitcoin L1) ===
-  if (errorLower.includes('not found') ||
-      errorLower.includes('already claimed') ||
-      errorLower.includes('utxo')) {
-    return {
-      title: t('Not available'),
-      description: t('This may have already been processed.')
-    };
-  }
-
-  // === Fee Issues ===
-  if (errorLower.includes('fee') ||
-      errorLower.includes('maxfee')) {
-    return {
-      title: t('Fee issue'),
-      description: t('Please try again with a different amount.')
-    };
-  }
-
-  // === Context-Specific Fallbacks ===
-  const fallbacks = {
-    payment: {
-      title: t('Payment failed'),
-      description: t('Please try again.')
-    },
-    receive: {
-      title: t('Couldn\'t create invoice'),
-      description: t('Please try again.')
-    },
-    claim: {
-      title: t('Couldn\'t complete'),
-      description: t('Please try again.')
-    },
-    withdraw: {
-      title: t('Withdrawal failed'),
-      description: t('Please try again.')
-    },
-    general: {
-      title: t('Something went wrong'),
-      description: t('Please try again.')
-    }
-  };
-
-  return fallbacks[context] || fallbacks.general;
+  const e = buildPaymentError(error, { context }, $t);
+  return { title: e.title, description: e.reason };
 }
 
 /**
- * Get a simple user-friendly message (title only)
- * @param {Error|string} error - The error object or message
- * @param {string} context - Context for the error
- * @param {Function} $t - Translation function
- * @returns {string}
+ * Backwards-compatible wrapper returning just the title.
  */
 export function getUserFriendlyErrorMessage(error, context = 'general', $t = null) {
-  const result = getUserFriendlyError(error, context, $t);
-  return result.title;
+  return buildPaymentError(error, { context }, $t).title;
 }
 
-export default { getUserFriendlyError, getUserFriendlyErrorMessage };
+// ─── Internals ──────────────────────────────────────────────────────────
+
+function extractRaw(error) {
+  if (!error) return '';
+  if (typeof error === 'string') return error;
+  return error.message || error.toString() || '';
+}
+
+function titleForContext(context, t) {
+  switch (context) {
+    case 'payment':  return t('Payment failed');
+    case 'withdraw': return t('Withdrawal failed');
+    case 'transfer': return t('Transfer failed');
+    case 'receive':  return t("Couldn't create invoice");
+    case 'connect':  return t("Couldn't connect");
+    case 'kiosk':    return t("Couldn't start payment");
+    case 'claim':    return t("Couldn't complete");
+    // LUD-04 login flow — user is signing in to a site, not configuring a wallet.
+    case 'identity': return t("Couldn't sign you in");
+    // Pre-payment link resolution (LUD-06, LUD-17, lightning address)
+    // failed before we even had an intent to pay. Distinct from 'payment'
+    // so the user isn't told a payment failed when none was attempted.
+    case 'link':     return t("Couldn't open this link");
+    // Earn flow payout (claiming accumulated sats from completing lessons).
+    // Distinct from 'claim' (Bitcoin L1 deposit claim) and from 'payment'
+    // (user-initiated send) so the title matches the user's mental model.
+    case 'earn':     return t("Couldn't claim your sats");
+    // Bitcoin main-chain operation: fee quote, return-to-mempool send,
+    // or any other L1 read/write that isn't a deposit claim or withdraw.
+    case 'l1':       return t('Bitcoin transaction failed');
+    default:         return t('Something went wrong');
+  }
+}
+
+/**
+ * Attribution label shown above an upstream-sourced reason. The
+ * wording depends on the user's role in the flow — in a withdraw the
+ * user is the recipient, so labelling the server "recipient" would be
+ * wrong. Every branch names the *other* side of the action.
+ */
+function attributionForContext(context, t) {
+  switch (context) {
+    case 'payment':  return t('Reported by the recipient');
+    case 'withdraw': return t('Reported by the withdrawal service');
+    case 'transfer': return t('Reported by the destination wallet');
+    case 'kiosk':    return t('Reported by the payment service');
+    case 'link':     return t('Reported by the server');
+    case 'earn':     return t('Reported by the payout service');
+    case 'l1':       return t('Reported by the Bitcoin network');
+    default:         return t('Reported by the service');
+  }
+}
+
+/**
+ * When the upstream message follows the well-known "Insufficient funds
+ * N / M" pattern (NWC INSUFFICIENT_BALANCE responses, Spark SDK,
+ * various LNbits extensions) and we know how many sats the user just
+ * tried to send, break the total out into send + fee so the user can
+ * see why the required amount is larger than what they typed.
+ *
+ *   "Insufficient funds 109 / 50551"   with amountSats=50000
+ *     → Not enough funds.
+ *       Balance: 109 sats
+ *       Required: 50,551 sats (50,000 + 551 fee)
+ *
+ * Returns null when the pattern doesn't match, when amountSats is
+ * unknown, or when the numbers don't fit a sane balance/required/fee
+ * shape. Falls back through the normal passthrough path in that case
+ * so the original prose is never lost — only enhanced.
+ */
+function expandInsufficientFunds(rawMsg, amountSats, t) {
+  if (!rawMsg) return null;
+  if (typeof amountSats !== 'number' || !Number.isFinite(amountSats) || amountSats <= 0) return null;
+  if (!/insufficient/i.test(rawMsg)) return null;
+
+  const m = rawMsg.match(/(\d{1,15})\s*\/\s*(\d{1,15})/);
+  if (!m) return null;
+
+  const balance = Number(m[1]);
+  const required = Number(m[2]);
+  if (!Number.isFinite(balance) || !Number.isFinite(required)) return null;
+  // Sanity: required must cover the attempted send (server fee can be 0).
+  const fee = required - amountSats;
+  if (fee < 0) return null;
+  // Sanity: balance shouldn't exceed required, otherwise the pattern
+  // probably isn't balance/required at all (e.g. some other ratio).
+  if (balance >= required) return null;
+
+  return formatInsufficientBalanceBreakdown({ balance, required, amountSats, fee }, t);
+}
+
+/**
+ * Multi-line breakdown for "not enough funds" surfaces. Single source
+ * of truth for the wording so the upstream-parsed path
+ * (`expandInsufficientFunds`) and pre-flight callers that already know
+ * the exact numbers (e.g. BatchSendModal's balance check) produce
+ * identical copy.
+ *
+ * `amountSats` and `fee` are optional. When `amountSats` is provided
+ * and `fee > 0`, the breakdown calls out the fee component
+ * explicitly so the user understands why required > amount typed.
+ *
+ *   { balance: 4, required: 6 }
+ *     → Not enough funds.
+ *       Balance: 4 sats
+ *       Required: 6 sats
+ *
+ *   { balance: 109, required: 50551, amountSats: 50000, fee: 551 }
+ *     → Not enough funds.
+ *       Balance: 109 sats
+ *       Required: 50,551 sats (50,000 + 551 fee)
+ *
+ * @param {{ balance: number, required: number, amountSats?: number, fee?: number }} parts
+ * @param {Function} t
+ * @returns {string}
+ */
+export function formatInsufficientBalanceBreakdown(parts, t) {
+  const translate = typeof t === 'function' ? t : ((s) => s);
+  const balance = Number(parts?.balance);
+  const required = Number(parts?.required);
+  if (!Number.isFinite(balance) || !Number.isFinite(required)) {
+    return translate('Not enough funds.');
+  }
+  const fmt = new Intl.NumberFormat('en-US').format;
+  const lines = [
+    translate('Not enough funds.'),
+    `${translate('Balance')}: ${fmt(balance)} ${translate('sats')}`,
+  ];
+  const amountSats = Number(parts?.amountSats);
+  const fee = Number(parts?.fee);
+  if (Number.isFinite(amountSats) && amountSats > 0 && Number.isFinite(fee) && fee > 0) {
+    lines.push(
+      `${translate('Required')}: ${fmt(required)} ${translate('sats')} ` +
+      `(${fmt(amountSats)} + ${fmt(fee)} ${translate('fee')})`
+    );
+  } else {
+    lines.push(`${translate('Required')}: ${fmt(required)} ${translate('sats')}`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Map a stable error `code` (set by providers) to a friendly, actionable
+ * reason. Used for Arkade Lightning (Boltz swap) failures, where the raw
+ * SDK message is terse/technical but the failure mode is well-defined — and
+ * crucially we can tell the user when a refundable failure already returned
+ * their funds. Returns null when there's no code-specific mapping.
+ */
+function translateErrorCode(error, t) {
+  const code = error && typeof error === 'object' ? error.code : null;
+  if (!code || typeof code !== 'string') return null;
+
+  switch (code) {
+    case 'ADDRESS_REQUEST_NOT_PAYMENT':
+      return t('This link asks for your address. It cannot receive a payment.');
+    case 'ARKADE_LN_UNAVAILABLE':
+      return t('Lightning is temporarily unavailable on Arkade wallets. Your Arkade address and Bitcoin address still work, and any other wallet can pay Lightning.');
+    case 'ARKADE_ONCHAIN_SOON':
+      return t("Sending to a Bitcoin address automatically isn't available for Arkade yet. Use a Lightning or Arkade address instead.");
+    case 'ARKADE_OFFBOARD_BELOW_MIN':
+      return t('That amount is too small to send to a Bitcoin address. The minimum is {min} sats.', { min: error.minSats || 0 });
+    case 'ARKADE_OFFBOARD_FAILED':
+      return t("Sending to a Bitcoin address didn't go through. Please try again.");
+    default:
+      return null;
+  }
+}
+
+/**
+ * Replace technical-only failures (SDK version drift, raw fetch error)
+ * with a curated message. Returns null when the raw text is not a
+ * known tech-only failure, leaving it to the passthrough/fallback.
+ */
+function translateTechJargon(msg, t) {
+  if (!msg) return null;
+  const lower = msg.toLowerCase();
+
+  // gRPC UNIMPLEMENTED / "deprecated endpoint" / service-path leaks
+  // mean the wallet binary is too old to talk to the current backend.
+  if (lower.includes('unimplemented')
+      || lower.includes('deprecated')
+      || lower.includes('clienterror')
+      || /\/[a-z.]+\.[a-z]+service\//i.test(msg)) {
+    return t('The app is out of date. Please update and try again.');
+  }
+
+  // Transport failures: browser fetch strings, the native HTTP plugin's
+  // platform messages, and the LNURL helper's timeout. Curated copy keeps
+  // them out of the upstream-attribution path ("Reported by ..."), which
+  // would falsely present client-side failures as the service's words.
+  const transport = classifyTransportFailure(msg);
+  if (transport === 'timeout') {
+    return t('The server did not respond or the link is no longer valid');
+  }
+  if (transport === 'offline') {
+    return t("Couldn't reach the network. Please check your internet and try again.");
+  }
+
+  // Bare HTTP status from `fetchLNURLInfo` ("Server returned 404") and
+  // similar generic upstream failures. Translate to a friendlier line
+  // grouped by status family. The raw status is still visible in the
+  // dialog's technical details, so power users don't lose information.
+  const httpStatus = msg.match(/^Server returned (\d{3})$/i);
+  if (httpStatus) {
+    const status = Number(httpStatus[1]);
+    if (status === 404 || status === 410) {
+      return t('This link is no longer active. It may have been used or removed.');
+    }
+    if (status === 401 || status === 403) {
+      return t("This link doesn't accept this request.");
+    }
+    if (status >= 500 && status <= 599) {
+      return t('The server is having trouble. Try again in a moment.');
+    }
+    // 4xx other than the above: probably a malformed link.
+    if (status >= 400 && status <= 499) {
+      return t("This link looks malformed and the server rejected it.");
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Classify a transport-level failure message: 'timeout' when the request
+ * gave up waiting, 'offline' when the device could not reach the host at
+ * all, null for anything else. Covers the browser fetch strings (exact
+ * match, so upstream prose that merely contains them is not swallowed)
+ * plus the native HTTP plugin's platform messages, which embed hostnames
+ * and so need substring matching (Android UnknownHostException /
+ * SocketTimeoutException text, iOS NSURLError descriptions), and the
+ * lnurlHttp timeout. Exported so UI-side translators (e.g. the send
+ * field's inline resolver copy) stay in sync with this one list.
+ */
+export function classifyTransportFailure(msg) {
+  if (!msg) return null;
+  const lower = String(msg).toLowerCase();
+  // Platform timeout strings are a small closed set, so they are matched
+  // exactly; a server's own prose ('Payment attempt timed out') must keep
+  // its text and its upstream attribution. 'did not respond in time' is
+  // our own lnurlHttp timeout and safe to substring-match (callers may
+  // prefix context onto it).
+  if (lower.includes('did not respond in time')
+      || lower === 'read timed out'
+      || lower === 'connect timed out'
+      || lower === 'timeout'
+      || lower === 'the request timed out.'
+      || lower === 'ssl handshake timed out') {
+    return 'timeout';
+  }
+  if (lower === 'failed to fetch'
+      || lower === 'network request failed'
+      || lower === 'load failed'
+      || lower.includes('unable to resolve host')
+      || lower.includes('no address associated')
+      // Android connect failure embeds host and port; require the port
+      // marker so a server's own 'failed to connect to peer' prose passes
+      // through untouched.
+      || /failed to connect to .*port \d+/.test(lower)
+      || lower.includes('internet connection appears to be offline')
+      || lower.includes('network connection was lost')) {
+    return 'offline';
+  }
+  return null;
+}
+
+/**
+ * True when `msg` looks like prose we can show to a user verbatim.
+ * Filters out JS errors, stack traces, hex hashes, gRPC paths.
+ */
+function isUserSafeMessage(msg) {
+  if (!msg) return false;
+  const trimmed = msg.trim();
+  if (trimmed.length < 3 || trimmed.length > 600) return false;
+  // Common JS error prefixes.
+  if (/^(TypeError|ReferenceError|SyntaxError|RangeError|URIError|EvalError):/i.test(trimmed)) return false;
+  // Stack-trace frames.
+  if (/\n\s*at\s+\S+\s*\(/.test(trimmed)) return false;
+  // "is not a function" / "is not defined" style runtime errors.
+  if (/\bis not (a function|defined|iterable)\b/i.test(trimmed)) return false;
+  // Long hex blobs (txids, payment hashes leaking into prose).
+  if (/[0-9a-f]{40,}/i.test(trimmed)) return false;
+  // gRPC service paths.
+  if (/\/[a-z.]+\.[a-z]+service\//i.test(trimmed)) return false;
+  return true;
+}
+
+function truncate(s, max) {
+  if (s.length <= max) return s;
+  return s.slice(0, max - 1) + '…';
+}
+
+export default {
+  buildPaymentError,
+  getUserFriendlyError,
+  getUserFriendlyErrorMessage,
+  formatInsufficientBalanceBreakdown,
+};

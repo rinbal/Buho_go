@@ -1,12 +1,21 @@
 import { defineStore } from 'pinia'
 import { useTransactionMetadataStore } from './transactionMetadata'
 import { WALLET_TYPES } from '../providers/WalletFactory'
-import { LightningAddress } from '@getalby/lightning-tools'
+import { lnurlGetJson } from '../utils/lnurlHttp.js'
+import { migratePocketConfigKeys } from '../utils/autoWithdrawKeys.js'
 
 const STORAGE_KEY = 'buhoGO_auto_withdraw'
-const SPEED_MAP = { low: 'SLOW', medium: 'MEDIUM', high: 'FAST' }
 const SPEED_LABELS = { low: 'Economy', medium: 'Standard', high: 'Priority' }
-const COOLDOWN_MS = 60_000 // 60s between triggers per wallet
+// Settings persists feeSpeed as low/medium/high. The Spark provider's
+// fee quote is keyed by slow/medium/fast. Translate at the boundary so
+// Settings UX stays stable while the provider speaks the SDK's language.
+const FEE_SPEED_TO_QUOTE_KEY = { low: 'slow', medium: 'medium', high: 'fast' }
+const COOLDOWN_MS = 60_000 // 60s between successful triggers per wallet
+// A failed attempt shouldn't hold the wallet hostage for the full 60s success
+// cooldown — transient blips (dropped NWC/Spark connection, LN-address resolve
+// hiccup) deserve a quicker retry. After a failure we roll the cooldown back so
+// the next balance tick can retry once this much time has elapsed.
+const FAILURE_RETRY_MS = 15_000 // 15s backoff before retrying a failed transfer
 const MIN_SEND_SATS = 10   // Don't send dust
 
 // Module-level lock — not in Pinia state, avoids reactivity issues
@@ -43,7 +52,12 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
   },
 
   actions: {
-    async initialize() {
+    /**
+     * Load the saved rules. With the device's wallets, rules saved for a
+     * former Spark "pocket" (`walletId:accountNumber`) move to the wallet
+     * that holds that account now (utils/autoWithdrawKeys.js).
+     */
+    async initialize({ wallets = null } = {}) {
       try {
         const saved = localStorage.getItem(STORAGE_KEY)
         if (saved) {
@@ -53,6 +67,14 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
       } catch (error) {
         console.error('[Auto-withdraw] Init error:', error)
         this.configs = {}
+      }
+      if (wallets) {
+        const { configs, moved, dropped } = migratePocketConfigKeys(this.configs, wallets)
+        if (moved.length || dropped.length) {
+          this.configs = configs
+          if (dropped.length) console.warn(`[Auto-withdraw] ${dropped.length} rule(s) for removed accounts dropped`)
+          await this.persistConfigs()
+        }
       }
     },
 
@@ -64,6 +86,7 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
         lightningAddress: config.lightningAddress ?? '',
         bitcoinAddress: config.bitcoinAddress ?? '',
         sparkAddress: config.sparkAddress ?? '',
+        arkadeAddress: config.arkadeAddress ?? '',
         feeSpeed: config.feeSpeed ?? 'medium',
         lastTriggeredAt: config.lastTriggeredAt ?? null
       }
@@ -106,7 +129,10 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
       if (!threshold || threshold <= 0) return
 
       const balance = Number(balanceSats)
-      if (balance <= threshold) return
+      // Guard non-finite balances explicitly: `NaN <= threshold` is false, so
+      // without this an undefined/garbage balance would slip past the check
+      // below and we'd compute a NaN send amount.
+      if (!Number.isFinite(balance) || balance <= threshold) return
 
       // Lock guard — prevent concurrent execution for same config
       if (_activeWithdrawals.has(configKey)) return
@@ -119,14 +145,47 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
       _activeWithdrawals.add(configKey)
       _lastTriggerTime.set(configKey, Date.now())
 
-      // Resolve base walletId from composite key (e.g. 'walletId:2' → 'walletId')
-      const baseWalletId = configKey.includes(':') ? configKey.split(':').slice(0, -1).join(':') : configKey
+      const walletId = configKey
+
+      // Declared in the action scope (not inside `try`) so the `catch` block
+      // can report the attempted amount — a `const` inside `try` would be a
+      // ReferenceError in `catch`, which previously masked the real failure
+      // and left the error toast/dialog unshown.
+      let sendAmount = 0
 
       try {
-        const wallet = walletStore.wallets.find(w => w.id === baseWalletId)
+        const wallet = walletStore.wallets.find(w => w.id === walletId)
         if (!wallet) return
 
-        const sendAmount = Math.floor(balance * 0.97)
+        // A Spark figure handed in may be a cached read. Moving money needs a
+        // balance the network just confirmed: re-read with requireFresh and
+        // decide on that number. A failed sync skips this trigger (the next
+        // accepted fresh balance retries) instead of sending from stale data.
+        let verifiedBalance = balance
+        if ((wallet.type || '').toLowerCase() === WALLET_TYPES.SPARK) {
+          const provider = walletStore.providers?.[walletId]
+          if (typeof provider?.getBalance !== 'function') return
+          const epoch = walletStore.walletEpoch?.(walletId)
+          let fresh
+          try {
+            fresh = await provider.getBalance({ requireFresh: true })
+          } catch (error) {
+            console.warn('[Auto-withdraw] Skipped: balance could not be verified:', error?.message || error)
+            _lastTriggerTime.set(configKey, Date.now() - COOLDOWN_MS + FAILURE_RETRY_MS)
+            return
+          }
+          // The verified read can take seconds. The rule may have been turned
+          // off or edited, the wallet removed or its connection rebuilt in
+          // the meantime: re-check all of it before any money moves.
+          if (this.configs[configKey] !== config || !config.enabled
+            || !walletStore.wallets.includes(wallet)
+            || walletStore.walletEpoch?.(walletId) !== epoch
+            || walletStore.providers?.[walletId] !== provider) return
+          verifiedBalance = Number(fresh?.balance)
+          if (!Number.isFinite(verifiedBalance) || verifiedBalance <= threshold) return
+        }
+
+        sendAmount = Math.floor(verifiedBalance * 0.97)
         if (sendAmount < MIN_SEND_SATS) return
 
         const walletType = wallet.type?.toLowerCase() || 'nwc'
@@ -137,6 +196,19 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
           result = await this._executeSparkPayout(configKey, sendAmount, config, walletStore)
           if (config.payoutType === 'spark') destination = config.sparkAddress
           else if (config.payoutType === 'onchain') destination = config.bitcoinAddress
+          else destination = config.lightningAddress
+        } else if (walletType === WALLET_TYPES.ARKADE) {
+          // Arkade Lightning is out of service (Boltz retired - see
+          // Plans WIP/arkade-maintenance-map.md). A Lightning payout from an
+          // Arkade wallet cannot succeed, so skip the trigger silently the
+          // way the below-minimum gate does: no retry storm, funds stay
+          // put, and ark/onchain payout types keep working.
+          if (config.payoutType !== 'arkade' && config.payoutType !== 'onchain') {
+            console.warn('[Auto-withdraw] Skipped: Arkade Lightning payouts are unavailable')
+            return
+          }
+          result = await this._executeArkadePayout(configKey, sendAmount, config, walletStore)
+          if (config.payoutType === 'arkade') destination = config.arkadeAddress
           else destination = config.lightningAddress
         } else {
           result = await this._executeLightningPayout(configKey, sendAmount, config, walletStore, walletType)
@@ -150,8 +222,8 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
           const note = `Automatic transfer \u00b7 ${sendAmount.toLocaleString()} sats sent to ${this._truncateDestination(destination)}${feeLabel}`
 
           try {
-            await metaStore.addTagToTransaction(result.id, 'auto-withdraw')
-            await metaStore.setNoteForTransaction(result.id, note)
+            await metaStore.addTagToTransaction(result.id, walletId, 'auto-withdraw')
+            await metaStore.setNoteForTransaction(result.id, walletId, note)
           } catch {
             // Non-critical — tagging failure doesn't affect the transfer
           }
@@ -171,12 +243,25 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
       } catch (error) {
         console.error('[Auto-withdraw] Failed:', error.message)
 
-        // Notify UI — error
-        const baseId = configKey.includes(':') ? configKey.split(':').slice(0, -1).join(':') : configKey
+        // The cooldown was set to "now" before the attempt to dam the storm of
+        // balance-refresh ticks. On failure, roll it back so the next tick can
+        // retry after FAILURE_RETRY_MS instead of waiting out the full 60s
+        // success cooldown — the difference between "intermittently works" and
+        // "works on the next refresh".
+        _lastTriggerTime.set(configKey, Date.now() - COOLDOWN_MS + FAILURE_RETRY_MS)
+
+        // Hand the raw error to the UI watcher so it can route it
+        // through the global payment-error dialog (same surface as
+        // every user-initiated failure). Keeping the raw Error here
+        // means the watcher can pass it to buildPaymentError with
+        // $t and an enriched context (wallet type, route, amount).
+        const wallet = walletStore.wallets.find(w => w.id === walletId)
         this.lastResult = {
           type: 'error',
-          message: error.message,
-          walletName: walletStore.wallets.find(w => w.id === baseId)?.name || 'Wallet'
+          error,
+          amountSats: sendAmount,
+          walletName: wallet?.name || 'Wallet',
+          walletType: wallet?.type || null,
         }
       } finally {
         _activeWithdrawals.delete(configKey)
@@ -185,13 +270,10 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
 
     /**
      * Execute payout from Spark wallet (lightning or on-chain)
-     * @param {string} configKey - walletId or walletId:accountNumber for pockets
+     * @param {string} configKey - the wallet id
      */
     async _executeSparkPayout(configKey, sendAmount, config, walletStore) {
-      // For composite keys (pockets), get provider directly; for plain walletIds, use getProvider
-      const provider = configKey.includes(':')
-        ? walletStore.providers[configKey]
-        : walletStore.getProvider(configKey)
+      const provider = walletStore.getProvider(configKey)
       if (!provider) throw new Error('Wallet provider not available')
 
       if (config.payoutType === 'spark') {
@@ -203,15 +285,16 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
         if (!config.bitcoinAddress) throw new Error('No Bitcoin address configured')
 
         const feeQuote = await provider.getWithdrawalFeeQuote(sendAmount, config.bitcoinAddress)
-        const speedKey = config.feeSpeed || 'medium'
-        const quote = feeQuote[speedKey] || feeQuote.medium
-        const sparkSpeed = SPEED_MAP[speedKey] || 'MEDIUM'
+        const quoteKey = FEE_SPEED_TO_QUOTE_KEY[config.feeSpeed] || 'medium'
+        const quote = feeQuote[quoteKey] || feeQuote.medium
 
         const result = await provider.withdrawToL1({
           amountSats: sendAmount,
           destinationAddress: config.bitcoinAddress,
-          speed: sparkSpeed,
-          feeQuoteId: quote.feeQuoteId
+          speed: quoteKey,
+          feeQuoteId: quote.feeQuoteId,
+          feeAmountSats: quote.totalFee,
+          deductFeeFromWithdrawalAmount: false
         })
 
         return { id: result.requestId, status: result.status }
@@ -224,43 +307,98 @@ export const useAutoWithdrawStore = defineStore('autoWithdraw', {
     },
 
     /**
-     * Execute lightning address payout from NWC or LNBits wallet
+     * Execute payout from an Arkade wallet.
+     *   - 'arkade'   → native ark1 transfer (instant, near-zero fee)
+     *   - 'lightning'→ resolve the LN address and pay via a Boltz swap
+     *   - 'onchain'  → Ramps offboard (phase-second, not yet available)
+     */
+    async _executeArkadePayout(configKey, sendAmount, config, walletStore) {
+      if (config.payoutType === 'arkade') {
+        const provider = walletStore.getProvider(configKey)
+        if (!provider) throw new Error('Wallet provider not available')
+        if (!config.arkadeAddress) throw new Error('No Arkade address configured')
+
+        const result = await provider.transferToArkadeAddress({
+          arkadeAddress: config.arkadeAddress,
+          amount: sendAmount,
+        })
+        return { id: result.id, status: result.status }
+      }
+
+      if (config.payoutType === 'onchain') {
+        const err = new Error('On-chain auto-withdraw from Arkade is coming soon')
+        err.code = 'ARKADE_ONCHAIN_SOON'
+        throw err
+      }
+
+      // Lightning payouts are gated off upstream (the rail is out of
+      // service); a config that still reaches here must fail with the coded
+      // outage error, never attempt the dead swap path.
+      const err = new Error('Lightning is temporarily unavailable for Arkade wallets')
+      err.code = 'ARKADE_LN_UNAVAILABLE'
+      throw err
+    },
+
+    /**
+     * Execute lightning address payout from NWC, LNBits or Arkade wallet
      */
     async _executeLightningPayout(walletId, sendAmount, config, walletStore, walletType) {
       if (!config.lightningAddress) throw new Error('No Lightning address configured')
 
       // Resolve lightning address
-      const ln = new LightningAddress(config.lightningAddress)
-      await ln.fetch()
-      const lnurlpData = ln.lnurlpData
-      if (!lnurlpData?.callback) throw new Error('Could not resolve Lightning address')
+      const [username, domain] = config.lightningAddress.split('@')
+      if (!username || !domain) throw new Error('Could not resolve Lightning address')
+      const metaResponse = await lnurlGetJson(`https://${domain}/.well-known/lnurlp/${username}`)
+      const lnurlpData = metaResponse.ok ? metaResponse.data : null
+      if (!lnurlpData?.callback || lnurlpData.tag !== 'payRequest' || lnurlpData.status === 'ERROR') {
+        throw new Error('Could not resolve Lightning address')
+      }
 
       // Request invoice
       const amountMs = sendAmount * 1000
       const separator = lnurlpData.callback.includes('?') ? '&' : '?'
       const callbackUrl = `${lnurlpData.callback}${separator}amount=${amountMs}`
-      const invoiceResponse = await fetch(callbackUrl)
+      const invoiceResponse = await lnurlGetJson(callbackUrl)
 
       if (!invoiceResponse.ok) {
         throw new Error('Failed to get invoice from Lightning address')
       }
 
-      const invoiceData = await invoiceResponse.json()
+      const invoiceData = invoiceResponse.data || {}
       if (invoiceData.status === 'ERROR') {
         throw new Error(invoiceData.reason || 'Invoice request failed')
       }
 
+      // LUD-09 note: any `successAction` on this response is intentionally
+      // ignored here. Auto-withdraw is a background sweep to the user's OWN
+      // configured payout address — there is no payer present to read a
+      // post-payment message and nothing meaningful to persist it against. The
+      // interactive path (Wallet.vue's send pipeline) is where successAction
+      // is captured, shown, and stored.
       const invoice = invoiceData.pr
       if (!invoice) throw new Error('No invoice returned')
 
       // Pay via wallet-specific provider
       if (walletType === WALLET_TYPES.LNBITS) {
-        const provider = walletStore.getProvider(walletId)
-        if (!provider) throw new Error('LNBits provider not available')
+        // Route through ensureLNBitsConnected so a stale `isConnected`
+        // (e.g. cleared by a prior 401) self-heals before the auto-withdraw
+        // attempt rather than failing silently in the background.
+        const provider = await walletStore.ensureLNBitsConnected(walletId)
         const result = await provider.payInvoice({ invoice })
         return { id: result.payment_hash || result.id || null, status: 'completed' }
+      } else if (walletType === WALLET_TYPES.ARKADE) {
+        const provider = await walletStore.ensureArkadeConnected(walletId)
+        const result = await provider.payInvoice({ invoice })
+        return { id: result.txid || null, status: 'completed' }
       } else {
-        const nwc = walletStore.connectionStates[walletId]?.nwcInstance
+        // Self-heal a dropped NWC connection (e.g. after an app resume or a
+        // relay disconnect) rather than failing the transfer outright — mirrors
+        // the LNbits ensureLNBitsConnected path above. connectWallet rebuilds
+        // and enables a fresh NWC instance.
+        let nwc = walletStore.connectionStates[walletId]?.nwcInstance
+        if (!nwc) {
+          nwc = await walletStore.connectWallet(walletId)
+        }
         if (!nwc) throw new Error('NWC not connected')
         const result = await nwc.sendPayment(invoice)
         return { id: result.payment_hash || result.paymentHash || result.preimage || null, status: 'completed' }

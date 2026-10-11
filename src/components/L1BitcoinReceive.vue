@@ -1,198 +1,424 @@
 <template>
   <div class="l1-bitcoin-receive">
+    <!-- Hero: amount badge, the code and its rail badges, vertically
+         centered in the space between header and the bottom action row -
+         the natural focus point on a phone. -->
+    <div class="unified-hero">
+      <!-- The request the QR currently carries; tapping edits it. -->
+      <button
+        v-if="amountSats > 0"
+        type="button"
+        class="invoice-badge"
+        :class="$q.dark.isActive ? 'invoice-badge-dark' : 'invoice-badge-light'"
+        @click="$emit('request-amount')"
+      >
+        <span class="invoice-badge-amount">{{ formatAmount(amountSats) }}</span>
+        <span v-if="amountFiat" class="invoice-badge-fiat">{{ amountFiat }}</span>
+        <span v-if="note" class="invoice-badge-note">{{ note }}</span>
+        <Icon icon="tabler:edit" width="14" height="14" />
+      </button>
+
     <!-- QR Code Section -->
     <div class="qr-section">
       <div class="qr-card" @click="copyAddress">
         <div class="qr-frame" :class="{ 'loading': !depositAddress }">
           <vue-qrcode
             v-if="depositAddress"
+            ref="depositQr"
             :value="qrValue"
-            :options="qrOptions"
+            :options="bitcoinQrOptions"
             class="qr-code"
           />
           <q-spinner v-else size="32px" color="primary" />
+          <!-- One mark on every code: this is a BuhoGO code, whatever
+               rail ends up paying it. -->
+          <span v-if="depositAddress" class="qr-logo" aria-hidden="true">
+            <img src="/buho_logo.svg" alt="" />
+          </span>
         </div>
       </div>
-      <div class="qr-hint" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-        {{ $t('Tap QR to copy address') }}
-      </div>
     </div>
 
-    <!-- Address Display - Compact -->
-    <div
-      v-if="depositAddress"
-      class="address-pill"
-      :class="$q.dark.isActive ? 'pill-dark' : 'pill-light'"
-      @click="copyAddress"
+    <!-- The rails this one code carries, stacked like profile avatars:
+         any of these networks can pay it. The address strings live behind
+         Copy on purpose - showing one under the QR made the code read as
+         on-chain only. -->
+    <div v-if="depositAddress" class="rail-stack" aria-hidden="true">
+      <span class="rail-badge rail-badge-btc" :class="$q.dark.isActive ? 'rail-ring-dark' : 'rail-ring-light'">
+        <Icon icon="tabler:currency-bitcoin" width="18" height="18" />
+      </span>
+      <span class="rail-badge" :class="$q.dark.isActive ? 'rail-badge-dark rail-ring-dark' : 'rail-badge-light rail-ring-light'">
+        <ArkadeLogo :size="18" :color="$q.dark.isActive ? 'orange' : 'purple'" alt="" />
+      </span>
+      <span class="rail-badge" :class="$q.dark.isActive ? 'rail-badge-dark rail-ring-dark' : 'rail-badge-light rail-ring-light'">
+        <img :src="$q.dark.isActive ? '/Spark/Spark Asterisk White.svg' : '/Spark/Spark Asterisk Black.svg'" alt="" />
+      </span>
+    </div>
+
+    <!-- The wallet's name on the network - the one receive handle a human
+         can read aloud or type. Tap to copy. Machine strings stay behind
+         Copy; this line replaces the anonymous zero-amount invoice as the
+         default identity of the request. -->
+    <button
+      v-if="depositAddress && leadWithLightningAddress"
+      class="ln-address-line"
+      :class="$q.dark.isActive ? 'ln-address-dark' : 'ln-address-light'"
+      @click="copyValue(lightningAddress, $t('Lightning address copied'))"
     >
-      <Icon icon="tabler:currency-bitcoin" width="16" height="16" class="pill-icon" />
-      <span class="pill-address">{{ truncateAddress(depositAddress) }}</span>
-      <Icon icon="tabler:copy" width="14" height="14" class="pill-copy" />
+      <span class="ln-address-text">{{ lightningAddress }}</span>
+      <Icon icon="tabler:copy" width="13" height="13" class="ln-address-copy" aria-hidden="true" />
+    </button>
     </div>
 
-    <!-- Action Buttons -->
-    <div v-if="depositAddress" class="action-buttons">
-      <q-btn
-        flat
-        no-caps
-        class="action-btn"
-        :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
-        @click="copyAddress"
-      >
-        <Icon icon="tabler:copy" width="18" height="18" />
-        <span>{{ $t('Copy') }}</span>
-      </q-btn>
-      <q-btn
-        flat
-        no-caps
-        class="action-btn"
-        :class="$q.dark.isActive ? 'action-btn-dark' : 'action-btn-light'"
-        @click="shareAddress"
-      >
-        <Icon icon="tabler:share" width="18" height="18" />
-        <span>{{ $t('Share') }}</span>
-      </q-btn>
-    </div>
-
-    <!-- Pending Deposits -->
-    <div v-if="pendingDeposits.length > 0" class="deposits-section">
-      <div class="section-header">
-        <span class="section-title" :class="$q.dark.isActive ? 'title-dark' : 'title-light'">
-          {{ $t('Incoming') }}
-        </span>
-        <q-btn
-          flat
-          dense
-          round
-          size="sm"
-          :loading="isCheckingDeposits"
-          @click="checkDeposits"
-          class="refresh-icon"
-          :class="{ 'spinning': isCheckingDeposits }"
-        >
-          <Icon icon="tabler:refresh" width="14" height="14" />
-        </q-btn>
-      </div>
-
-      <div
+    <!--
+      Pending Deposits
+      Polished incoming-deposit tracker. Surfaces directly under the
+      address card so a user who just scanned the QR sees the
+      confirmation progress without scrolling. Card uses Bitcoin orange
+      as the accent (matches the asset colour) instead of the legacy
+      green tint, with a subtle progress bar that fills 1/3 → 2/3 → 3/3
+      so the wait is legible at a glance.
+    -->
+    <!--
+      Pending Deposits — slim, single-line chips. The chip is just a
+      tap target; the bottom sheet below carries the full picture
+      (progress while confirming, fee + Add to Wallet when ready).
+      That keeps the receive screen scannable when nothing is
+      happening yet, and gives users one consistent surface to learn.
+    -->
+    <div v-if="pendingDeposits.length > 0" class="deposits-list">
+      <button
         v-for="deposit in pendingDeposits"
         :key="deposit.txId"
-        class="deposit-row"
-        :class="$q.dark.isActive ? 'row-dark' : 'row-light'"
+        class="deposit-chip"
+        :class="$q.dark.isActive ? 'chip-dark' : 'chip-light'"
+        @click="openDepositSheet(deposit)"
       >
-        <!-- Left: Status indicator -->
-        <div class="deposit-indicator" :class="deposit.confirmed ? 'ready' : 'pending'">
-          <Icon :icon="deposit.confirmed ? 'tabler:check' : 'tabler:currency-bitcoin'" width="18" height="18" />
+        <div class="chip-indicator" :class="$q.dark.isActive ? 'indicator-dark' : 'indicator-light'">
+          <Icon icon="tabler:currency-bitcoin" width="16" height="16" />
         </div>
-
-        <!-- Center: Amount & Status -->
-        <div class="deposit-details">
-          <div class="deposit-amount" :class="$q.dark.isActive ? 'amount-dark' : 'amount-light'">
-            +{{ formatAmount(deposit.amount) }}
-          </div>
-          <div class="deposit-status" :class="deposit.confirmed ? 'status-ready' : 'status-pending'">
-            <template v-if="deposit.confirmed">
-              {{ $t('Ready') }}
-            </template>
-            <template v-else>
-              <span class="status-dots">
-                <span class="dot" :class="{ 'active': deposit.confirmations >= 1 }"></span>
-                <span class="dot" :class="{ 'active': deposit.confirmations >= 2 }"></span>
-                <span class="dot" :class="{ 'active': deposit.confirmations >= 3 }"></span>
-              </span>
-              {{ deposit.confirmations }}/3
-            </template>
-          </div>
-        </div>
-
-        <!-- Right: Action -->
-        <q-btn
-          v-if="deposit.confirmed"
-          no-caps
-          unelevated
-          size="sm"
-          class="claim-btn"
-          :loading="deposit.claiming"
-          @click="initiateClaimDeposit(deposit)"
-        >
-          {{ $t('Claim') }}
-        </q-btn>
-        <span v-else class="confirming-label" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-6'">
-          {{ $t('Confirming...') }}
+        <span class="chip-amount" :class="$q.dark.isActive ? 'amount-dark' : 'amount-light'">
+          +{{ formatAmount(deposit.amount) }}
         </span>
-      </div>
+        <span
+          class="chip-status"
+          :class="[
+            manualClaimAllowed(deposit) ? 'chip-status-ready' : 'chip-status-pending',
+            $q.dark.isActive ? 'chip-status-dark' : 'chip-status-light'
+          ]"
+        >
+          <span class="chip-dot" :class="manualClaimAllowed(deposit) ? 'chip-dot-ready' : 'chip-dot-pending'" aria-hidden="true"></span>
+          <span v-if="deposit.confirmed">{{ $t(bitcoinDepositsStore.statusText(deposit)) }}</span>
+          <span v-else>{{ deposit.confirmations }}/3</span>
+        </span>
+        <Icon icon="tabler:chevron-right" width="14" height="14" class="chip-chevron" />
+      </button>
     </div>
 
-    <!-- Empty State: Check Button -->
-    <div v-else class="empty-state">
-      <q-btn
-        flat
-        no-caps
-        class="check-btn"
-        :class="$q.dark.isActive ? 'check-dark' : 'check-light'"
-        :loading="isCheckingDeposits"
-        @click="checkDeposits"
-      >
-        <Icon icon="tabler:refresh" width="16" height="16" class="q-mr-xs" />
-        {{ $t('Check for deposits') }}
-      </q-btn>
+    <!-- One row of equal, labeled actions (52pt targets): shape the
+         request, hand out an identity, hand out the code, pull in a
+         voucher. Copy asks which identity instead of guessing; Share
+         hands out the full unified string - exactly what the QR encodes. -->
+    <div v-if="depositAddress" class="cta-row">
+      <button class="cta" @click="$emit('request-amount')">
+        <span class="cta-circle cta-circle-accent" :class="$q.dark.isActive ? 'cta-accent-dark' : 'cta-accent-light'">
+          <Icon icon="tabler:edit" width="20" height="20" />
+        </span>
+        <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Amount') }}</span>
+      </button>
+      <button class="cta">
+        <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+          <Icon icon="tabler:copy" width="20" height="20" />
+        </span>
+        <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Copy') }}</span>
+        <q-menu
+          anchor="top middle"
+          self="bottom middle"
+          :offset="[0, 6]"
+        >
+          <q-list class="copy-menu" :class="$q.dark.isActive ? 'copy-menu-dark' : 'copy-menu-light'">
+            <q-item v-if="leadWithLightningAddress" v-close-popup clickable @click="copyValue(lightningAddress, $t('Lightning address copied'))">
+              <div class="copy-item">
+                <span>{{ $t('Lightning Address') }}</span>
+                <small>{{ lightningAddress }}</small>
+              </div>
+            </q-item>
+            <q-item v-if="lightningInvoice && !leadWithLightningAddress" v-close-popup clickable @click="copyValue(lightningInvoice, $t('Invoice copied'))">
+              <div class="copy-item">
+                <span>{{ $t('Lightning invoice') }}</span>
+                <small>{{ truncateAddress(lightningInvoice) }}</small>
+              </div>
+            </q-item>
+            <q-item v-close-popup clickable @click="copyAddress">
+              <div class="copy-item">
+                <span>{{ $t('Bitcoin address') }}</span>
+                <small>{{ truncateAddress(depositAddress) }}</small>
+              </div>
+            </q-item>
+            <q-item v-if="sparkAddress" v-close-popup clickable @click="copyValue(sparkAddress, $t('Spark address copied'))">
+              <div class="copy-item">
+                <span>{{ $t('Spark address') }}</span>
+                <small>{{ truncateAddress(sparkAddress) }}</small>
+              </div>
+            </q-item>
+          </q-list>
+        </q-menu>
+      </button>
+      <button class="cta" @click="shareAddress">
+        <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+          <Icon icon="tabler:share" width="20" height="20" />
+        </span>
+        <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Share') }}</span>
+      </button>
+      <button class="cta" @click="$emit('scan-withdraw')">
+        <span class="cta-circle" :class="$q.dark.isActive ? 'cta-circle-dark' : 'cta-circle-light'">
+          <Icon icon="tabler:scan" width="20" height="20" />
+        </span>
+        <span class="cta-label" :class="$q.dark.isActive ? 'cta-label-dark' : 'cta-label-light'">{{ $t('Redeem') }}</span>
+      </button>
     </div>
 
-    <!-- Claim Confirmation - iOS Bottom Sheet -->
+
+    <!--
+      Deposit Sheet — single bottom sheet that handles every state of
+      a single Bitcoin deposit: still confirming, fetching the fee
+      quote, ready to claim, claim in flight. The chip above just
+      opens the sheet for the deposit it represents; everything the
+      user might want to do/see lives here so this is the one surface
+      we'd expose if a second call site ever needs the same flow.
+    -->
     <q-dialog v-model="showClaimDialog" position="bottom" transition-show="slide-up" transition-hide="slide-down">
       <q-card class="claim-sheet" :class="$q.dark.isActive ? 'sheet-dark' : 'sheet-light'">
-        <!-- Handle -->
         <div class="sheet-handle"><div class="handle-bar"></div></div>
 
-        <!-- Amount Hero -->
-        <div class="amount-hero">
-          <div class="hero-value" :class="$q.dark.isActive ? 'text-white' : 'text-dark'">
-            +{{ formatAmount(netClaimAmount) }}
+        <!-- ============================================================
+             CONFIRMING STATE — deposit is still waiting for blocks.
+             We surface the count, a 3-segment progress strip, and the
+             expected time so the user doesn't have to guess. No CTA
+             here; the sheet auto-promotes to the ready state when
+             confirmations land.
+             ============================================================ -->
+        <template v-if="claimingDeposit && !claimingDeposit.confirmed">
+          <div class="amount-hero">
+            <div class="hero-eyebrow" :class="$q.dark.isActive ? 'eyebrow-dark' : 'eyebrow-light'">
+              <span class="eyebrow-pulse" aria-hidden="true"></span>
+              {{ $t('Bitcoin arriving') }}
+            </div>
+            <div class="hero-value hero-value-pending">
+              +{{ formatAmount(claimingDeposit.amount) }}
+            </div>
+            <!-- The eyebrow and the strip already say the deposit is
+                 confirming, so the line under the amount carries what
+                 waiting costs: the SDK's mature quote, with the "~" the
+                 timing line uses while it is still an estimate. Without
+                 a quote the plain sentence keeps the slot, so nothing
+                 moves when the quote lands. -->
+            <div
+              v-if="waitQuote"
+              class="hero-fee"
+              :class="$q.dark.isActive ? 'hero-fee-dark' : 'hero-fee-light'"
+            >
+              <span>{{ $t('Fee') }}</span>
+              <strong>{{ waitPrefix }}{{ formatAmount(waitQuote.feeSats) }}</strong>
+              <span class="meta-sep" aria-hidden="true">·</span>
+              <span>{{ $t('You get') }}</span>
+              <strong>{{ waitPrefix }}{{ formatAmount(waitQuote.creditAmountSats) }}</strong>
+            </div>
+            <div v-else class="hero-label" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-7'">
+              {{ $t('Confirming on the Bitcoin network') }}
+            </div>
           </div>
-          <div class="hero-label" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-7'">
-            {{ $t('will be added to your wallet') }}
-          </div>
-        </div>
 
-        <!-- Fee Details -->
-        <div class="fee-details" :class="$q.dark.isActive ? 'details-dark' : 'details-light'">
-          <div class="fee-row">
-            <span class="fee-label">{{ $t('Deposit') }}</span>
-            <span class="fee-value">{{ formatAmount(claimingDeposit?.amount || 0) }}</span>
+          <div class="confirm-progress">
+            <div class="confirm-segments" aria-hidden="true">
+              <span
+                v-for="i in 3"
+                :key="i"
+                class="confirm-segment"
+                :class="[
+                  $q.dark.isActive ? 'segment-dark' : 'segment-light',
+                  { 'segment-filled': (claimingDeposit.confirmations || 0) >= i }
+                ]"
+              ></span>
+            </div>
+            <div class="confirm-caption" :class="$q.dark.isActive ? 'meta-dark' : 'meta-light'">
+              <strong>{{ claimingDeposit.confirmations || 0 }}/3</strong>
+              {{ $t('confirmations') }}
+              <span class="meta-sep" aria-hidden="true">·</span>
+              <span>{{ $t('~10-60 min total') }}</span>
+            </div>
           </div>
-          <div class="fee-row deduct">
-            <span class="fee-label">{{ $t('Network fee') }}</span>
-            <span class="fee-value">-{{ formatAmount(claimFeeAmount) }}</span>
+
+          <!-- Speed up. Offered only when the service prices an early add,
+               and only as one quiet pill until asked: the default view is
+               the plain confirming sheet. Tapping the pill opens the
+               comparison in its place, so nothing above the strip moves.
+               The wait column repeats the line under the amount; the Now
+               column is the offer. "~" marks the SDK's estimate. -->
+          <transition name="speed-reveal" mode="out-in">
+            <div
+              v-if="instantClassification && !speedUpOpen"
+              key="pill"
+              class="speed-pill-row"
+            >
+              <button
+                type="button"
+                class="speed-pill"
+                :class="$q.dark.isActive ? 'speed-pill-dark' : 'speed-pill-light'"
+                data-audit="deposit-speed-up"
+                @click="openSpeedUp"
+              >
+                <Icon icon="tabler:gauge" width="19" height="19" aria-hidden="true" />
+                {{ $t('Speed up') }}
+              </button>
+            </div>
+            <div
+              v-else-if="instantClassification && waitQuote"
+              key="compare"
+              class="claim-choice"
+              role="table"
+              :aria-label="$t('Speed up')"
+            >
+              <span class="choice-cell choice-head"></span>
+              <span class="choice-cell choice-head">{{ $t('Wait') }}</span>
+              <span class="choice-cell choice-head choice-now">{{ $t('Now') }}</span>
+
+              <span class="choice-cell choice-label">{{ $t('Ready in') }}</span>
+              <span class="choice-cell choice-value">{{ $t('~10-60 min') }}</span>
+              <span class="choice-cell choice-value choice-now">{{ $t('Right away') }}</span>
+
+              <span class="choice-cell choice-label">{{ $t('Fee') }}</span>
+              <span class="choice-cell choice-value deduct">{{ waitPrefix }}{{ formatAmount(waitQuote.feeSats) }}</span>
+              <span class="choice-cell choice-value deduct choice-now">{{ formatAmount(instantClassification.feeSats) }}</span>
+
+              <span class="choice-cell choice-label">{{ $t('You get') }}</span>
+              <span class="choice-cell choice-value credit">{{ waitPrefix }}{{ formatAmount(waitQuote.creditAmountSats) }}</span>
+              <span class="choice-cell choice-value credit choice-now">{{ formatAmount(instantClassification.creditSats) }}</span>
+            </div>
+            <!-- An engine that prices only the early leg: disclose that one. -->
+            <div
+              v-else-if="instantClassification"
+              key="single"
+              class="fee-details"
+              :class="$q.dark.isActive ? 'details-dark' : 'details-light'"
+            >
+              <div class="fee-row">
+                <span class="fee-label">{{ $t('Deposit') }}</span>
+                <span class="fee-value">{{ formatAmount(claimingDeposit.amount || 0) }}</span>
+              </div>
+              <div class="fee-row deduct">
+                <span class="fee-label">{{ $t('Fee') }}</span>
+                <span class="fee-value">-{{ formatAmount(instantClassification.feeSats) }}</span>
+              </div>
+            </div>
+          </transition>
+
+          <div class="sheet-actions">
+            <q-btn
+              v-if="instantClassification && speedUpOpen"
+              unelevated
+              no-caps
+              class="confirm-btn"
+              :class="$q.dark.isActive ? 'confirm-btn-dark' : 'confirm-btn-light'"
+              :loading="isClaimingInstant || walletStore.isDepositClaimInFlight(claimingDeposit.txId, claimingDeposit.outputIndex)"
+              data-audit="deposit-add-now"
+              @click="confirmInstantClaim"
+            >
+              {{ $t('Add now') }}
+              <template v-slot:loading>
+                <q-spinner size="18px" class="q-mr-sm" />
+                {{ $t('Adding') }}
+              </template>
+            </q-btn>
+            <!-- With the comparison open the quiet exit is the other way
+                 to add it: Wait closes the sheet and the deposit simply
+                 stays on the confirmation path. Held while a claim is
+                 in flight so the answer is never missed. -->
+            <q-btn
+              flat
+              no-caps
+              class="cancel-btn"
+              :class="$q.dark.isActive ? 'cancel-dark' : 'cancel-light'"
+              :disable="isClaimingInstant"
+              @click="cancelClaim"
+            >
+              {{ speedUpOpen ? $t('Wait') : $t('Close') }}
+            </q-btn>
           </div>
-        </div>
+        </template>
 
-        <!-- High Fee Warning -->
-        <div v-if="isHighFee" class="fee-alert">
-          <Icon icon="tabler:info-circle" width="16" height="16" />
-          <span>{{ $t('High fee relative to deposit') }}</span>
-        </div>
+        <template v-else-if="automaticDeposit">
+          <div class="amount-hero" data-audit="deposit-automatic">
+            <div class="hero-eyebrow">{{ $t(bitcoinDepositsStore.statusText(claimingDeposit)) }}</div>
+            <div class="hero-value hero-value-pending">+{{ formatAmount(claimingDeposit.amount) }}</div>
+            <p class="hero-label" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-7'" role="status">
+              {{ bitcoinDepositsStore.status(claimingDeposit) === 'retrying'
+                ? $t('We will retry automatically. You can close this screen.')
+                : $t('This deposit will be added automatically. You can close this screen.') }}
+            </p>
+          </div>
+          <div class="sheet-actions">
+            <q-btn flat no-caps class="cancel-btn" :class="$q.dark.isActive ? 'cancel-dark' : 'cancel-light'" @click="cancelClaim">
+              {{ $t('Close') }}
+            </q-btn>
+          </div>
+        </template>
 
-        <!-- Actions -->
-        <div class="sheet-actions">
-          <q-btn
-            unelevated
-            no-caps
-            class="confirm-btn"
-            :loading="isClaimingDeposit"
-            @click="confirmClaim"
-          >
-            {{ $t('Add to Wallet') }}
-          </q-btn>
-          <q-btn
-            flat
-            no-caps
-            class="cancel-btn"
-            :class="$q.dark.isActive ? 'cancel-dark' : 'cancel-light'"
-            @click="cancelClaim"
-          >
-            {{ $t('Cancel') }}
-          </q-btn>
-        </div>
+        <!-- ============================================================
+             READY / CLAIMING STATE — deposit has 3+ confirmations.
+             Quote fetch happens inline so the sheet can be opened at
+             the moment of confirmation without a separate modal hop.
+             ============================================================ -->
+        <template v-else-if="claimingDeposit">
+          <div class="amount-hero">
+            <div class="hero-value">
+              <q-spinner v-if="isLoadingQuote || !claimFeeQuote" size="32px" :color="$q.dark.isActive ? 'green-4' : 'green-8'" />
+              <span v-else>+{{ formatAmount(netClaimAmount) }}</span>
+            </div>
+            <div class="hero-label" :class="$q.dark.isActive ? 'text-grey-5' : 'text-grey-7'">
+              {{ isLoadingQuote || !claimFeeQuote ? $t('Calculating fee...') : $t('will be added to your wallet') }}
+            </div>
+          </div>
+
+          <div v-if="!isLoadingQuote && claimFeeQuote" class="fee-details" :class="$q.dark.isActive ? 'details-dark' : 'details-light'">
+            <div class="fee-row">
+              <span class="fee-label">{{ $t('Deposit') }}</span>
+              <span class="fee-value">{{ formatAmount(claimingDeposit.amount || 0) }}</span>
+            </div>
+            <div class="fee-row deduct">
+              <span class="fee-label">{{ $t('Fee') }}</span>
+              <span class="fee-value">-{{ formatAmount(claimFeeAmount) }}</span>
+            </div>
+          </div>
+
+          <div v-if="!isLoadingQuote && isHighFee" class="fee-alert">
+            <Icon icon="tabler:info-circle" width="16" height="16" />
+            <span>{{ $t('High fee relative to deposit') }}</span>
+          </div>
+
+          <div class="sheet-actions">
+            <q-btn
+              unelevated
+              no-caps
+              class="confirm-btn"
+              :class="$q.dark.isActive ? 'confirm-btn-dark' : 'confirm-btn-light'"
+              :loading="isClaimingDeposit || walletStore.isDepositClaimInFlight(claimingDeposit.txId, claimingDeposit.outputIndex)"
+              :disable="isLoadingQuote || !claimFeeQuote"
+              @click="confirmClaim"
+            >
+              {{ $t('Add to Wallet') }}
+            </q-btn>
+            <q-btn
+              flat
+              no-caps
+              class="cancel-btn"
+              :class="$q.dark.isActive ? 'cancel-dark' : 'cancel-light'"
+              @click="cancelClaim"
+            >
+              {{ $t('Cancel') }}
+            </q-btn>
+          </div>
+        </template>
       </q-card>
     </q-dialog>
   </div>
@@ -200,27 +426,59 @@
 
 <script>
 import VueQrcode from '@chenfengyuan/vue-qrcode';
+import ArkadeLogo from './ArkadeLogo.vue';
 import { useWalletStore } from 'src/stores/wallet';
+import { useBitcoinDepositsStore } from 'src/stores/bitcoinDeposits';
 import { formatAmount as formatAmountUtil } from 'src/utils/amountFormatting';
 import { shareContent } from 'src/utils/share';
+import { qrBlobFromRef } from 'src/utils/qrShare';
 import { truncateAddress } from 'src/utils/addressUtils';
 import { getQrOptions } from 'src/utils/qrConfig';
+import { composeUnifiedBip21 } from 'src/utils/bip21';
+import { AUTO_CLAIM_THRESHOLDS } from 'src/stores/bitcoinPreferences';
 
 export default {
   name: 'L1BitcoinReceive',
 
   components: {
-    VueQrcode
+    VueQrcode,
+    ArkadeLogo
   },
 
   props: {
     qrOptions: {
       type: Object,
       default: () => getQrOptions()
+    },
+    /**
+     * The wallet's current BOLT11 (zero-amount by default, amount-carrying
+     * after the user sets one). Minted and monitored by ReceiveModal; here
+     * it only rides inside the unified QR as its lightning= param. Empty
+     * while minting or after a mint failure - the QR then degrades to the
+     * rails that still work.
+     */
+    lightningInvoice: {
+      type: String,
+      default: ''
+    },
+    /** Requested amount in sats (0 = amountless). Becomes amount= in BTC. */
+    amountSats: {
+      type: Number,
+      default: 0
+    },
+    /** Preformatted fiat equivalent for the amount badge ('' hides it). */
+    amountFiat: {
+      type: String,
+      default: ''
+    },
+    /** The note attached to the request, shown truncated on the badge. */
+    note: {
+      type: String,
+      default: ''
     }
   },
 
-  emits: ['deposit-claimed', 'deposits-updated'],
+  emits: ['deposit-claimed', 'deposits-updated', 'request-amount', 'scan-withdraw'],
 
   data() {
     return {
@@ -229,10 +487,27 @@ export default {
       isLoadingAddress: false,
       isCheckingDeposits: false,
       pollingInterval: null,
-      // Claim dialog state
+      // Claim dialog state. The same sheet shows both the
+      // "still confirming" view and the "ready to claim" view, driven
+      // by `claimingDeposit.confirmed`. `isLoadingQuote` covers the
+      // brief gap after a confirmed deposit's sheet opens but before
+      // the SSP fee quote arrives.
       showClaimDialog: false,
       claimingDeposit: null,
+      claimWalletId: null,
+      // Instant (0-conf) offer for the sheet's confirming view:
+      // a classification from classifyUnconfirmedDeposit with
+      // category 'instant', or null when the SSP offered none.
+      instantClassification: null,
+      // What waiting costs, from the same quote: shown under the amount
+      // whether or not an early add is offered.
+      waitQuote: null,
+      // The comparison behind the Speed up pill; false = the pill.
+      speedUpOpen: false,
+      isClaimingInstant: false,
       claimFeeQuote: null,
+      claimQuoteRequest: 0,
+      isLoadingQuote: false,
       isClaimingDeposit: false,
       // Config
       minDepositAmount: 500,
@@ -242,13 +517,72 @@ export default {
 
   setup() {
     const walletStore = useWalletStore();
-    return { walletStore };
+    return { walletStore, bitcoinDepositsStore: useBitcoinDepositsStore() };
   },
 
   computed: {
+    automaticDeposit() {
+      return this.claimingDeposit?.confirmed && !this.manualClaimAllowed(this.claimingDeposit);
+    },
+    /** The wallet's static Spark address - the spark= rail of the QR. */
+    sparkAddress() {
+      return this.walletStore.activeSparkAddress || '';
+    },
+
+    /**
+     * The wallet's Lightning address (user@domain), when it has one. This
+     * is the one human-readable receive handle, so the default amountless
+     * view shows it under the QR and hands it to Copy and Share; the QR
+     * itself keeps carrying the machine rails. Empty when the wallet has
+     * no address (the pre-address engine), which restores the invoice-
+     * centric behavior everywhere below.
+     */
+    lightningAddress() {
+      return this.walletStore.activeWalletLightningAddress || '';
+    },
+
+    /**
+     * Whether the human layer leads with the Lightning address: only on
+     * the default amountless view. Once the user sets an amount the
+     * request IS the invoice, and copy/share hand that out as before.
+     */
+    leadWithLightningAddress() {
+      return !!this.lightningAddress && !(this.amountSats > 0);
+    },
+
+    /**
+     * ONE code that carries every rail: the on-chain address as the base,
+     * the BOLT11 as lightning= (which itself embeds a Spark fallback for
+     * Spark-aware payers) and the bare Spark address as spark=. Rails that
+     * are missing (invoice mint failed, no Spark address yet) simply drop
+     * out - the QR degrades to exactly what still works.
+     */
     qrValue() {
-      // Use bitcoin: URI scheme for better wallet compatibility
-      return this.depositAddress ? `bitcoin:${this.depositAddress}` : '';
+      if (!this.depositAddress) return '';
+      return composeUnifiedBip21({
+        address: this.depositAddress,
+        lightning: this.lightningInvoice,
+        spark: this.sparkAddress,
+        amountSats: this.amountSats > 0 ? this.amountSats : null,
+      });
+    },
+
+    /**
+     * Render the Bitcoin QR slightly smaller than the default Spark/LN
+     * QR (220px vs 280px) so the receive screen fits a phone viewport
+     * with the address pill, action buttons and incoming chips below
+     * the fold without scrolling. The shape is set via the canvas
+     * width here rather than CSS — scaling a canvas via CSS skews it
+     * because canvas doesn't honour `height: auto` from intrinsic
+     * width/height attributes.
+     */
+    bitcoinQrOptions() {
+      return { ...this.qrOptions, width: 232 };
+    },
+
+    /** Estimated wait figures carry the "~" the timing line already uses. */
+    waitPrefix() {
+      return this.waitQuote?.isEstimate ? '~' : '';
     },
 
     netClaimAmount() {
@@ -264,8 +598,18 @@ export default {
     },
 
     isHighFee() {
+      // Mirror the auto-claim classifier so the in-sheet warning fires
+      // for exactly the deposits that fall into `needs_approval` (i.e.
+      // the ones we used to flag with a sticky banner). Single source
+      // of truth lives in bitcoinPreferences.
       if (!this.claimingDeposit || !this.claimFeeQuote) return false;
-      return this.claimFeeAmount > (this.claimingDeposit.amount * 0.5);
+      const ratio = this.claimingDeposit.amount > 0
+        ? this.claimFeeAmount / this.claimingDeposit.amount
+        : 1;
+      return (
+        this.claimFeeAmount > AUTO_CLAIM_THRESHOLDS.MAX_FEE_SATS ||
+        ratio > AUTO_CLAIM_THRESHOLDS.MAX_FEE_RATIO
+      );
     }
   },
 
@@ -278,14 +622,43 @@ export default {
     this.stopPolling();
   },
 
+  watch: {
+    'walletStore.activeWalletId'() {
+      this.cancelClaim();
+      this.pendingDeposits = [];
+      this.depositAddress = null;
+      this.loadDepositAddress();
+    },
+    // The store bumps `depositsRefreshSignal` whenever a claim (auto or
+    // manual, here or in Wallet.vue) lands. We re-fetch instead of trusting
+    // the 30s poll so the row vanishes the instant the UTXO is gone.
+    'walletStore.depositsRefreshSignal'() {
+      if (this.walletStore.lastDepositsRefreshWalletId !== this.walletStore.activeWalletId) return;
+      this.pendingDeposits = this.pendingDeposits.filter(d => !this.walletStore.isDepositClaimed(d.txId, d.outputIndex));
+      if (this.claimingDeposit && this.walletStore.isDepositClaimed(this.claimingDeposit.txId, this.claimingDeposit.outputIndex)) this.cancelClaim();
+      this.checkDeposits();
+    },
+    automaticDeposit(automatic) {
+      if (!automatic && this.showClaimDialog && this.manualClaimAllowed(this.claimingDeposit) && !this.isLoadingQuote) {
+        this.openDepositSheet(this.claimingDeposit);
+      }
+    }
+  },
+
   methods: {
+    manualClaimAllowed(deposit) {
+      return this.bitcoinDepositsStore.needsManual(deposit);
+    },
     async loadDepositAddress() {
+      const walletId = this.walletStore.activeWalletId;
       this.isLoadingAddress = true;
       try {
         // Ensure Spark is connected (auto-reconnects with session PIN if needed)
-        const provider = await this.walletStore.ensureSparkConnected();
+        const provider = await this.walletStore.ensureSparkConnected(walletId);
         if (provider?.getL1DepositAddress) {
-          this.depositAddress = await provider.getL1DepositAddress();
+          const address = await provider.getL1DepositAddress();
+          if (walletId !== this.walletStore.activeWalletId) return;
+          this.depositAddress = address;
           // Initial deposit check
           await this.checkDeposits();
           // Start polling only after successful address load
@@ -293,12 +666,20 @@ export default {
         }
       } catch (error) {
         console.error('Failed to load Bitcoin deposit address:', error);
+        // Unified error dialog. The local translator has Spark-specific
+        // headlines ("Wallet locked", "Still confirming") that read
+        // better than the generic context fallback ("Bitcoin transaction
+        // failed") when the failure is a precondition rather than a
+        // transaction. Pass both title and reason so the user reads
+        // accurate copy; the modal shell is identical to every other
+        // error surface in the app.
         const userMessage = this.getUserFriendlyError(error, 'address');
-        this.$q.notify({
-          type: 'negative',
-          message: userMessage.title,
-          caption: userMessage.description,
-          
+        this.walletStore.showPaymentError(error, {
+          context: 'l1',
+          route: 'L1 deposit address',
+          title: userMessage.title,
+          reason: userMessage.description,
+          t: this.$t.bind(this),
         });
       } finally {
         this.isLoadingAddress = false;
@@ -306,31 +687,46 @@ export default {
     },
 
     async checkDeposits() {
+      if (this.isCheckingDeposits) return;
       this.isCheckingDeposits = true;
-      const startTime = Date.now();
-      const minLoadingTime = 2000; // Minimum 2 seconds for better UX
+      const walletId = this.walletStore.activeWalletId;
 
       try {
         // Ensure Spark is connected (auto-reconnects with session PIN if needed)
         const provider = await this.walletStore.ensureSparkConnected();
+        if (walletId !== this.walletStore.activeWalletId) return;
         if (provider?.getPendingDeposits) {
+          // Instantly-claimed deposits linger in the SDK's pending list
+          // until confirmations catch up — never show them as claimable.
           const deposits = await provider.getPendingDeposits();
-          // Preserve claiming state for existing deposits
-          this.pendingDeposits = deposits.map(d => ({
-            ...d,
-            claiming: this.pendingDeposits.find(pd => pd.txId === d.txId)?.claiming || false
-          }));
+          if (walletId !== this.walletStore.activeWalletId) return;
+          this.walletStore.reconcileDepositClaims(deposits);
+          this.pendingDeposits = deposits.filter(d => !this.walletStore.isDepositClaimed(d.txId, d.outputIndex));
+          void this.bitcoinDepositsStore.processDeposits(this.pendingDeposits, walletId);
           this.$emit('deposits-updated', this.pendingDeposits);
+
+          // If the sheet is open against a deposit that just promoted
+          // to confirmed (poll tick caught the third confirmation),
+          // re-bind to the fresh object and kick off the quote fetch
+          // so the sheet auto-transitions from "Confirming" to the
+          // Add to Wallet view in front of the user.
+          if (this.showClaimDialog && this.claimingDeposit) {
+            const fresh = this.pendingDeposits.find(d => d.txId === this.claimingDeposit.txId);
+            if (fresh) {
+              const justConfirmed = fresh.confirmed && !this.claimingDeposit.confirmed;
+              this.claimingDeposit = fresh;
+              if (justConfirmed && !this.claimFeeQuote) {
+                // The early offer only makes sense pre-confirmation.
+                this.instantClassification = null;
+                this.speedUpOpen = false;
+                this.openDepositSheet(fresh);
+              }
+            }
+          }
         }
       } catch (error) {
         console.error('Failed to check deposits:', error);
       } finally {
-        // Ensure minimum loading time for better UX feedback
-        const elapsed = Date.now() - startTime;
-        const remainingTime = minLoadingTime - elapsed;
-        if (remainingTime > 0) {
-          await new Promise(resolve => setTimeout(resolve, remainingTime));
-        }
         this.isCheckingDeposits = false;
       }
     },
@@ -376,58 +772,241 @@ export default {
       }, intervalMs);
     },
 
-    async initiateClaimDeposit(deposit) {
-      // Step 1: Get fee quote
+    /** Show progress immediately. Manual controls require a shared, explicit
+     * policy decision; fee loading must never expose an automatic claim CTA. */
+    async openDepositSheet(deposit) {
+      const walletId = this.walletStore.activeWalletId;
+      this.claimWalletId = walletId;
+      const request = ++this.claimQuoteRequest;
+      const current = () => walletId === this.walletStore.activeWalletId && request === this.claimQuoteRequest && this.showClaimDialog;
+      // Set the spinner flag first so the first render of the ready
+      // view shows the spinner, never the 0-sat fallback amount.
+      this.isLoadingQuote = !!deposit.confirmed;
+      this.claimingDeposit = deposit;
+      this.claimFeeQuote = null;
+      this.instantClassification = null;
+      this.waitQuote = null;
+      this.speedUpOpen = false;
+      this.showClaimDialog = true;
+
+      if (!deposit.confirmed) {
+        // Confirming view: price both ways of adding it in the
+        // background. The wait leg fills the line under the amount;
+        // an early leg, when the service offers one, adds the Speed up
+        // pill. Until then, and if the quote fails, the view is the
+        // plain confirming sheet.
+        this.loadDepositOffers(deposit);
+        return;
+      }
+
+      if (!this.manualClaimAllowed(deposit)) {
+        this.isLoadingQuote = false;
+        void this.bitcoinDepositsStore.processDeposit(deposit, this.walletStore.activeWalletId);
+        return;
+      }
+
       try {
-        // Ensure Spark is connected (auto-reconnects with session PIN if needed)
         const provider = await this.walletStore.ensureSparkConnected();
+        if (!current() || !this.manualClaimAllowed(deposit)) return;
         if (!provider?.getClaimFeeQuote) {
           throw new Error('Claim not supported');
         }
-
-        // Mark as claiming to show loading state
-        deposit.claiming = true;
-
         const quote = await provider.getClaimFeeQuote(deposit.txId, deposit.outputIndex);
-
-        this.claimingDeposit = deposit;
+        if (!current() || !this.manualClaimAllowed(deposit)) return;
+        this.bitcoinDepositsStore.reconsiderQuote(deposit, quote, walletId);
         this.claimFeeQuote = quote;
-        this.showClaimDialog = true;
-
       } catch (error) {
+        if (!current()) return;
         console.error('Failed to get claim fee quote:', error);
-        deposit.claiming = false;
         const userMessage = this.getUserFriendlyError(error, 'claim');
-        this.$q.notify({
-          type: 'negative',
-          message: userMessage.title,
-          caption: userMessage.description,
-          
+        this.walletStore.showPaymentError(error, {
+          context: 'claim',
+          route: 'L1 claim fee quote',
+          title: userMessage.title,
+          reason: userMessage.description,
+          t: this.$t.bind(this),
         });
+        // Close the sheet on quote failure — without a quote there's
+        // nothing actionable for the user to see.
+        this.showClaimDialog = false;
+        this.claimingDeposit = null;
+      } finally {
+        if (request === this.claimQuoteRequest) this.isLoadingQuote = false;
       }
     },
 
     cancelClaim() {
-      if (this.claimingDeposit) {
-        this.claimingDeposit.claiming = false;
-      }
+      this.claimQuoteRequest++;
+      this.isClaimingDeposit = false;
       this.showClaimDialog = false;
       this.claimingDeposit = null;
       this.claimFeeQuote = null;
+      this.isLoadingQuote = false;
+      this.instantClassification = null;
+      this.waitQuote = null;
+      this.speedUpOpen = false;
+      this.isClaimingInstant = false;
+    },
+
+    /**
+     * Price both ways of adding an unconfirmed deposit. One provider call
+     * returns the wait leg, shown under the amount, and, when the service
+     * fronts this deposit, the early leg behind the Speed up pill.
+     * Best-effort: any failure leaves the plain confirming view.
+     */
+    async loadDepositOffers(deposit) {
+      const walletId = this.claimWalletId;
+      const request = this.claimQuoteRequest;
+      try {
+        const provider = await this.walletStore.ensureSparkConnected(walletId);
+        if (!provider?.classifyUnconfirmedDeposit) return;
+        const classification = await provider.classifyUnconfirmedDeposit(deposit);
+        // The sheet may have moved on (closed, or promoted to confirmed)
+        // while the quote was in flight.
+        if (walletId !== this.walletStore.activeWalletId || request !== this.claimQuoteRequest
+          || this.claimingDeposit?.txId !== deposit.txId
+          || this.claimingDeposit?.outputIndex !== deposit.outputIndex || this.claimingDeposit?.confirmed) return;
+        this.waitQuote = classification.wait || null;
+        this.instantClassification = classification.category === 'instant' ? classification : null;
+      } catch (error) {
+        console.warn('Deposit offers lookup failed:', error?.message || error);
+      }
+    },
+
+    /** The pill gives way to the comparison, in place. */
+    openSpeedUp() {
+      this.speedUpOpen = true;
+    },
+
+    /**
+     * "Add now" on the confirming view. Same coordination guards
+     * as the 3-conf claim; on success the deposit is durably marked
+     * claimed so the confirmation-window pipeline can never resubmit it.
+     */
+    async confirmInstantClaim() {
+      const deposit = this.claimingDeposit;
+      const walletId = this.claimWalletId;
+      const epoch = this.walletStore.walletEpoch?.(walletId);
+      const current = () => !!walletId && walletId === this.walletStore.activeWalletId
+        && this.walletStore.walletEpoch?.(walletId) === epoch
+        && this.claimingDeposit === deposit;
+      if (!current()) return;
+      const classification = this.instantClassification;
+      if (!deposit || !classification) return;
+
+      const claimTxId = deposit.txId;
+      const claimVout = deposit.outputIndex || 0;
+      if (this.walletStore.isDepositClaimInFlight(claimTxId, claimVout)
+          || this.walletStore.isDepositClaimed(claimTxId, claimVout)) {
+        this.$q.notify({
+          type: 'info',
+          icon: 'sync',
+          message: this.$t('Already adding to wallet'),
+          caption: this.$t('Your balance will update shortly')
+        });
+        this.showClaimDialog = false;
+        return;
+      }
+
+      this.walletStore.markDepositClaimInFlight(claimTxId, claimVout);
+      this.isClaimingInstant = true;
+      try {
+        const provider = await this.walletStore.ensureSparkConnected(walletId);
+        if (!current()) return;
+        const result = await provider.claimInstantDeposit(
+          claimTxId,
+          classification.quote,
+          classification.plan,
+          deposit.outputIndex || 0
+        );
+
+        this.walletStore.markDepositClaimed(claimTxId, claimVout);
+        this.walletStore.signalDepositsRefresh(walletId);
+        if (!current()) return;
+        // An early claim settles asynchronously; keep the balance moving
+        // until the credit lands so the home screen catches up.
+        if (result && result.settled === false) {
+          this.startBalancePolling();
+        }
+
+        // ReceiveModal presents the deposit confirmation via deposit-claimed.
+        this.pendingDeposits = this.pendingDeposits.filter(d => !(d.txId === claimTxId && (d.outputIndex || 0) === claimVout));
+        if (this.walletStore.activeWalletId) {
+          await this.walletStore.refreshWalletData(walletId);
+        }
+        if (!current()) return;
+        this.$emit('deposit-claimed', { success: true, amount: classification.creditSats });
+        this.walletStore.signalDepositsRefresh(walletId);
+        this.showClaimDialog = false;
+        this.claimingDeposit = null;
+        this.instantClassification = null;
+        this.waitQuote = null;
+        this.speedUpOpen = false;
+      } catch (error) {
+        if (!current()) return;
+        console.error('Speed up failed:', error);
+        // Rare: the service's price moved between quote and claim, or it
+        // withdrew the offer. Nothing was charged. Say so in the user's
+        // words and withdraw the pill; the confirmation path continues.
+        this.$q.notify({
+          type: 'negative',
+          message: this.$t('Could not speed up'),
+          caption: this.$t('It still arrives after 3 confirmations.'),
+          timeout: 5000
+        });
+        this.instantClassification = null;
+        this.speedUpOpen = false;
+      } finally {
+        if (this.claimingDeposit === deposit || !this.claimingDeposit) this.isClaimingInstant = false;
+        this.walletStore.clearDepositClaimInFlight(claimTxId, claimVout);
+      }
     },
 
     async confirmClaim() {
-      if (!this.claimingDeposit || !this.claimFeeQuote) return;
+      const deposit = this.claimingDeposit;
+      const walletId = this.claimWalletId;
+      const epoch = this.walletStore.walletEpoch?.(walletId);
+      const current = () => !!walletId && walletId === this.walletStore.activeWalletId
+        && this.walletStore.walletEpoch?.(walletId) === epoch
+        && this.claimingDeposit === deposit;
+      if (!current()) return;
+      if (!this.claimingDeposit || !this.claimFeeQuote || !this.manualClaimAllowed(this.claimingDeposit)) return;
 
+      const quote = this.claimFeeQuote;
+      const claimTxId = deposit.txId;
+      const claimVout = this.claimingDeposit.outputIndex || 0;
+
+      // Final coordination check: auto-claim may have grabbed the UTXO
+      // between the user opening this sheet and tapping "Add to Wallet".
+      // Bail with a friendly message instead of submitting a duplicate.
+      if (this.walletStore.isDepositClaimInFlight(claimTxId, claimVout)) {
+        this.$q.notify({
+          type: 'info',
+          icon: 'sync',
+          message: this.$t('Already adding to wallet'),
+          caption: this.$t('Your balance will update shortly')
+        });
+        this.showClaimDialog = false;
+        return;
+      }
+
+      this.walletStore.markDepositClaimInFlight(claimTxId, claimVout);
       this.isClaimingDeposit = true;
       try {
         // Ensure Spark is connected (auto-reconnects with session PIN if needed)
-        const provider = await this.walletStore.ensureSparkConnected();
+        const provider = await this.walletStore.ensureSparkConnected(walletId);
+        if (!current()) return;
         const result = await provider.claimDeposit(
-          this.claimingDeposit.txId,
-          this.claimFeeQuote, // Pass the full quote with creditAmountSats and signature
-          this.claimingDeposit.outputIndex
+          claimTxId,
+          quote,
+          claimVout
         );
+
+        // The claim was accepted (whether settled or still processing) —
+        // record it durably so no path resubmits this UTXO.
+        this.walletStore.markDepositClaimed(claimTxId, claimVout);
+        this.walletStore.signalDepositsRefresh(walletId);
+        if (!current()) return;
 
         // Handle processing state (TRANSFER_LOCKED - claim is being processed in background)
         if (result.processing) {
@@ -440,52 +1019,105 @@ export default {
 
           // Remove from pending list (it will complete in background)
           this.pendingDeposits = this.pendingDeposits.filter(
-            d => d.txId !== this.claimingDeposit.txId
+            d => d.txId !== claimTxId || (d.outputIndex || 0) !== claimVout
           );
 
           // Start polling for balance update
           this.startBalancePolling();
 
           this.$emit('deposit-claimed', result);
+          // Tell the parent banner to drop this deposit immediately so the
+          // "Ready to claim" pill on the wallet home doesn't outlive the
+          // sheet by 30 seconds.
+          this.walletStore.signalDepositsRefresh(walletId);
           this.showClaimDialog = false;
           return;
         }
 
-        // Immediate success
-        this.$q.notify({
-          type: 'positive',
-          message: this.$t('Bitcoin added to wallet'),
-          caption: `+${this.formatAmount(result.amount)}`
-        });
-
+        // ReceiveModal presents the deposit confirmation via deposit-claimed.
         // Remove claimed deposit from list
         this.pendingDeposits = this.pendingDeposits.filter(
-          d => d.txId !== this.claimingDeposit.txId
+          d => d.txId !== claimTxId || (d.outputIndex || 0) !== claimVout
         );
 
         // Refresh wallet balance
         if (this.walletStore.activeWalletId) {
-          await this.walletStore.refreshWalletData(this.walletStore.activeWalletId);
+          await this.walletStore.refreshWalletData(walletId);
         }
 
+        if (!current()) return;
         this.$emit('deposit-claimed', result);
+        this.walletStore.signalDepositsRefresh(walletId);
         this.showClaimDialog = false;
 
       } catch (error) {
+        if (!current()) return;
         console.error('Failed to claim deposit:', error);
-        const userMessage = this.getUserFriendlyError(error, 'claim');
-        this.$q.notify({
-          type: 'negative',
-          message: userMessage.title,
-          caption: userMessage.description
-        });
-      } finally {
-        this.isClaimingDeposit = false;
-        if (this.claimingDeposit) {
-          this.claimingDeposit.claiming = false;
+
+        // Race recovery: the auto-claim path in Wallet.vue may have already
+        // claimed this deposit between our quote and the SSP submit. In that
+        // case the SDK throws a misleading "needs more confirmations" error
+        // even though the UTXO is gone. Re-check the pending list — if our
+        // deposit is no longer there, treat it as a success and refresh the
+        // balance instead of surfacing a scary error.
+        const claimedTxId = claimTxId;
+        let alreadyClaimed = false;
+        try {
+          const provider = await this.walletStore.ensureSparkConnected(walletId);
+          if (!current()) return;
+          if (provider?.getPendingDeposits && claimedTxId) {
+            const stillPending = (await provider.getPendingDeposits()).filter(
+              (d) => !this.walletStore.isDepositClaimed(d.txId, d.outputIndex)
+            );
+            if (!current()) return;
+            alreadyClaimed = this.walletStore.isDepositClaimed(claimedTxId, claimVout);
+            if (alreadyClaimed) {
+              this.pendingDeposits = stillPending;
+              this.$emit('deposits-updated', this.pendingDeposits);
+            }
+          }
+        } catch (recheckError) {
+          console.warn('Post-claim re-check failed:', recheckError?.message || recheckError);
         }
-        this.claimingDeposit = null;
-        this.claimFeeQuote = null;
+
+        if (alreadyClaimed) {
+          this.$q.notify({
+            type: 'positive',
+            message: this.$t('Bitcoin added to wallet'),
+
+          });
+          this.walletStore.signalDepositsRefresh(walletId);
+        } else {
+          const userMessage = this.getUserFriendlyError(error, 'claim');
+          this.walletStore.showPaymentError(error, {
+            context: 'claim',
+            route: 'L1 deposit claim',
+            title: userMessage.title,
+            reason: userMessage.description,
+            t: this.$t.bind(this),
+          });
+        }
+
+        // Always refresh balance — even on a "real" failure, an in-flight
+        // auto-claim may have settled in the background.
+        if (this.walletStore.activeWalletId) {
+          try {
+            await this.walletStore.refreshWalletData(walletId);
+          } catch (refreshError) {
+            console.warn('Balance refresh failed:', refreshError?.message || refreshError);
+          }
+        }
+
+        // Close the sheet on error so the amount doesn't visibly drop to 0
+        // when we null the quote in `finally`.
+        this.showClaimDialog = false;
+      } finally {
+        this.walletStore.clearDepositClaimInFlight(claimTxId, claimVout);
+        if (this.claimingDeposit === deposit) {
+          this.isClaimingDeposit = false;
+          this.claimingDeposit = null;
+          this.claimFeeQuote = null;
+        }
       }
     },
 
@@ -499,19 +1131,24 @@ export default {
     },
 
     async copyAddress() {
-      if (!this.depositAddress) return;
+      await this.copyValue(this.depositAddress, this.$t('Address copied'));
+    },
+
+    /** Copy one of the QR's identities with its own confirmation toast. */
+    async copyValue(value, message) {
+      if (!value) return;
 
       try {
-        await navigator.clipboard.writeText(this.depositAddress);
+        await navigator.clipboard.writeText(value);
         this.$q.notify({
           type: 'positive',
-          message: this.$t('Address copied'),
+          message,
 
         });
       } catch (error) {
         this.$q.notify({
           type: 'negative',
-          message: this.$t('Failed to copy'),
+          message: this.$t('Failed to copy address'),
 
         });
       }
@@ -520,22 +1157,32 @@ export default {
     async shareAddress() {
       if (!this.depositAddress) return;
 
+      // Amountless with a Lightning address: hand the human-readable name
+      // to the recipient (the QR image still rides along for scanning).
+      // With an amount set, share the full unified string exactly as the
+      // QR encodes it, so the recipient's wallet gets every rail. The
+      // BuhoGO wordmark is baked into the QR image by qrShare.
+      const leadAddress = this.leadWithLightningAddress;
+      const qrBlob = await qrBlobFromRef(this.$refs.depositQr, {
+        label: leadAddress ? this.lightningAddress : this.depositAddress,
+      });
       const result = await shareContent({
-        title: this.$t('Bitcoin Address'),
-        text: this.depositAddress
+        title: leadAddress ? this.$t('Lightning Address') : this.$t('Bitcoin Address'),
+        text: leadAddress ? this.lightningAddress : this.qrValue,
+        files: qrBlob ? [{ blob: qrBlob, name: leadAddress ? 'lightning-address.png' : 'bitcoin-address.png', mimeType: 'image/png' }] : undefined,
       });
 
       if (result.success) {
-        // Share was successful - no notification needed, native share UI provides feedback
+        // Native share UI already confirms success; no toast needed.
       } else if (result.reason === 'unsupported' || result.reason === 'error') {
         if (result.reason === 'error') {
           console.error('Failed to share address:', result.error);
         }
-        // Fallback to copy if share is not supported or failed
         await this.copyAddress();
       }
-      // Don't do anything for 'cancelled' - user just closed the dialog
+      // 'cancelled' → user closed the dialog, no action needed.
     },
+
 
     getUserFriendlyError(error, context = 'general') {
       const errorStr = error?.message || error?.toString() || '';
@@ -551,21 +1198,24 @@ export default {
         };
       }
 
+      // Deposit not found or already claimed — checked BEFORE the
+      // confirmation-keyword branch because the SDK sometimes returns a
+      // "needs more confirmations" message for a UTXO that was actually
+      // already swept (e.g. by the auto-claim path).
+      if (errorLower.includes('not found') || errorLower.includes('already claimed') ||
+          errorLower.includes('utxo')) {
+        return {
+          title: this.$t('Deposit not available'),
+          description: this.$t('This deposit may have already been claimed.')
+        };
+      }
+
       // Deposit not ready/confirmed
       if (errorLower.includes('confirmation') || errorLower.includes('not confirmed') ||
           errorLower.includes('pending')) {
         return {
           title: this.$t('Still confirming'),
           description: this.$t('Please wait for more confirmations before claiming.')
-        };
-      }
-
-      // Deposit not found or already claimed
-      if (errorLower.includes('not found') || errorLower.includes('already claimed') ||
-          errorLower.includes('utxo')) {
-        return {
-          title: this.$t('Deposit not available'),
-          description: this.$t('This deposit may have already been claimed.')
         };
       }
 
@@ -630,20 +1280,73 @@ export default {
 
 <style scoped>
 .l1-bitcoin-receive {
+  flex: 1;
   display: flex;
   flex-direction: column;
   align-items: center;
   padding: 0;
+  min-height: 0;
 }
 
 /* ==========================================
    QR Code Section - Clean & Centered
    ========================================== */
+/* Centers the badge + code + rails in whatever space the header and the
+   bottom action row leave - the natural focus point on a phone. */
+.unified-hero {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+  min-height: 0;
+}
+
 .qr-section {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding-top: 8px;
+}
+
+.invoice-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  max-width: 100%;
+  margin-bottom: 13px;
+  padding: 8px 14px;
+  border: 0;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.invoice-badge:active { transform: scale(0.98); }
+
+.invoice-badge-light { background: rgba(0, 0, 0, 0.05); color: rgba(0, 0, 0, 0.85); }
+.invoice-badge-dark  { background: rgba(255, 255, 255, 0.10); color: rgba(255, 255, 255, 0.9); }
+
+.invoice-badge-amount {
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+.invoice-badge-fiat {
+  font-size: 12px;
+  opacity: 0.6;
+}
+
+.invoice-badge-note {
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  opacity: 0.7;
 }
 
 .qr-card {
@@ -656,6 +1359,7 @@ export default {
 }
 
 .qr-frame {
+  position: relative;
   background: white;
   padding: 14px;
   border-radius: 16px;
@@ -663,8 +1367,8 @@ export default {
 }
 
 .qr-frame.loading {
-  width: 240px;
-  height: 240px;
+  width: 260px;
+  height: 260px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -672,278 +1376,323 @@ export default {
 
 .qr-code {
   display: block;
-  border-radius: 8px;
+  border-radius: 0;
 }
 
-.qr-hint {
-  font-size: 12px;
-  margin-top: 8px;
-  opacity: 0.5;
-}
-
-/* ==========================================
-   Address Pill - Compact & Tappable
-   ========================================== */
-.address-pill {
-  display: inline-flex;
+.qr-logo {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  width: 44px;
+  height: 44px;
   align-items: center;
-  gap: 8px;
-  padding: 10px 14px;
-  border-radius: 20px;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  margin: 12px auto 0;
+  justify-content: center;
+  margin: auto;
+  padding: 6px;
+  border-radius: 10px;
+  background: white;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.10);
 }
 
-.address-pill:active {
-  transform: scale(0.98);
-}
-
-.pill-dark {
-  background: rgba(255, 255, 255, 0.08);
-}
-
-.pill-dark:hover {
-  background: rgba(255, 255, 255, 0.12);
-}
-
-.pill-light {
-  background: rgba(0, 0, 0, 0.04);
-}
-
-.pill-light:hover {
-  background: rgba(0, 0, 0, 0.06);
-}
-
-.pill-icon {
-  color: #F7931A;
-}
-
-.pill-address {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  letter-spacing: 0.02em;
-}
-
-.pill-copy {
-  opacity: 0.4;
+.qr-logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 /* ==========================================
-   Action Buttons
+   Rail stack - the networks this one code carries, overlapped like
+   profile avatars. Informational; the strings live behind Copy.
    ========================================== */
-.action-buttons {
+.rail-stack {
   display: flex;
   justify-content: center;
-  gap: 12px;
-  margin-top: 12px;
+  margin-top: 13px;
 }
 
-.action-btn {
+.ln-address-line {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 10px 16px;
-  border-radius: 10px;
+  gap: 7px;
+  margin: 12px auto 0;
+  padding: 0 16px;
+  min-height: 44px; /* full-size touch target */
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 14px;
   font-weight: 500;
+  max-width: 100%;
 }
-
-.action-btn-dark {
-  color: rgba(255, 255, 255, 0.8);
-  background: rgba(255, 255, 255, 0.08);
+.ln-address-light {
+  background: rgba(26, 26, 26, 0.05);
+  color: #1a1a1a;
 }
-
-.action-btn-dark:hover {
-  background: rgba(255, 255, 255, 0.12);
+.ln-address-dark {
+  background: rgba(255, 255, 255, 0.07);
+  color: #f0f0f0;
 }
-
-.action-btn-light {
-  color: rgba(0, 0, 0, 0.7);
-  background: rgba(0, 0, 0, 0.05);
-}
-
-.action-btn-light:hover {
-  background: rgba(0, 0, 0, 0.08);
-}
-
-/* ==========================================
-   Pending Deposits Section
-   ========================================== */
-.deposits-section {
-  background: rgba(21, 222, 114, 0.06);
-  border-radius: 16px;
+.ln-address-text {
   overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-
-.section-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 16px;
-  border-bottom: 1px solid rgba(21, 222, 114, 0.1);
-}
-
-.section-title {
-  font-size: 13px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-}
-
-.title-dark {
-  color: #15DE72;
-}
-
-.title-light {
-  color: #0DBB5F;
-}
-
-.refresh-icon {
-  color: #15DE72;
-}
-
-.refresh-icon.spinning {
-  animation: spin 1s linear infinite;
-}
-
-@keyframes spin {
-  from { transform: rotate(0deg); }
-  to { transform: rotate(360deg); }
-}
-
-/* Deposit Row */
-.deposit-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-}
-
-.row-dark {
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-}
-
-.row-light {
-  border-bottom: 1px solid rgba(0, 0, 0, 0.04);
-}
-
-.deposit-row:last-child {
-  border-bottom: none;
-}
-
-.deposit-indicator {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  color: white;
+.ln-address-copy {
+  opacity: 0.45;
   flex-shrink: 0;
 }
 
-.deposit-indicator.pending {
-  background: linear-gradient(135deg, #F7931A, #FFAB40);
+.rail-badge {
+  display: flex;
+  width: 34px;
+  height: 34px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  border: 2.5px solid transparent;
 }
 
-.deposit-indicator.ready {
-  background: linear-gradient(135deg, #15DE72, #0DBB5F);
+.rail-badge + .rail-badge {
+  margin-left: -9px;
 }
 
-.deposit-details {
-  flex: 1;
-  min-width: 0;
+.rail-badge img {
+  width: 20px;
+  height: 20px;
+  object-fit: contain;
 }
 
-.deposit-amount {
-  font-size: 16px;
-  font-weight: 600;
-  color: #15DE72;
-}
-
-.amount-dark {
+.rail-badge-btc {
+  background: #F7931A;
   color: #FFFFFF;
 }
 
-.amount-light {
-  color: #000000;
-}
+.rail-badge-light { background: #FFFFFF; }
+.rail-badge-dark  { background: #2A2A2A; }
 
-.deposit-status {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  margin-top: 2px;
-}
-
-.deposit-status.status-ready {
-  color: #15DE72;
-}
-
-.deposit-status.status-pending {
-  color: #F7931A;
-}
-
-/* Status Dots */
-.status-dots {
-  display: inline-flex;
-  gap: 3px;
-  margin-right: 4px;
-}
-
-.status-dots .dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: rgba(247, 147, 26, 0.25);
-  transition: all 0.3s ease;
-}
-
-.status-dots .dot.active {
-  background: #F7931A;
-}
-
-/* Claim Button */
-.claim-btn {
-  background: linear-gradient(135deg, #15DE72, #0DBB5F) !important;
-  color: white !important;
-  font-size: 13px !important;
-  font-weight: 600 !important;
-  padding: 8px 16px !important;
-  border-radius: 10px !important;
-  box-shadow: 0 2px 8px rgba(21, 222, 114, 0.25);
-}
-
-.confirming-label {
-  font-size: 12px;
-  font-style: italic;
-}
+/* The ring wears the sheet's own surface color, so where badges overlap
+   the joint reads as a clean cutout instead of a stray white halo. */
+.rail-ring-light { border-color: var(--bg-card, #FAF7EF); }
+.rail-ring-dark  { border-color: var(--bg-card, #1A1A1A); }
 
 /* ==========================================
-   Empty State
+   CTA row - equal, labeled actions on 52pt circular targets.
+   Amount wears the accent; the rest stay quiet.
    ========================================== */
-.empty-state {
-  text-align: center;
-  padding: 8px 0;
+.cta-row {
+  display: flex;
+  justify-content: center;
+  gap: 20px;
+  align-self: stretch;
+  margin-top: 13px;
+  padding-bottom: max(10px, var(--safe-bottom, 0px));
 }
 
-.check-btn {
-  padding: 10px 20px;
-  border-radius: 10px;
-  font-size: 13px;
-  font-weight: 500;
+.cta {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  min-width: 56px;
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-family: 'Manrope', sans-serif;
+  -webkit-tap-highlight-color: transparent;
 }
 
-.check-dark {
-  color: rgba(255, 255, 255, 0.7);
-  background: rgba(255, 255, 255, 0.06);
+.cta:active .cta-circle {
+  transform: scale(0.94);
 }
 
-.check-light {
-  color: rgba(0, 0, 0, 0.6);
-  background: rgba(0, 0, 0, 0.04);
+.cta-circle {
+  display: flex;
+  width: 52px;
+  height: 52px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  transition: transform 0.12s ease, background-color 0.18s ease;
+}
+
+.cta-circle-light { background: rgba(0, 0, 0, 0.05); color: rgba(0, 0, 0, 0.75); }
+.cta-circle-light:hover { background: rgba(0, 0, 0, 0.08); }
+.cta-circle-dark { background: rgba(255, 255, 255, 0.08); color: rgba(255, 255, 255, 0.85); }
+.cta-circle-dark:hover { background: rgba(255, 255, 255, 0.12); }
+
+.cta-accent-light { background: rgba(247, 147, 26, 0.14); color: #B86E0F; }
+.cta-accent-light:hover { background: rgba(247, 147, 26, 0.20); }
+.cta-accent-dark { background: rgba(247, 147, 26, 0.18); color: #FBBF77; }
+.cta-accent-dark:hover { background: rgba(247, 147, 26, 0.24); }
+
+.cta-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.cta-label-light { color: rgba(0, 0, 0, 0.65); }
+.cta-label-dark  { color: rgba(255, 255, 255, 0.7); }
+
+/* ==========================================
+   Copy chooser - three identities, each with its value
+   ========================================== */
+.copy-menu {
+  min-width: 230px;
+  padding: 4px 0;
+}
+
+.copy-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.copy-item span {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.copy-item small {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  opacity: 0.55;
+}
+
+
+
+
+
+
+
+/* ==========================================
+   Pending Deposits — slim chip list. Each row is a single tap
+   target that opens the deposit sheet for that UTXO. The sheet
+   carries the full picture (progress while confirming, fee table
+   when ready), so the chip stays minimal: avatar, amount, tiny
+   status, chevron. Listed vertically in case a user receives
+   multiple deposits in a row.
+   ========================================== */
+.deposits-list {
+  align-self: stretch;
+  margin-top: 21px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.deposit-chip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  font-family: 'Manrope', sans-serif;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.08s ease;
+  -webkit-tap-highlight-color: transparent;
+}
+.deposit-chip:active { transform: scale(0.99); }
+
+.chip-light {
+  background: rgba(247, 147, 26, 0.06);
+  border-color: rgba(247, 147, 26, 0.18);
+}
+.chip-light:hover {
+  background: rgba(247, 147, 26, 0.10);
+}
+.chip-dark {
+  background: rgba(247, 147, 26, 0.07);
+  border-color: rgba(247, 147, 26, 0.16);
+}
+.chip-dark:hover {
+  background: rgba(247, 147, 26, 0.11);
+}
+
+/* Avatar: tinted bg + solid Bitcoin orange glyph. Same vocabulary as
+   the transaction-history rows so a deposit reads the same wherever
+   the user encounters it. */
+.chip-indicator {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: #F7931A;
+}
+.indicator-light { background: rgba(247, 147, 26, 0.14); }
+.indicator-dark  { background: rgba(247, 147, 26, 0.18); }
+
+.chip-amount {
+  flex: 1;
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.amount-light { color: #0F172A; }
+.amount-dark  { color: #FFFFFF; }
+
+/* Status badge — soft pill with a status dot + tiny label.
+   Pending uses the orange family, ready flips to green. */
+.chip-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px 3px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+}
+.chip-status-pending.chip-status-light { background: rgba(247, 147, 26, 0.14); color: #B86E0F; }
+.chip-status-pending.chip-status-dark  { background: rgba(247, 147, 26, 0.18); color: #FBBF77; }
+.chip-status-ready.chip-status-light   { background: rgba(13, 187, 95, 0.14); color: #0DBB5F; }
+.chip-status-ready.chip-status-dark    { background: rgba(21, 222, 114, 0.18); color: #15DE72; }
+
+.chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+.chip-dot-pending {
+  background: #F7931A;
+  box-shadow: 0 0 0 0 rgba(247, 147, 26, 0.55);
+  animation: eyebrow-pulse 1.8s ease-out infinite;
+}
+.chip-dot-ready {
+  background: #15DE72;
+}
+
+.chip-chevron {
+  opacity: 0.4;
+  flex-shrink: 0;
+}
+
+/* Reused by the sheet's "Bitcoin arriving" eyebrow + chip dot. */
+@keyframes eyebrow-pulse {
+  0%   { box-shadow: 0 0 0 0 rgba(247, 147, 26, 0.55); }
+  70%  { box-shadow: 0 0 0 7px rgba(247, 147, 26, 0);  }
+  100% { box-shadow: 0 0 0 0 rgba(247, 147, 26, 0);    }
+}
+.eyebrow-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #F7931A;
+  box-shadow: 0 0 0 0 rgba(247, 147, 26, 0.55);
+  animation: eyebrow-pulse 1.8s ease-out infinite;
 }
 
 /* ==========================================
@@ -961,7 +1710,7 @@ export default {
 }
 
 .claim-sheet.sheet-light {
-  background: #FFFFFF;
+  background: var(--bg-card);
 }
 
 .sheet-handle {
@@ -987,7 +1736,11 @@ export default {
   font-size: 44px;
   font-weight: 700;
   letter-spacing: -1px;
-  color: #15DE72;
+  /* Inherits the project's brand-aware credit colour: muted #059573 on
+     cream (set on body.body--light via --color-green), neon #15DE72 on
+     dark. Keeps "incoming sats" as a credit signal without the cream-
+     mode neon buzz. */
+  color: var(--color-green, #15DE72);
   line-height: 1;
 }
 
@@ -995,6 +1748,95 @@ export default {
   font-size: 15px;
   margin-top: 10px;
 }
+
+/* What waiting costs, under the arriving amount. Labels muted, numbers
+   in the text colour, one line that never wraps. Same slot and size as
+   .hero-label so the quote landing never moves the strip below. */
+.hero-fee {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 13px;
+  margin-top: 10px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+.hero-fee strong {
+  font-weight: 600;
+}
+.hero-fee .meta-sep {
+  margin: 0 2px;
+  opacity: 0.5;
+}
+.hero-fee-light { color: rgba(15, 23, 42, 0.6); }
+.hero-fee-light strong { color: #0F172A; }
+.hero-fee-dark { color: rgba(255, 255, 255, 0.55); }
+.hero-fee-dark strong { color: #F5F5F7; }
+
+/* Confirming-state hero overrides — small uppercase eyebrow above
+   the amount, and a softer orange tint for the amount itself so it
+   doesn't claim the same credit-green meaning as the ready state. */
+.hero-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+.hero-eyebrow.eyebrow-light { color: #B86E0F; }
+.hero-eyebrow.eyebrow-dark  { color: #FBBF77; }
+
+.hero-value-pending {
+  color: #F7931A !important;
+}
+
+/* 3-segment confirmation strip. Each segment is a rounded bar that
+   fills as confirmations land. We use distinct elements (instead of
+   a single bar with width %) so the discrete "1 of 3" milestone is
+   legible at a glance and animates per-block. */
+.confirm-progress {
+  margin: 0 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.confirm-segments {
+  display: flex;
+  gap: 6px;
+}
+
+.confirm-segment {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  transition: background 0.3s ease;
+}
+.confirm-segment.segment-light { background: rgba(247, 147, 26, 0.18); }
+.confirm-segment.segment-dark  { background: rgba(247, 147, 26, 0.20); }
+.confirm-segment.segment-filled {
+  background: linear-gradient(90deg, #F7931A, #FFB347);
+}
+
+.confirm-caption {
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.confirm-caption strong {
+  font-weight: 700;
+}
+.confirm-caption .meta-sep {
+  margin: 0 4px;
+  opacity: 0.5;
+}
+
+/* Reused by the confirming caption below the segments. */
+.meta-light { color: rgba(15, 23, 42, 0.6); }
+.meta-dark  { color: rgba(255, 255, 255, 0.55); }
 
 /* Fee Details */
 .fee-details {
@@ -1030,6 +1872,118 @@ export default {
   color: #FF6B6B;
 }
 
+/* Speed up pill: a real button one step below the primary. Tinted with
+   the credit green, 44pt, centered, icon + verb. It is an offer, not
+   the sheet's purpose, so it is a pill and not a full-width bar. */
+.speed-pill-row {
+  display: flex;
+  justify-content: center;
+  margin: 2px 20px 14px;
+}
+.speed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 44px;
+  padding: 0 18px 0 14px;
+  border: 0;
+  border-radius: 999px;
+  font-family: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 0.12s ease, background-color 0.2s ease;
+}
+.speed-pill:active {
+  transform: scale(0.97);
+}
+.speed-pill:focus-visible {
+  outline: 2px solid currentColor;
+  outline-offset: 2px;
+}
+.speed-pill-light {
+  background: rgba(5, 149, 115, 0.12);
+  color: #05704F;
+}
+.speed-pill-dark {
+  background: rgba(21, 222, 114, 0.14);
+  color: #7BF0B3;
+}
+/* The pill gives way to the comparison in place: a short fade, no
+   layout jump above the strip. */
+.speed-reveal-enter-active,
+.speed-reveal-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+}
+.speed-reveal-enter-from,
+.speed-reveal-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .speed-pill,
+  .speed-reveal-enter-active,
+  .speed-reveal-leave-active {
+    transition: none;
+  }
+}
+
+/* Two ways to add a confirming deposit, priced side by side. Shown only
+   once Speed up is tapped. It sits directly on the sheet, no card: the
+   Now column's faint tint is the only surface, so the two columns never
+   read as one list and the eye lands on the column the primary button
+   acts on. */
+.claim-choice {
+  margin: 0 20px 16px;
+  padding: 6px 8px;
+  border-radius: 12px;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  column-gap: 6px;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+.choice-cell {
+  padding: 6px 8px;
+}
+.choice-head {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  text-align: right;
+  white-space: nowrap;
+}
+.choice-label {
+  opacity: 0.7;
+}
+/* A price is one token: the "~" mark, the unit and the digits never
+   break across lines, whatever the locale's grouping does to the width. */
+.choice-value {
+  font-weight: 500;
+  text-align: right;
+  white-space: nowrap;
+}
+.choice-value.deduct {
+  color: #FF6B6B;
+}
+.choice-value.credit {
+  color: var(--color-green, #15DE72);
+  font-weight: 600;
+}
+.choice-now {
+  background: rgba(247, 147, 26, 0.08);
+}
+.choice-head.choice-now {
+  border-radius: 8px 8px 0 0;
+  opacity: 0.85;
+}
+.choice-value.credit.choice-now {
+  border-radius: 0 0 8px 8px;
+}
+
 /* Fee Alert */
 .fee-alert {
   display: flex;
@@ -1047,7 +2001,8 @@ export default {
 
 /* Sheet Actions */
 .sheet-actions {
-  padding: 8px 20px 32px;
+  padding: 8px 20px;
+  padding-bottom: max(32px, var(--safe-bottom, 0px));
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1059,9 +2014,16 @@ export default {
   border-radius: 14px;
   font-size: 17px;
   font-weight: 600;
+}
+.confirm-btn-dark {
   background: linear-gradient(135deg, #15DE72, #0DBB5F) !important;
   color: white !important;
   box-shadow: 0 4px 16px rgba(21, 222, 114, 0.3);
+}
+.confirm-btn-light {
+  background: var(--btn-neutral-bg) !important;
+  color: var(--btn-neutral-fg) !important;
+  box-shadow: none;
 }
 
 .cancel-btn {

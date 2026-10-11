@@ -2,8 +2,14 @@
 // https://v2.quasar.dev/quasar-cli-vite/quasar-config-file
 
 import { defineConfig } from '#q-app/wrappers'
+import { createRequire } from 'node:module'
 
-export default defineConfig((/* ctx */) => {
+// The app's own version, exposed to runtime code as process.env.APP_VERSION.
+// Used to key per-install memory to a build — e.g. the QR scanner engine
+// choice (src/utils/scannerEngine.js) is re-evaluated after every update.
+const { version: appVersion } = createRequire(import.meta.url)('./package.json')
+
+export default defineConfig((ctx) => {
   return {
     // https://v2.quasar.dev/quasar-cli-vite/prefetch-feature
     // preFetch: true,
@@ -12,15 +18,51 @@ export default defineConfig((/* ctx */) => {
     // --> boot files are part of "main.js"
     // https://v2.quasar.dev/quasar-cli-vite/boot-files
     boot: [
+      // 'theme' runs first so the persisted light/dark choice is applied
+      // before any component renders — avoids a flash of the wrong theme.
+      'theme',
       'axios',
       'i18n',
+      'toasts',
       'iconify',
-      'safe-area'
-    ],
+      'safe-area',
+      'kiosk',
+      // 'secure-screen' reconciles the Pinia screen-privacy field
+      // with the native SharedPreferences value applied by
+      // MainActivity.onCreate, and installs the router-meta
+      // forceSecure override guard. Safe to load everywhere — the
+      // util layer no-ops on web.
+      'secure-screen',
+      // Durable profile recovery, username activation and publication.
+      'profile-sync',
+      // 'payment-address' gives every identity a payment address it did not
+      // have to go and find: the first Spark wallet's Lightning address when
+      // one exists, the Social Bucket (<npub>@npub.cash) otherwise, adopted
+      // as the profile's lud16 and published. Without this a new user's
+      // username resolves to a profile with nothing to pay. Best-effort and
+      // idempotent. Profile synchronization publishes the resulting edits.
+      'payment-address',
+      // 'dm-inbox' runs the contact chat's lifecycle (docs/CONTACT_CHAT.md):
+      // one runtime per identity, started once the app is unlocked, its key
+      // wiped on lock and after ten minutes in the background. It reads the
+      // identity and the profile address, so it comes after the two boots that
+      // settle them. Does nothing on a kiosk device.
+      'dm-inbox',
+      // 'emergency-exit' resumes any exit in progress: chain checks and the
+      // next package broadcasts, independent of Spark being reachable.
+      'emergency-exit',
+      ctx.mode.capacitor ? 'deep-links' : '',
+      ctx.mode.capacitor ? 'nfc' : '',
+      ctx.dev ? 'audit' : ''
+    ].filter(Boolean),
 
     // https://v2.quasar.dev/quasar-cli-vite/quasar-config-file#css
     css: [
-      'app.css'
+      'app.css',
+      // Shared chrome for the identity surface. Global rather than scoped per
+      // page: eleven screens were repeating the same forty lines, and the one
+      // that mattered most (the primary button) was invisible in dark mode.
+      'identity.css'
     ],
 
     // https://github.com/quasarframework/quasar/tree/dev/extras
@@ -53,7 +95,9 @@ export default defineConfig((/* ctx */) => {
 
       // publicPath: '/',
       // analyze: true,
-      // env: {},
+      env: {
+        APP_VERSION: appVersion,
+      },
       // rawDefine: {}
       // ignorePublicFolder: true,
       // minify: false,
@@ -64,6 +108,20 @@ export default defineConfig((/* ctx */) => {
         // Disable crossorigin attribute on script/link tags — can cause loading issues in Capacitor Android WebView
         viteConf.build = viteConf.build || {}
         viteConf.build.crossOriginLoading = false
+
+        // The Breez SDK ships a WASM module loaded via its own storage-global
+        // wrapper; Vite's dependency optimizer must not pre-bundle it or the
+        // wasm URL resolution and IndexedDB globals break at runtime.
+        viteConf.optimizeDeps = viteConf.optimizeDeps || {}
+        viteConf.optimizeDeps.exclude = viteConf.optimizeDeps.exclude || []
+        viteConf.optimizeDeps.exclude.push('@breeztech/breez-sdk-spark')
+
+        // The Arkade SDK's descriptor dependency writes through a bare `global`
+        // identifier. That used to be patched here with an optimizeDeps define
+        // (global -> globalThis), which only ever covered the dev pre-bundle and
+        // went silent when Vite 8 swapped esbuild for Rolldown. It is now a
+        // classic <script> shim at the top of index.html, which no bundler
+        // change can quietly drop — see the comment there.
       },
       // viteVuePluginOptions: {},
 
@@ -75,16 +133,29 @@ export default defineConfig((/* ctx */) => {
     // Full list of options: https://v2.quasar.dev/quasar-cli-vite/quasar-config-file#devserver
     devServer: {
       // https: true,
-      open: true // opens browser window automatically
+      open: true, // opens browser window automatically
+      // nadanada's API sends no CORS headers, so the browser blocks direct
+      // calls. Proxy /nadanada-api -> the live API (server-to-server, no CORS)
+      // for web dev. On native we hit the API directly via CapacitorHttp, so
+      // this only matters for `quasar dev` and the web build.
+      proxy: {
+        '/nadanada-api': {
+          target: 'https://nadanada.me/api/v2',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/nadanada-api/, '')
+        }
+      }
     },
 
     // https://v2.quasar.dev/quasar-cli-vite/quasar-config-file#framework
     framework: {
       config: {
-        dark: true,
+        dark: false,
         notify: {
-          position: 'top',
-          timeout: 2500
+          position: 'bottom',
+          timeout: 2500,
+          textColor: 'white',
+          progress: true,
         }
       },
 
@@ -148,15 +219,59 @@ export default defineConfig((/* ctx */) => {
 
     // https://v2.quasar.dev/quasar-cli-vite/developing-pwa/configuring-pwa
     pwa: {
-      workboxMode: 'GenerateSW', // 'GenerateSW' or 'InjectManifest'
+      // The worker is hand-authored source (src-pwa/custom-service-worker.js)
+      // so its update lifecycle and caching strategies are reviewable code
+      // instead of generated config. See that file for the reasoning.
+      workboxMode: 'InjectManifest',
       // swFilename: 'sw.js',
       manifestFilename: 'manifest.json',
-      // extendManifestJson (json) {},
-      // useCredentialsForManifestTag: true,
-      // injectPwaMetaTags: false,
-      // extendPWACustomSWConf (esbuildConf) {},
-      // extendGenerateSWOptions (cfg) {},
-      // extendInjectManifestOptions (cfg) {}
+      extendPWACustomSWConf (esbuildConf) {
+        // esbuild refuses to compile for Safari 14: WebKit destructuring bugs
+        // make it a target that would need lowering, and esbuild has not
+        // implemented that lowering ("Transforming destructuring ... is not
+        // supported yet"). The Workbox modules the worker imports are full of
+        // destructuring, so the worker build hard-fails. Safari 14 never ran
+        // transpiled worker code anyway: the previously generated worker
+        // shipped these same patterns as-is. Lift only the worker's floor to
+        // Safari 15; the app bundle keeps the project-wide browser target.
+        if (Array.isArray(esbuildConf.target)) {
+          esbuildConf.target = esbuildConf.target.map(
+            target => (target === 'safari14' ? 'safari15' : target),
+          )
+        }
+      },
+      extendInjectManifestOptions (cfg) {
+        // Precache the app shell only: what the app needs to boot and render
+        // offline. public/ also holds a large media library (store
+        // screenshots, onboarding art, partner kits); precaching it made
+        // every worker update a ~44 MB download that phones often never
+        // finished, stranding them on stale builds. Those images now cache at
+        // runtime as they are viewed (see the worker's image route).
+        cfg.globPatterns = [
+          'index.html',
+          'assets/**',
+          'fonts/**',
+          'icons/**',
+          'favicon/**',
+          '*.svg',
+          'manifest.json',
+        ]
+        // The ~12.5 MB Breez SDK wasm lives under assets/ and sits just under
+        // the size cap below, so without this it would be precached and
+        // pushed to every visitor at install time, wallet or no wallet. It is
+        // cached on the first Spark connect instead (see the worker's
+        // breez-wasm route), so only devices actually running a Spark wallet
+        // pay for it once, and those stay offline-capable afterwards.
+        cfg.globIgnores = [...(cfg.globIgnores || []), '**/breez_sdk_spark_wasm_bg*.wasm']
+        // Everything in assets/ is content-hashed, so the URL itself is the
+        // version; skip the revision query parameter on those fetches.
+        cfg.dontCacheBustURLsMatching = /^assets\//
+        // Workbox silently drops files over 2 MiB from the precache, which
+        // left the largest (boot-critical) chunk as a mandatory network fetch
+        // and blanked stale clients after every deploy. Raise the cap well
+        // clear of the current worst case.
+        cfg.maximumFileSizeToCacheInBytes = 12 * 1024 * 1024
+      },
     },
 
     // Full list of options: https://v2.quasar.dev/quasar-cli-vite/developing-cordova-apps/configuring-cordova

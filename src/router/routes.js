@@ -1,3 +1,45 @@
+import { Capacitor } from '@capacitor/core'
+
+/**
+ * Guard for the Learn & Earn (`/learn*`) routes. The feature pays out real
+ * sats, and the web build has no way to stop a user from creating throwaway
+ * wallets to farm rewards, so the whole flow is native-only. On web we bounce
+ * any direct navigation (typed URL, external deep link, in-app push) to
+ * Settings flagged to open the shared Get-the-App dialog. On the native build
+ * it is a no-op. Mirrors the biometrics / screen-privacy gating.
+ */
+const earnNativeOnly = (to, from, next) => {
+  if (Capacitor.isNativePlatform()) {
+    next()
+    return
+  }
+  next({ path: '/settings', query: { getApp: 'learn' } })
+}
+
+/**
+ * The nadanada shop is native-only. nadanada's API sends no CORS headers, so a
+ * browser cannot reach it at all without a reverse proxy, and a half-working
+ * shop that can still create an invoice is worse than none. Bounces to /spend,
+ * which pops the shared Get-the-App dialog (see SpendPage).
+ *
+ * Same three-layer shape as Learn & Earn: this guard, the row tap in
+ * SpendPage, and the money-exit lock in services/nadanada/client.js.
+ */
+const shopNativeOnly = (to, from, next) => {
+  if (Capacitor.isNativePlatform()) {
+    next()
+    return
+  }
+  next({ path: '/spend', query: { getApp: 'shop' } })
+}
+
+// `/settings?section=backup` was the backup entry for years and is still
+// what older links name. Backups now live on `/security`.
+function legacyBackupSection(to, from, next) {
+  if (['backup', 'backups'].includes(to.query.section)) return next('/security')
+  next()
+}
+
 const routes = [
   {
     path: '/',
@@ -5,14 +47,115 @@ const routes = [
     children: [
       { path: '', component: () => import('pages/WelcomePage.vue') },
       { path: '/spark-setup', component: () => import('pages/SparkSetupPage.vue') },
-      { path: '/spark-restore', component: () => import('pages/SparkRestorePage.vue') },
+      { path: '/arkade-setup', component: () => import('pages/ArkadeSetupPage.vue') },
+      // Unified, wallet-type-aware restore. `/restore` lets the user pick;
+      // `/spark-restore` (Settings, kiosk) and `/arkade-restore` pin the type.
+      { path: '/restore', component: () => import('pages/RestorePage.vue') },
+      { path: '/spark-restore', component: () => import('pages/RestorePage.vue') },
+      { path: '/arkade-restore', component: () => import('pages/RestorePage.vue') },
+      { path: '/spark-success', component: () => import('pages/SparkSuccessWizard.vue') },
       { path: '/nwc-setup', component: () => import('pages/NWCSetupPage.vue') },
       { path: '/lnbits-setup', component: () => import('pages/LNBitsSetupPage.vue') },
       { path: '/wallet', component: () => import('pages/Wallet.vue') },
-      { path: '/settings', component: () => import('pages/Settings.vue') },
+      // Settings / Identity / Spend hub - three sibling tabs, each its own
+      // route. Entry points target the tab they mean: the wallet toolbar's
+      // profile icon opens `/identity`, Map's back-fallback opens `/spend`.
+      // Nothing lands on the hub without naming a tab, so the Settings route
+      // needs no default-tab redirect - it always shows the Settings tab,
+      // with or without a query (`?section=wallets`, `?getApp=learn`).
+      // Backups left Settings for Security; the guard sends old links on.
+      { path: '/settings', component: () => import('pages/Settings.vue'), beforeEnter: legacyBackupSection },
+      // Security: backups and restoration. Reached from the home menu at any
+      // time and from the pending-backup keyring, and the one route the
+      // required-update gate yields to (see UpdateExperience.vue).
+      { path: '/security', component: () => import('pages/SecurityPage.vue') },
+      // Emergency exit for one Spark wallet: opened from Settings → Advanced. A
+      // resumable page, not a flow, because an exit spans days. Kiosk mode
+      // never reaches it (the kiosk guard redirects every unlisted route).
+      { path: '/security/exit/:walletId', component: () => import('pages/EmergencyExitPage.vue') },
+      { path: '/about', component: () => import('pages/AboutPage.vue') },
+      { path: '/spend', component: () => import('pages/SpendPage.vue') },
+      // Public profile page. The one route in the app meant for people who
+      // do not have BuhoGO: it is what a shared card link opens. Takes a
+      // username, a full NIP-05 address or an npub. Deliberately outside the
+      // identity tab, because the visitor is not the owner of the card.
+      { path: '/p/:id', component: () => import('pages/PublicProfilePage.vue') },
+
+      // Identity. The tab itself is the card. Larger configuration tasks use
+      // pushed screens; the quick Get paid action stays in a bottom sheet.
+      { path: '/identity', component: () => import('pages/identity/IdentityHomePage.vue') },
+      // The flat tab has no Manage layer and no About page; old deep links
+      // land on the card itself, query preserved like the /profile redirect.
+      {
+        path: '/identity/about',
+        redirect: (to) => ({ path: '/identity', query: to.query }),
+      },
+      {
+        path: '/identity/manage',
+        redirect: (to) => ({ path: '/identity', query: to.query }),
+      },
+      { path: '/identity/profile', component: () => import('pages/identity/IdentityProfilePage.vue') },
+      { path: '/identity/username', component: () => import('pages/identity/IdentityUsernamePage.vue') },
+      // Keep old bookmarks/deep links working while presenting Get paid in
+      // context over the identity home rather than as a separate page.
+      {
+        path: '/identity/get-paid',
+        redirect: (to) => ({
+          path: '/identity',
+          query: { ...to.query, sheet: 'get-paid' },
+        }),
+      },
+      // Sign in is also a scoped action. Preserve old links while returning
+      // people to the identity card when they dismiss the sheet.
+      {
+        path: '/identity/sign-in',
+        redirect: (to) => ({
+          path: '/identity',
+          query: { ...to.query, sheet: 'sign-in' },
+        }),
+      },
+      // The identity backup page merged into Security.
+      { path: '/identity/words', redirect: '/security' },
+      { path: '/identity/identities', component: () => import('pages/identity/IdentityListPage.vue') },
+      { path: '/identity/identities/:key(\\d+|x[a-z0-9]+)', component: () => import('pages/identity/IdentityDetailPage.vue') },
+      // Legacy Keys links now land beside the identity each private key belongs to.
+      { path: '/identity/advanced', redirect: '/identity/identities' },
+      { path: '/identity/erase', component: () => import('pages/identity/IdentityErasePage.vue') },
+      // Legacy alias - anything that still links to /profile (e.g. an
+      // older deep link) lands on the same page under its new tab name.
+      // Query params are preserved (a redirect string alone would drop
+      // them) since IdentityAuthDialog's LUD-04 sign-in flow can land
+      // here with its own query.
+      { path: '/profile', redirect: (to) => ({ path: '/identity', query: to.query }) },
       { path: '/transactions', component: () => import('pages/TransactionHistory.vue') },
       { path: '/transaction/:id', component: () => import('pages/TransactionDetails.vue') },
-      { path: '/address-book', component: () => import('pages/AddressBook.vue') }
+      { path: '/address-book', component: () => import('pages/AddressBook.vue') },
+      // A contact's own page: identity, pay, and the payments between you.
+      { path: '/address-book/:id', component: () => import('pages/ContactProfilePage.vue') },
+      // The contact chat: money requests, payments and short encrypted
+      // messages with a saved contact. `/messages/:pubkey` is the same page for
+      // a sender who is not in the address book (the route notifications use):
+      // it shows who wrote with an "add contact / block" banner, and hands over
+      // to the contact route as soon as the sender is saved. Lazy-loaded like
+      // the contact page.
+      { path: '/address-book/:id/chat', component: () => import('pages/ContactChatPage.vue') },
+      { path: '/messages/:pubkey', component: () => import('pages/ContactChatPage.vue') },
+      // Bitcoin merchant map. Lazy-loaded so maplibre-gl (~200KB gzipped)
+      // never lands in the initial bundle. `?place=<id>` deep-links a pin.
+      { path: '/map', component: () => import('pages/MapPage.vue') },
+      // eSIM + VPN shop (nadanada). Lazy-loaded so the catalog + QR code only
+      // enter the bundle when the user opens the store. Same pattern as /map.
+      { path: '/shop', component: () => import('pages/ShopPage.vue'), beforeEnter: shopNativeOnly },
+      // Online shops directory (BitcoinListings + BTCPay + Nostr). Lazy-loaded
+      // so the adapters + Nostr code never land in the initial bundle.
+      // Retired with the Spend online row: the merchant directory was too
+      // technical for this tab. Page and service stay in the repo unrouted.
+      // { path: '/online-shops', component: () => import('pages/OnlineShopsPage.vue') },
+      { path: '/kiosk', name: 'kiosk', component: () => import('pages/KioskDashboard.vue') },
+      { path: '/learn', component: () => import('pages/EarnMap.vue'), beforeEnter: earnNativeOnly },
+      { path: '/learn/summary', component: () => import('pages/EarnSummary.vue'), beforeEnter: earnNativeOnly },
+      { path: '/learn/:sectionId', component: () => import('pages/EarnSection.vue'), beforeEnter: earnNativeOnly },
+      { path: '/learn/:sectionId/:questionId(.*)', component: () => import('pages/EarnQuiz.vue'), beforeEnter: earnNativeOnly }
     ]
   },
 
